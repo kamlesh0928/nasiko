@@ -118,7 +118,17 @@ pub async fn handle_request(
             )
             .await
         }
-        other => unreachable!("implements() gate admitted unhandled method {other}"),
+        // Unreachable in practice — `implements(method)` already gated every
+        // other value above — but a request path must never panic
+        // (CLEAN_CODE_GUIDE §6), so this degrades to the same clean
+        // `-32601` a real unimplemented method gets, rather than a `panic!`
+        // that would 500 the whole request over what `implements()` and this
+        // match's arms simply drifted out of sync on.
+        other => err(
+            &req_id,
+            codes::METHOD_NOT_FOUND,
+            format!("Method not found: {other}"),
+        ),
     };
     Some(result)
 }
@@ -857,8 +867,16 @@ pub async fn handle_tools_call(
             // address and retry exactly once before giving up — mirrors this
             // gateway's own existing precedent for the structurally
             // identical Composio-connection staleness problem (refresh only
-            // on-demand, never on every request).
+            // on-demand, never on every request). `!server.system` excludes
+            // the OTHER kind of trusted backend: a system connector has no
+            // container at all, so the refresher's
+            // `runtime.endpoint(ContainerId::from_uuid(connector_id))` is
+            // meaningless for it — and, under `SimulatedRuntime` with
+            // `SIM_RESOLVE_ALL` (a real test/dev configuration), it would
+            // "succeed" and overwrite the system row's real loopback URL with
+            // a bogus one.
             if server.trusted
+                && !server.system
                 && is_connection_level_failure(&e)
                 && let Some(new_url) = state.endpoint_refresher.refresh(server.connector_id).await
             {
@@ -1599,6 +1617,21 @@ mod tests {
         }
     }
 
+    /// Like [`FakeRefresher`], but counts invocations — lets a test assert
+    /// the refresher was never called at all (the system-server exclusion),
+    /// not just that a call's return value went unused.
+    struct CountingRefresher {
+        url: String,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl crate::endpoint_refresh::EndpointRefresher for CountingRefresher {
+        async fn refresh(&self, _connector_id: Uuid) -> Option<String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(self.url.clone())
+        }
+    }
+
     /// A resolved session with one generic MCP backend (`ServerType::Mcp`,
     /// `trusted`) at `url`, namespaced under `cid`'s connector prefix.
     fn mcp_session(url: &str, cid: Uuid, trusted: bool) -> ResolvedSession {
@@ -1612,6 +1645,31 @@ mod tests {
                 transport: "streamable_http".into(),
                 trusted,
                 system: false,
+                tool_names: vec![],
+                instructions: None,
+            }],
+            connected_toolkits: vec![],
+            toolkit_to_connector: HashMap::new(),
+            unusable_connectors: HashMap::new(),
+        }
+    }
+
+    /// Same shape as [`mcp_session`], but a SYSTEM backend (`trusted: true`,
+    /// `system: true`) — the prefixed-tool-name routing path (`{prefix}__x`)
+    /// works identically for a system server (only bare-name routing treats
+    /// `system` specially), so this can reuse the exact connection-failure
+    /// scenario the uploaded-build tests above use.
+    fn system_mcp_session(url: &str, cid: Uuid) -> ResolvedSession {
+        ResolvedSession {
+            servers: vec![MCPServerConfig {
+                connector_id: cid,
+                kind: ServerType::Mcp,
+                name: "system-server".into(),
+                url: url.into(),
+                headers: HashMap::new(),
+                transport: "streamable_http".into(),
+                trusted: true,
+                system: true,
                 tool_names: vec![],
                 instructions: None,
             }],
@@ -1707,6 +1765,51 @@ mod tests {
             res["error"]["code"],
             json!(codes::INTERNAL_ERROR),
             "must surface the original failure, never retry: {res}"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_backend_connection_failure_never_triggers_endpoint_refresh() {
+        // A system connector's `trusted` is also `true` (loopback, same as an
+        // uploaded build) — without the `!server.system` exclusion this would
+        // wrongly take the uploaded-build self-heal path and ask the
+        // refresher for a `ContainerId` that corresponds to no real
+        // container. Asserts the refresher is never even called, not merely
+        // that its result goes unused.
+        let (_guard, fresh_url) = spawn_ok_backend().await;
+        let mut state = test_state();
+        state.authorizer = std::sync::Arc::new(AllowAllAuthorizer);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        state.endpoint_refresher = std::sync::Arc::new(CountingRefresher {
+            url: fresh_url,
+            calls: calls.clone(),
+        });
+
+        let cid = Uuid::new_v4();
+        let resolved = system_mcp_session("http://127.0.0.1:1/mcp", cid);
+        let p = perms(&[cid], vec![]);
+        let tool = format!("{}__echo", crate::types::connector_prefix(cid));
+
+        let res = handle_tools_call(
+            &state,
+            Uuid::new_v4(),
+            &json!(1),
+            &json!({ "name": tool, "arguments": {} }),
+            &resolved,
+            &p,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            res["error"]["code"],
+            json!(codes::INTERNAL_ERROR),
+            "must surface the original failure, never retry: {res}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the refresher must never be invoked for a system backend"
         );
     }
 

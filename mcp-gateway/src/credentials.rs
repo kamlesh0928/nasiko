@@ -145,19 +145,14 @@ async fn build_server_config(
     // this list exactly, since a bare name is otherwise ambiguous with a
     // Composio meta-tool or toolkit slug (e.g. `GMAIL_SEND_EMAIL`). One extra
     // query per system connector per request is fine (there is exactly one
-    // such connector); a lookup failure degrades to "owns nothing this
-    // cycle" rather than failing the whole session resolution over it.
+    // such connector). A DB error here propagates like every sibling query
+    // in `build_generic_servers` (`list_accessible_mcp_connectors`,
+    // `list_user_connections`) — silently degrading to "owns nothing" would
+    // let `aggregator::aggregate_tools` list zero of this backend's tools
+    // while a stale cached manifest (or a retry) still routes calls to it,
+    // which is worse than failing this session-build cycle outright.
     let tool_names = if system {
-        repo::list_connector_tool_names(&state.db, connector.id)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    connector = %connector.name, error = %e,
-                    "failed to load system connector's tool catalog — bare-name routing \
-                     will find nothing for it this cycle"
-                );
-                Vec::new()
-            })
+        repo::list_connector_tool_names(&state.db, connector.id).await?
     } else {
         Vec::new()
     };

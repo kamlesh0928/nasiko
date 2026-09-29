@@ -81,6 +81,16 @@ pub async fn aggregate_tools(
             else {
                 continue;
             };
+            // Listing and routing must agree: `router::route_tool` only ever
+            // hands a bare name to a system backend when its synced
+            // `tool_names` catalog claims it exactly — a tool the LIVE
+            // backend advertises but the catalog hasn't synced yet would
+            // otherwise be listed here, then have `tools/call` misroute it
+            // (with its arguments) to Composio instead of erroring. Hide it
+            // rather than list something that can't actually be called.
+            if server.system && !server.tool_names.iter().any(|t| t == &original) {
+                continue;
+            }
             if perms.decide(server.connector_id, &original) == ToolAccess::Denied {
                 continue;
             }
@@ -537,6 +547,7 @@ mod tests {
             &format!("{}/mcp", sys_backend.url()),
         );
         sys.system = true;
+        sys.tool_names = vec!["save_file".to_string()];
         let generic = srv(
             ServerType::Mcp,
             generic_id,
@@ -566,5 +577,45 @@ mod tests {
             ),
             "a non-system generic server's tool must still be prefixed: {merged:?}"
         );
+    }
+
+    /// Listing and routing must agree (review finding): a system backend can
+    /// advertise a tool the synced `tool_names` catalog hasn't caught up to
+    /// yet — `router::route_tool` would never hand a bare name for it to
+    /// this backend, so listing it here would produce a tool the agent can
+    /// call but that silently misroutes (to Composio, with its arguments) at
+    /// `tools/call` time. Only catalog-listed tools may appear.
+    #[tokio::test]
+    async fn system_server_only_lists_tools_present_in_its_synced_catalog() {
+        let mut backend = mockito::Server::new_async().await;
+        backend
+            .mock("POST", "/mcp")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"save_file"},{"name":"secret_tool"}]}}"#,
+            )
+            .create_async()
+            .await;
+
+        let sys_id = Uuid::new_v4();
+        let mut sys = srv(ServerType::Mcp, sys_id, &format!("{}/mcp", backend.url()));
+        sys.system = true;
+        sys.tool_names = vec!["save_file".to_string()]; // catalog hasn't synced secret_tool
+
+        let state = test_state();
+        let merged = aggregate_tools(
+            &state,
+            Uuid::new_v4(),
+            &[sys],
+            &[],
+            &perms_enabling(&[sys_id]),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0]["name"], json!("save_file"));
     }
 }

@@ -101,8 +101,12 @@ impl McpConnector {
             && self.oauth_client_id.is_some()
     }
     /// True only for a platform-built-and-deployed MCP server — see
-    /// `SourceKind::UploadedBuild`'s doc comment. Drives the SSRF-guard
-    /// `trusted` split (credentials.rs) and the delete/destroy-container fix.
+    /// `SourceKind::UploadedBuild`'s doc comment. One of the SSRF-guard
+    /// `trusted` split's two inputs (`credentials::build_server_config`
+    /// ORs this with `provider_type == "system"` — a platform-owned
+    /// loopback backend is trusted for the same "url was never
+    /// user-supplied" reason, just via a different column) and the
+    /// delete/destroy-container fix.
     pub fn is_uploaded_build(&self) -> bool {
         self.source_kind == SourceKind::UploadedBuild
     }

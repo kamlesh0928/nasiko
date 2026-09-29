@@ -314,11 +314,17 @@ pub struct MCPServerConfig {
     pub headers: HashMap<String, String>,
     #[serde(default = "default_transport")]
     pub transport: String,
-    /// True only for `source_kind = UploadedBuild` connectors, whose `url` was
-    /// resolved by `ContainerRuntime::endpoint()` and never typed by a user —
-    /// the SSRF guard (`net.rs`) exists specifically to stop a *user* pointing
-    /// the gateway at an internal address, so it doesn't apply here. Set
-    /// exactly once, in `credentials::build_generic_servers` — never derived or
+    /// True for the two kinds of backend whose `url` was never typed by a
+    /// user — the SSRF guard (`net.rs`) exists specifically to stop a *user*
+    /// pointing the gateway at an internal address, so it doesn't apply to
+    /// either: (1) `source_kind = UploadedBuild` connectors, whose `url` was
+    /// resolved by `ContainerRuntime::endpoint()`, and (2) `provider_type =
+    /// 'system'` connectors (`system` below), which are only ever inserted
+    /// by the platform itself (`register_connector` hardcodes
+    /// `provider_type = 'mcp_server'`; `update`/`share` reject any row that
+    /// isn't `mcp_server` — see their own doc comments) and whose `url` is
+    /// always a loopback address the control plane serves itself. Set
+    /// exactly once, in `credentials::build_server_config` — never derived or
     /// overridden anywhere else, and never accepted from external input.
     #[serde(default)]
     pub trusted: bool,
