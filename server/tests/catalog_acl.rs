@@ -463,6 +463,56 @@ async fn list_excludes_internal_agent_even_for_superuser() {
     server.cleanup().await;
 }
 
+/// Task 1.6 (spec §16 A4): a coding-agent row must never appear in the catalog listing, even
+/// when marked `is_public` directly — a listing showing it to someone other than its owner would
+/// violate the single-owner precondition Task 1.5's MCP-gateway owner-fallback policy relies on.
+#[tokio::test]
+#[serial]
+async fn list_excludes_coding_agent_row_even_when_marked_public() {
+    let server = common::TestServer::start().await;
+    let admin = init_admin(&server).await;
+    let uid = admin["user_id"].as_str().unwrap();
+
+    let coding_agent = create_agent(
+        &server,
+        uid,
+        json!({"name": "cat3-coding-hidden", "version": "1.0.0"}),
+    )
+    .await;
+    let coding_id = coding_agent["id"].as_str().unwrap();
+    // `is_public = true` bypasses the write-side guard added in `agents/grants.rs` — this proves
+    // the read side (the listing query) is independently defended too, not only the write path.
+    sqlx::query(
+        "UPDATE agents SET is_public = true, coding_agent_integration_id = 'claude' WHERE id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(coding_id).unwrap())
+    .execute(&server.db)
+    .await
+    .unwrap();
+
+    let normal = create_agent(
+        &server,
+        uid,
+        json!({"name": "cat3-coding-normal", "version": "1.0.0"}),
+    )
+    .await;
+    let normal_id = normal["id"].as_str().unwrap();
+
+    let seen = list_agents(&server, uid, true).await;
+    let ids: Vec<&str> = seen.iter().filter_map(|a| a["id"].as_str()).collect();
+
+    assert!(
+        !ids.contains(&coding_id),
+        "a coding-agent row must not appear in the list, even marked public"
+    );
+    assert!(
+        ids.contains(&normal_id),
+        "an ordinary agent's visibility must be unaffected"
+    );
+
+    server.cleanup().await;
+}
+
 #[tokio::test]
 #[serial]
 async fn by_skill_includes_user_granted_agent_for_non_owner() {

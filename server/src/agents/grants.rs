@@ -156,6 +156,15 @@ async fn make_public(
     if let Err(r) = check_access(&state, &claims, agent_id).await {
         return r;
     }
+    if let Err(r) = super::coding_agent::reject_if_coding_agent(
+        &state.db,
+        agent_id,
+        super::coding_agent::CodingAgentGuard::Unshareable,
+    )
+    .await
+    {
+        return r;
+    }
 
     let result = sqlx::query(
         "UPDATE agents SET is_public = true, updated_at = now() WHERE id = $1 AND deleted_at IS NULL",
@@ -265,6 +274,15 @@ async fn add_user_grant(
     Json(body): Json<AddUserGrantBody>,
 ) -> impl IntoResponse {
     if let Err(r) = check_access(&state, &claims, agent_id).await {
+        return r;
+    }
+    if let Err(r) = super::coding_agent::reject_if_coding_agent(
+        &state.db,
+        agent_id,
+        super::coding_agent::CodingAgentGuard::Unshareable,
+    )
+    .await
+    {
         return r;
     }
 

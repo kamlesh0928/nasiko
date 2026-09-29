@@ -311,6 +311,7 @@ const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
     responses(
         (status = 202, description = "Build queued", body = UploadAndDeployResponse),
         (status = 400, description = "Missing/invalid name, version_tag, or source zip"),
+        (status = 409, description = "(owner, name) names a local coding agent — coding_agent_not_deployable"),
         (status = 413, description = "Upload exceeds 100 MiB limit"),
     ),
 )]
@@ -424,6 +425,19 @@ pub(crate) async fn upload_and_deploy(
         Some(n) if !n.is_empty() => n,
         _ => return (StatusCode::BAD_REQUEST, "name is required").into_response(),
     };
+
+    // A coding-agent row must never be deployed onto (Task 1.6, spec §16 A4) — checked against
+    // the upsert's own key, `(owner_id, name)`, and BEFORE the `ON CONFLICT (owner_id, name)`
+    // upsert below runs (which would otherwise deploy a container over it first and only reject
+    // too late to matter). No `id` exists to check yet at this point — that's exactly why this
+    // needs its own by-`(owner_id, name)` lookup rather than `reject_if_coding_agent`.
+    if let Err(r) = crate::agents::coding_agent::reject_if_coding_agent_by_owner_and_name(
+        &state.db, owner_id, &name,
+    )
+    .await
+    {
+        return r;
+    }
     // `version_tag` isn't resolved here — it may still come from the zip's
     // AgentCard.json/pyproject.toml/Cargo.toml, discovered during validation
     // below. Resolved and validated as a plain x.y.z once that's known (no

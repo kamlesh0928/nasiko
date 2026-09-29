@@ -243,10 +243,10 @@ pub(crate) async fn register_coding_agent(
 /// `org_bind` carries the ids of agents reachable through an org-hierarchy grant
 /// (`team`/`department`/`organization`), as resolved by
 /// `AuthService::org_granted_agent_ids`. `EeAuthService::can_access_agent`
-/// (the EE auth service) grants access via team/department membership by joining on
+/// (ee/auth/src/lib.rs) grants access via team/department membership by joining on
 /// `users.team_id` / `users.department_id` — columns that only exist after the EE
 /// `1002_org_hierarchy` migration. This file is compiled into and shared by both
-/// the OSS and EE server binaries (the EE server wraps this crate's router rather
+/// the OSS and EE server binaries (`ee/server` wraps this crate's router rather
 /// than forking it — see `nasiko_server::build_app_with_user_router`), so a single
 /// static SQL string here cannot reference those EE-only columns; the trait
 /// resolves them per edition and hands back plain ids instead, which is what
@@ -349,6 +349,7 @@ pub(crate) async fn by_skill(
            FROM agents a
            WHERE ({access})
              AND NOT a.is_internal
+             AND a.coding_agent_integration_id IS NULL
              AND EXISTS (
                  SELECT 1 FROM agent_skills s
                  WHERE s.agent_id = a.id AND s.tags @> ARRAY[$1]::text[]
@@ -420,15 +421,6 @@ pub(crate) async fn create(
         }
     }
     let skills = serde_json::to_value(&skills_vec).unwrap_or_default();
-    // The card decides whether this agent is offered the minimal-code ladder at all, so it may as
-    // well decide the starting position too: an agent registered with coding skills comes up with
-    // the ladder on. Reversible from the Settings switch, and scoped to *registration* on purpose —
-    // nothing here rewrites an existing agent, whose owner may have turned it off deliberately.
-    //
-    // `has_coding_skills` rather than a local predicate: the dispatch-time gate
-    // (`a2a_dispatch.rs`) calls the same function, and the two disagreeing is precisely the drift
-    // that produced the `/code/i`-vs-`ILIKE '%code%'` bug this helper was extracted to fix.
-    let minimal_code_enabled = super::models::has_coding_skills(&skills_vec);
     let meta = body.metadata.unwrap_or(serde_json::json!({}));
     let owner_id = match claims.user_uuid() {
         Ok(id) => id,
@@ -445,8 +437,8 @@ pub(crate) async fn create(
 
     let result = sqlx
         ::query_as::<_, Agent>(
-            r#"INSERT INTO agents (name, display_name, description, owner_id, url, icon_url, version, documentation_url, capabilities, skills, tags, metadata, image, minimal_code_enabled)
-           VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, '1.0.0'), $8, $9, $10, $11, $12, $13, $14)
+            r#"INSERT INTO agents (name, display_name, description, owner_id, url, icon_url, version, documentation_url, capabilities, skills, tags, metadata, image)
+           VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, '1.0.0'), $8, $9, $10, $11, $12, $13)
            RETURNING *"#
         )
         .bind(&body.name)
@@ -462,7 +454,6 @@ pub(crate) async fn create(
         .bind(&tags)
         .bind(meta)
         .bind(&body.image)
-        .bind(minimal_code_enabled)
         .fetch_one(&mut *tx).await;
 
     let agent = match result {
@@ -566,6 +557,7 @@ pub(crate) async fn list(
         r#"SELECT * FROM agents
            WHERE deleted_at IS NULL
              AND NOT is_internal
+             AND coding_agent_integration_id IS NULL
              AND ($1::uuid IS NULL OR owner_id = $1)
              AND ({access})
              AND ($2::text IS NULL OR status = $2)
@@ -642,31 +634,6 @@ pub(crate) struct AgentDetailResponse {
     is_coding_agent: bool,
     #[serde(rename = "coding_agent_integration_id")]
     coding_agent_integration_id: Option<String>,
-    /// Per-agent payload-compression opt-in. The Settings toggle renders from this, so a
-    /// projection that omits it shows the switch off however the column reads.
-    #[serde(rename = "compress_enabled")]
-    compress_enabled: bool,
-    /// Drives the control plane's minimal-code ladder injection at A2A dispatch
-    /// time (a2a_dispatch.rs). Same reasoning as compress_enabled above — omit
-    /// it here and the Settings toggle shows off regardless of the real value.
-    #[serde(rename = "minimal_code_enabled")]
-    minimal_code_enabled: bool,
-    /// Whether this agent's card reads as code work, and so should be offered minimal-code
-    /// mode at all. Served rather than re-derived in the browser: the settings page used to
-    /// run its own `/code/i` over the skills, mirroring a Postgres `ILIKE '%code%'` in the
-    /// dispatch path, and the two could disagree — which is exactly what happened, since both
-    /// missed `coding` (no "code" in it) while matching `encode`.
-    #[serde(rename = "has_coding_skills")]
-    has_coding_skills: bool,
-    /// Owner-writable bag, and the home of `features.*` — the flags
-    /// `AppState::agent_env` turns into `NASIKO_<KEY>` on the container.
-    ///
-    /// Third occurrence of the same trap the two fields above warn about, and the worst of
-    /// them: the Settings feature switches render from `metadata.features`, and the UI builds
-    /// its `PUT` body by spreading the value it read back. Omitted here it was always
-    /// `undefined`, so every switch showed off however the column read *and* each save
-    /// replaced the whole column with just the one feature it was toggling.
-    metadata: serde_json::Value,
     status: String,
     version: String,
     description: String,
@@ -789,10 +756,6 @@ pub(crate) async fn get_one(
         can_manage,
         is_coding_agent: coding_agent_integration_id.is_some(),
         coding_agent_integration_id,
-        compress_enabled: agent.compress_enabled,
-        minimal_code_enabled: agent.minimal_code_enabled,
-        has_coding_skills: super::models::has_coding_skills(&agent.skills),
-        metadata: agent.metadata.0.clone(),
         status: agent.status.clone(),
         version: agent.version.clone(),
         description: agent.description.unwrap_or_default(),
@@ -1016,8 +979,6 @@ pub(crate) async fn update(
              metadata = COALESCE($11, metadata),
              status = COALESCE($12, status),
              image = COALESCE($13, image),
-             minimal_code_enabled = COALESCE($14, minimal_code_enabled),
-             compress_enabled = COALESCE($15, compress_enabled),
              updated_at = now()
            WHERE id = $1
            RETURNING *"#,
@@ -1039,8 +1000,6 @@ pub(crate) async fn update(
     .bind(&body.metadata)
     .bind(&body.status)
     .bind(&agent_image)
-    .bind(body.minimal_code_enabled)
-    .bind(body.compress_enabled)
     .fetch_optional(&mut *tx)
     .await;
 
@@ -1697,6 +1656,7 @@ pub(crate) async fn registry_user_agents(
     let agents = sqlx::query_as::<_, Agent>(
         r#"SELECT * FROM agents
            WHERE deleted_at IS NULL
+             AND coding_agent_integration_id IS NULL
              AND (
                owner_id = $1
                OR is_public = true

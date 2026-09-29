@@ -236,6 +236,90 @@ async fn upload_persists_agent_and_build_record() {
     server.cleanup().await;
 }
 
+/// Task 1.6 (spec §16 A4): the `(owner_id, name)` upsert must reject — not clear
+/// `coding_agent_integration_id` and deploy over it — when an existing row by that key is a
+/// CLI-bound coding agent. The check runs before the `ON CONFLICT (owner_id, name)` write, so a
+/// name collision with a coding-agent row must never bump its version or image.
+#[tokio::test]
+#[serial]
+async fn upload_rejects_when_name_collides_with_a_coding_agent_row_owned_by_the_caller() {
+    let server = common::TestServer::start().await;
+    let admin = init_admin(&server).await;
+    let uid = admin["user_id"].as_str().unwrap();
+
+    // First upload creates the row the ordinary way...
+    let zip = make_valid_structure_zip();
+    let first = upload(
+        &server,
+        uid,
+        vec![
+            ("name", "upload-coding-agent".into()),
+            ("version_tag", "1.0.0".into()),
+        ],
+        Some(zip),
+    )
+    .await;
+    assert_eq!(first.status(), 202);
+    let first_body: Value = first.json().await.unwrap();
+    let agent_id: uuid::Uuid = first_body["data"]["agent_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // ...then it becomes a CLI-bound coding-agent row — the same fact
+    // `POST /api/agents/coding-integrations` sets, applied directly (mirrors how
+    // `catalog_acl.rs`'s coding-agent fixtures are set up elsewhere in this suite).
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(agent_id)
+        .execute(&server.db)
+        .await
+        .unwrap();
+
+    let zip = make_valid_structure_zip();
+    let second = upload(
+        &server,
+        uid,
+        vec![
+            ("name", "upload-coding-agent".into()),
+            ("version_tag", "2.0.0".into()),
+        ],
+        Some(zip),
+    )
+    .await;
+    assert_eq!(second.status(), 409);
+    let text = second.text().await.unwrap();
+    assert!(
+        text.contains("coding_agent_not_deployable"),
+        "expected coding_agent_not_deployable, got: {text}"
+    );
+
+    // Unchanged: the rejected upload must never have reached the upsert.
+    let still_coding: Option<String> =
+        sqlx::query_scalar("SELECT coding_agent_integration_id FROM agents WHERE id = $1")
+            .bind(agent_id)
+            .fetch_one(&server.db)
+            .await
+            .unwrap();
+    assert_eq!(still_coding.as_deref(), Some("claude"));
+
+    // Control: an ordinary (non-colliding) upload in the same test still gets through as today.
+    let zip = make_valid_structure_zip();
+    let normal = upload(
+        &server,
+        uid,
+        vec![
+            ("name", "upload-normal-agent".into()),
+            ("version_tag", "1.0.0".into()),
+        ],
+        Some(zip),
+    )
+    .await;
+    assert_eq!(normal.status(), 202, "a normal upload must be unaffected");
+
+    server.cleanup().await;
+}
+
 #[tokio::test]
 #[serial]
 async fn upload_persists_build_job_atomically_with_agent_and_build() {

@@ -338,6 +338,101 @@ async fn update_duplicate_version_in_agent_versions_returns_409() {
     server.cleanup().await;
 }
 
+/// Task 1.6 (spec §16 A4): a coding-agent row must never be deployed onto — it would inherit the
+/// MCP gateway's owner-fallback policy while becoming dispatchable.
+#[tokio::test]
+#[serial]
+async fn update_rejects_coding_agent_row_but_not_a_normal_one() {
+    let server = common::TestServer::start().await;
+    let admin = init_admin(&server).await;
+    let uid = admin["user_id"].as_str().unwrap();
+
+    let coding_agent = create_agent(&server, uid, "update-coding-agent", "1.0.0").await;
+    let coding_id: Uuid = coding_agent["id"].as_str().unwrap().parse().unwrap();
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(coding_id)
+        .execute(&server.db)
+        .await
+        .unwrap();
+
+    let zip = common::make_zip(&[NO_DOCKERFILE]);
+    let res = do_update(&server, uid, &coding_id.to_string(), None, Some(zip)).await;
+    assert_eq!(res.status(), 409);
+    let text = res.text().await.unwrap();
+    assert!(
+        text.contains("coding_agent_not_deployable"),
+        "expected coding_agent_not_deployable, got: {text}"
+    );
+    // Unchanged: no build/version-history row was seeded, no image/status mutation attempted.
+    let still_coding: Option<String> =
+        sqlx::query_scalar("SELECT coding_agent_integration_id FROM agents WHERE id = $1")
+            .bind(coding_id)
+            .fetch_one(&server.db)
+            .await
+            .unwrap();
+    assert_eq!(still_coding.as_deref(), Some("claude"));
+
+    // Control: an ordinary row in the same test still gets through as today.
+    let normal_agent = create_agent(&server, uid, "update-normal-agent", "1.0.0").await;
+    let normal_id: Uuid = normal_agent["id"].as_str().unwrap().parse().unwrap();
+    let zip = common::make_zip(&[NO_DOCKERFILE]);
+    let res = do_update(&server, uid, &normal_id.to_string(), None, Some(zip)).await;
+    assert_eq!(res.status(), 202, "a normal row must be unaffected");
+
+    server.cleanup().await;
+}
+
+/// Same guard, exercised via the rollback path — the other route this task must close (Task 1.6).
+#[tokio::test]
+#[serial]
+async fn rollback_rejects_coding_agent_row_but_not_a_normal_one() {
+    let server = common::TestServer::start().await;
+    let admin = init_admin(&server).await;
+    let uid = admin["user_id"].as_str().unwrap();
+
+    let coding_agent = create_agent(&server, uid, "rollback-coding-agent", "1.0.1").await;
+    let coding_id: Uuid = coding_agent["id"].as_str().unwrap().parse().unwrap();
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(coding_id)
+        .execute(&server.db)
+        .await
+        .unwrap();
+    // A rollback-eligible version exists — proves the coding-agent guard, not the "no eligible
+    // version" 409, is what fires.
+    sqlx::query(
+        "INSERT INTO agent_versions (agent_id, version, image_tag, is_active, can_rollback, status) \
+         VALUES ($1, '1.0.0', 'rollback-coding-agent:1.0.0', false, true, 'archived')",
+    )
+    .bind(coding_id)
+    .execute(&server.db)
+    .await
+    .unwrap();
+
+    let res = do_rollback(&server, uid, &coding_id.to_string(), None).await;
+    assert_eq!(res.status(), 409);
+    let text = res.text().await.unwrap();
+    assert!(
+        text.contains("coding_agent_not_deployable"),
+        "expected coding_agent_not_deployable, got: {text}"
+    );
+
+    // Control: an ordinary row with the same rollback-eligible setup still gets through as today.
+    let normal_agent = create_agent(&server, uid, "rollback-normal-agent", "1.0.1").await;
+    let normal_id: Uuid = normal_agent["id"].as_str().unwrap().parse().unwrap();
+    sqlx::query(
+        "INSERT INTO agent_versions (agent_id, version, image_tag, is_active, can_rollback, status) \
+         VALUES ($1, '1.0.0', 'rollback-normal-agent:1.0.0', false, true, 'archived')",
+    )
+    .bind(normal_id)
+    .execute(&server.db)
+    .await
+    .unwrap();
+    let res = do_rollback(&server, uid, &normal_id.to_string(), None).await;
+    assert_eq!(res.status(), 202, "a normal row must be unaffected");
+
+    server.cleanup().await;
+}
+
 // ─── PUT /api/agents/{id}/update — version bump logic ────────────────────────
 
 #[tokio::test]
