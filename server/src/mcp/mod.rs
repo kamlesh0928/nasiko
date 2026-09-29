@@ -36,13 +36,20 @@ pub use handlers::sharing::grant_response;
 /// - `POST /api/mcp` — credential in `Authorization: Bearer`. Preferred.
 /// - `POST /api/mcp/s/{token}` — credential in the path, for framework MCP
 ///   clients that can only be handed a URL (see `handlers::gateway::mcp_gateway_via_url`).
-pub fn agent_gateway_router() -> Router<AppState> {
+///
+/// `max_body_bytes` scopes a body-size limit to just these two routes (mirrors
+/// [`upload_mutation_router`]'s own `DefaultBodyLimit`) — axum's blanket 2 MiB
+/// default would reject the inline `save_file` payloads a later task
+/// introduces, and raising the workspace-wide default is unwarranted for
+/// every other route.
+pub fn agent_gateway_router(max_body_bytes: usize) -> Router<AppState> {
     Router::new()
         .route("/mcp", post(handlers::gateway::mcp_gateway))
         .route(
             "/mcp/s/{token}",
             post(handlers::gateway::mcp_gateway_via_url),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
 }
 
 /// Path prefix of the URL-credential gateway form, whose next segment is a live
@@ -229,7 +236,7 @@ pub fn composio_callback_router() -> Router<AppState> {
 // ─── Shared error + auth helpers ────────────────────────────────────────────
 
 /// Standard API envelope: `{"data": …, "status_code": N, "message": "…"}`.
-/// `pub` (not `pub(crate)`) so the EE server's own MCP-related handlers
+/// `pub` (not `pub(crate)`) so `ee/server`'s own MCP-related handlers
 /// (`mcp_sharing.rs`) can produce the same envelope shape.
 pub struct ApiResponse {
     status: StatusCode,
@@ -322,7 +329,7 @@ where
 }
 
 /// Wraps [`McpError`] as an HTTP response for the management routes. `pub` so
-/// The EE server's MCP handlers can return it too (see [`ApiResponse`]).
+/// `ee/server`'s MCP handlers can return it too (see [`ApiResponse`]).
 pub struct ApiError(pub McpError);
 
 impl IntoResponse for ApiError {

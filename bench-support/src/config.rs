@@ -1,6 +1,6 @@
 //! Builds a `nasiko_config::Config` for the bench harness, pointed at the
 //! in-process mock LLM and carrying a dummy (non-empty) `openai_api_key` —
-//! the enterprise server's `build_ee_app` panics at startup without one (the MAF worker
+//! `ee/server::build_ee_app` panics at startup without one (the MAF worker
 //! requires it), even though the worker itself sits idle unless flows are
 //! explicitly queued.
 
@@ -80,6 +80,7 @@ pub fn build_bench_config(database_url: String, mock_llm_base_url: &str) -> Conf
         mcp_tool_search_tool_limit: 15,
         mcp_tool_search_meta_limit: 10,
         mcp_upload_max_bytes: 50 * 1024 * 1024,
+        mcp_gateway_max_body_bytes: 8 * 1024 * 1024,
         mcp_upload_default_port: 8080,
         mcp_servers_network: "nasiko-mcp-servers-net".into(),
         mcp_upload_max_replicas: 1,
@@ -112,8 +113,6 @@ pub fn build_bench_config(database_url: String, mock_llm_base_url: &str) -> Conf
         openai_api_key: Some("bench-dummy-key".into()),
         openai_base_url: Some(mock_llm_base_url.to_string()),
         openai_model: "mock-model".into(),
-        decomposer_api_url: None,
-        decomposer_api_key: None,
         router_model: "mock-model".into(),
         capability_generator_model: "mock-model".into(),
         mcp_description_model: "mock-model".into(),
@@ -145,23 +144,9 @@ pub fn build_bench_config(database_url: String, mock_llm_base_url: &str) -> Conf
         github_client_secret: None,
         router_shortlist_threshold: 15,
         router_shortlist_size: 10,
-        pacms_history_pool_size: 150,
-        savings_factor_refresh_secs: 86_400,
-        savings_factor_min_samples: 1_600,
-        savings_factor_window_days: 30,
-        react_compress_enabled: false,
-        react_compress_min_bytes: 2048,
-        history_compress_enabled: false,
-        history_compress_min_bytes: 2048,
-        pacms_budget_low: 500,
-        pacms_budget_medium: 1000,
-        pacms_budget_high: 5000,
-        pacms_history_mandatory_recent: 3,
-        context_k_low: 1,
-        context_k_medium: 5,
-        context_k_high: 20,
+        max_router_history_messages: 20,
         embedding_model: "mock-embedding".into(),
-        agent_call_timeout_secs: 600,
+        router_agent_timeout_secs: 60,
         github_callback_url: None,
         github_central_callback_url: None,
         docker_agent_network: None,

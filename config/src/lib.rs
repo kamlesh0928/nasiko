@@ -47,10 +47,6 @@ pub struct Config {
     pub openai_api_key: Option<String>,
     pub openai_base_url: Option<String>,
     pub openai_model: String,
-    /// MAF "decompose one instruction into atomic sub-queries" service.
-    /// `None` disables `/maf/workflow/from-instruction` (503).
-    pub decomposer_api_url: Option<String>,
-    pub decomposer_api_key: Option<String>,
     pub router_model: String,
     pub capability_generator_model: String,
     /// Model for the MCP-connector description LLM fallback — only called when
@@ -95,30 +91,18 @@ pub struct Config {
     pub flow_max_depth: i32,
     pub flow_max_fan_out: i32,
     pub flow_max_tokens: i64,
-    /// Wall-clock budget for one flow, from `NASIKO_FLOW_TIMEOUT_SECS`. The
-    /// platform's widest window: the flow guard enforces it, and both the MCP
-    /// gateway (`tools/call`) and the LLM router (token attribution) refuse to
-    /// serve a flow older than this, so nothing an agent turn depends on may
-    /// outlive it.
     pub flow_timeout_secs: i32,
     /// How long a HITL pause (`hitl_requests`) stays answerable before the dispatcher's poll
     /// loop expires it. `oss/hitl`'s own store applies this at row-creation time — see
     /// `PgHitlStore::with_ttl_days`.
     pub hitl_request_ttl_days: i64,
-    /// `nasiko_hitl::dispatcher::DispatcherConfig`'s remaining tunables (the `mcp_tool`-origin
-    /// resume dispatcher, `oss/hitl/src/dispatcher.rs`) — every comparable tunable elsewhere in
-    /// this codebase goes through this single `Config` struct, and `hitl_request_ttl_days` right
-    /// above is the same feature's own TTL knob, so these were the odd ones out as compile-time
+    /// `nasiko_hitl::dispatcher::DispatcherConfig`'s five tunables (the `mcp_tool`-origin resume
+    /// dispatcher, `oss/hitl/src/dispatcher.rs`) — every comparable tunable elsewhere in this
+    /// codebase goes through this single `Config` struct, and `hitl_request_ttl_days` right above
+    /// is the same feature's own TTL knob, so these were the odd ones out as compile-time
     /// constants (found in review).
     pub hitl_resume_poll_interval_secs: u64,
     pub hitl_resume_recovery_interval_secs: u64,
-    /// Claim-lease floor shared by *both* resume dispatchers — `nasiko_hitl::dispatcher`'s
-    /// `mcp_tool` one (via `DispatcherConfig::effective_lease_minutes`, which holds one claim
-    /// across its own in-process retry loop) and `oss/server/src/hitl/mod.rs`'s `direct_chat`/
-    /// `agent_proxy`/`orchestrator`/`maf` one (via its `lease_secs` helper, which claims once per
-    /// delivery attempt). Each dispatcher floors its own effective lease at what its own delivery
-    /// shape needs, so raising or lowering this one knob can never reopen either's
-    /// double-delivery window.
     pub hitl_resume_lease_minutes: i64,
     pub hitl_resume_max_attempts: u32,
     pub hitl_resume_retry_delay_secs: u64,
@@ -142,64 +126,11 @@ pub struct Config {
     pub nasiko_bff_url: Option<String>,
     pub router_shortlist_threshold: usize,
     pub router_shortlist_size: usize,
-    /// How many of the most recent chat messages the PACMS context selector
-    /// draws candidates from (a wide pool for the selector to choose a
-    /// budget-fitting subset from). See `SessionHistory::fetch_pacms`.
-    pub pacms_history_pool_size: usize,
-    /// Structurally compress tool results as the ReAct loop stores them
-    /// (PRD §9 IP-3). Shrinks what the loop carries, which also defers the
-    /// context-compaction cliff. On by default — gated by the agent's own
-    /// switch, so this is a fleet kill switch rather than an enabler.
-    /// How often the brevity holdout is re-analysed into a measured effect factor.
-    pub savings_factor_refresh_secs: u64,
-    /// Minimum samples **per arm** before a measured factor replaces the seeded one. Below this
-    /// the arm means are noise, and a noisy `fixture` figure is worse than an honest seed.
-    pub savings_factor_min_samples: i64,
-    /// Trailing window the holdout comparison reads.
-    pub savings_factor_window_days: i64,
-    pub react_compress_enabled: bool,
-    /// Skip tool results below this size.
-    pub react_compress_min_bytes: usize,
-    /// Structurally compress each history message before context selection
-    /// (PRD §9 IP-4). On by default — gated by the agent's own switch, so this
-    /// is a fleet kill switch rather than an enabler.
-    pub history_compress_enabled: bool,
-    /// Skip history messages below this size. A short turn is mostly prose,
-    /// which does not compress, so the attempt is pure cost.
-    pub history_compress_min_bytes: usize,
-    /// Token budget for a user on the PACMS "low" tier (`users.pacms_budget_level`).
-    pub pacms_budget_low: usize,
-    /// Token budget for a user on the PACMS "medium" tier — the default tier
-    /// for a user who hasn't picked one.
-    pub pacms_budget_medium: usize,
-    /// Token budget for a user on the PACMS "high" tier.
-    pub pacms_budget_high: usize,
-    /// How many of the most-recent messages in the pool are force-included
-    /// (PACMS `mandatory` set) regardless of relevance/coverage score, so the
-    /// immediate conversational thread is never dropped.
-    pub pacms_history_mandatory_recent: usize,
-    /// Item count for a user on the "low" tier (`users.pacms_budget_level`),
-    /// shared by the `topk` strategy's query/answer-pair count
-    /// (`SessionHistory::fetch_topk`) and the `lastk` strategy's recency
-    /// window (`SessionHistory::fetch`) — same tier the PACMS token budget
-    /// above reads, resolved via `PacmsBudgetLevel::k`.
-    pub context_k_low: usize,
-    /// Item count for a user on the "medium" tier — the default tier for a
-    /// user who hasn't picked one.
-    pub context_k_medium: usize,
-    /// Item count for a user on the "high" tier.
-    pub context_k_high: usize,
+    pub max_router_history_messages: usize,
     /// OpenAI-compatible model used for Stage 1 vector embeddings.
     /// Default: `text-embedding-3-small`. Stage 1 is skipped if `openai_api_key` is unset.
     pub embedding_model: String,
-    /// Wall-clock budget for a single agent HTTP hop — the A2A proxy, the
-    /// orchestrator's streaming and non-streaming agent calls, and the MAF
-    /// executor's. An agent turn can legitimately run for minutes (long tool
-    /// calls, multi-step orchestration), so this is deliberately far above the
-    /// shared `http_client` default, which stays short for embeddings, registry
-    /// probes and OAuth. Read from `AGENT_CALL_TIMEOUT_SECS`, falling back to
-    /// the former `ROUTER_AGENT_TIMEOUT_SECS`.
-    pub agent_call_timeout_secs: u64,
+    pub router_agent_timeout_secs: u64,
     pub github_callback_url: Option<String>,
     /// Central OAuth callback relay URL (multi-tenant deployments): used as the
     /// GitHub `redirect_uri` for both authorize and token exchange instead of
@@ -293,6 +224,11 @@ pub struct Config {
     /// default 50 MiB — deliberately smaller than agents' 100 MiB default,
     /// since MCP servers are typically much smaller than full agent codebases.
     pub mcp_upload_max_bytes: u64,
+    /// Max request body size for the agent-facing MCP gateway routes
+    /// (`POST /api/mcp`, `POST /api/mcp/s/{token}`). MCP_GATEWAY_MAX_BODY_BYTES,
+    /// default 8 MiB — axum's own default of 2 MiB would reject the inline
+    /// `save_file` payloads a later task introduces.
+    pub mcp_gateway_max_body_bytes: usize,
     /// Port an uploaded MCP server container is expected to bind via `$PORT`.
     /// MCP_UPLOAD_DEFAULT_PORT, default 8080.
     pub mcp_upload_default_port: u16,
@@ -396,8 +332,6 @@ impl Config {
             openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
             openai_base_url: std::env::var("OPENAI_BASE_URL").ok(),
             openai_model: env_or("OPENAI_MODEL", "gpt-4o-mini"),
-            decomposer_api_url: std::env::var("MODEL_API_URL").ok(),
-            decomposer_api_key: std::env::var("MODEL_APIKEY").ok(),
             router_model: env_or("ROUTER_MODEL", "gpt-4o-mini"),
             capability_generator_model: env_or("CAPABILITY_GENERATOR_MODEL", "gpt-4o-mini"),
             mcp_description_model: env_or("MCP_DESCRIPTION_MODEL", "gpt-4o-mini"),
@@ -438,11 +372,7 @@ impl Config {
             flow_max_depth: env_parse("NASIKO_FLOW_MAX_DEPTH", 5),
             flow_max_fan_out: env_parse("NASIKO_FLOW_MAX_FAN_OUT", 20),
             flow_max_tokens: env_parse("NASIKO_FLOW_MAX_TOKENS", 100000),
-            // Keep in step with `nasiko_flow::DEFAULT_FLOW_TIMEOUT_SECS` (this
-            // crate is a leaf and can't reference it): an agent turn may run
-            // the full `agent_call_timeout_secs`, so the flow that authorizes
-            // it has to live at least as long.
-            flow_timeout_secs: env_parse("NASIKO_FLOW_TIMEOUT_SECS", 600),
+            flow_timeout_secs: env_parse("NASIKO_FLOW_TIMEOUT_SECS", 120),
             hitl_request_ttl_days: env_parse("HITL_REQUEST_TTL_DAYS", 7),
             // Defaults match `nasiko_hitl::dispatcher::DispatcherConfig::default()` exactly, so
             // an unset env var changes nothing.
@@ -472,27 +402,9 @@ impl Config {
                 .filter(|s| !s.is_empty()),
             router_shortlist_threshold: env_parse("ROUTER_SHORTLIST_THRESHOLD", 15),
             router_shortlist_size: env_parse("ROUTER_SHORTLIST_SIZE", 10),
-            pacms_history_pool_size: env_parse("PACMS_HISTORY_POOL_SIZE", 150),
-            savings_factor_refresh_secs: env_parse("SAVINGS_FACTOR_REFRESH_SECS", 86_400),
-            savings_factor_min_samples: env_parse("SAVINGS_FACTOR_MIN_SAMPLES", 1_600),
-            savings_factor_window_days: env_parse("SAVINGS_FACTOR_WINDOW_DAYS", 30),
-            react_compress_enabled: env_parse("TOKEN_COMPRESS_TOOL_RESULTS", true),
-            react_compress_min_bytes: env_parse("TOKEN_COMPRESS_TOOL_RESULTS_MIN_BYTES", 2048),
-            history_compress_enabled: env_parse("TOKEN_COMPRESS_HISTORY", true),
-            history_compress_min_bytes: env_parse("TOKEN_COMPRESS_HISTORY_MIN_BYTES", 2048),
-            pacms_budget_low: env_parse("PACMS_BUDGET_LOW", 500),
-            pacms_budget_medium: env_parse("PACMS_BUDGET_MEDIUM", 1000),
-            pacms_budget_high: env_parse("PACMS_BUDGET_HIGH", 5000),
-            pacms_history_mandatory_recent: env_parse("PACMS_HISTORY_MANDATORY_RECENT", 3),
-            context_k_low: env_parse("CONTEXT_K_LOW", 1),
-            context_k_medium: env_parse("CONTEXT_K_MEDIUM", 5),
-            context_k_high: env_parse("CONTEXT_K_HIGH", 20),
+            max_router_history_messages: env_parse("MAX_ROUTER_HISTORY_MESSAGES", 20),
             embedding_model: env_or("EMBEDDING_MODEL", "text-embedding-3-small"),
-            agent_call_timeout_secs: std::env::var("AGENT_CALL_TIMEOUT_SECS")
-                .or_else(|_| std::env::var("ROUTER_AGENT_TIMEOUT_SECS"))
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(600),
+            router_agent_timeout_secs: env_parse("ROUTER_AGENT_TIMEOUT_SECS", 60),
             github_callback_url: std::env::var("GITHUB_CALLBACK_URL").ok(),
             github_central_callback_url: std::env::var("GITHUB_CENTRAL_CALLBACK_URL")
                 .ok()
@@ -573,6 +485,7 @@ impl Config {
             mcp_perm_cache_ttl_seconds: env_parse("MCP_PERM_CACHE_TTL_SECONDS", 30),
             mcp_manifest_ttl_seconds: env_parse("MCP_MANIFEST_TTL_SECONDS", 300),
             mcp_upload_max_bytes: env_parse("MCP_UPLOAD_MAX_BYTES", 50 * 1024 * 1024),
+            mcp_gateway_max_body_bytes: env_parse("MCP_GATEWAY_MAX_BODY_BYTES", 8 * 1024 * 1024),
             mcp_upload_default_port: env_parse("MCP_UPLOAD_DEFAULT_PORT", 8080),
             mcp_servers_network: env_or("MCP_SERVERS_NETWORK", "nasiko-mcp-servers-net"),
             mcp_upload_max_replicas: env_parse("MCP_UPLOAD_MAX_REPLICAS", 1),
@@ -610,11 +523,11 @@ impl Config {
 /// base URL, for callers that append their own `/v1/...` path segment.
 ///
 /// `OPENAI_BASE_URL` is commonly written *with* the `/v1` — that is how
-/// `cp.nasiko.dev` and typical deployment env files have it — so appending `/v1/whatever`
+/// `cp.nasiko.dev` and `ee/server/.env` have it — so appending `/v1/whatever`
 /// to the raw value doubles up into `.../v1/v1/whatever`, which 404s.
 ///
 /// Deliberately a free function rather than normalization applied to
-/// [`Config::openai_base_url`] itself: the artifact registry uses the opposite
+/// [`Config::openai_base_url`] itself: `ee/artifact-registry` uses the opposite
 /// convention (base URL *includes* `/v1`, it appends bare `/embeddings`), so
 /// the stored value has to stay verbatim.
 pub fn openai_base_url_without_v1(base_url: &str) -> &str {

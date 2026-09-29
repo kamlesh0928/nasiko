@@ -510,3 +510,65 @@ async fn url_credential_allows_tools_call_inside_its_own_flow() {
     );
     server.cleanup().await;
 }
+
+// ─── `MCP-Protocol-Version` header validation ─────────────────────────────────
+//
+// Task 1.1 made the gateway negotiate `protocolVersion` in `initialize` and
+// advertise 2025-06-18. Per the MCP spec, a client that negotiated 2025-06-18
+// sends `MCP-Protocol-Version` on every subsequent request; the gateway must
+// reject a version it doesn't implement, while still treating the header as
+// optional (old clients that never negotiated never send it).
+
+#[tokio::test]
+#[serial]
+async fn unknown_protocol_version_header_is_rejected_with_400() {
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "gw-owner-pv").await;
+    let agent_id = seed_agent(&server, owner, "pv-agent").await;
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+
+    let resp = server
+        .client
+        .post(server.url("/api/mcp"))
+        .bearer_auth(&token)
+        .header("MCP-Protocol-Version", "1999-01-01")
+        .json(&rpc("tools/list"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let resp = server
+        .client
+        .post(server.url("/api/mcp"))
+        .bearer_auth(&token)
+        .header("MCP-Protocol-Version", "2025-06-18")
+        .json(&rpc("tools/list"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn missing_protocol_version_header_still_succeeds() {
+    // The header is optional — old clients that never negotiated a protocol
+    // version never send it, and must not be locked out.
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "gw-owner-pv-none").await;
+    let agent_id = seed_agent(&server, owner, "pv-agent-none").await;
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+
+    let resp = server
+        .client
+        .post(server.url("/api/mcp"))
+        .bearer_auth(&token)
+        .json(&rpc("tools/list"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    server.cleanup().await;
+}

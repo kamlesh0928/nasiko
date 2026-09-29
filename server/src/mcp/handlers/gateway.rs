@@ -130,6 +130,26 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
         }
     };
 
+    // Per the MCP spec, a client that negotiated a protocol version in
+    // `initialize` sends `MCP-Protocol-Version` on every subsequent request.
+    // The header is optional — a client that never negotiated (or an old
+    // client predating this) never sends it — but a version we don't
+    // implement is rejected outright rather than silently ignored.
+    if let Some(v) = headers
+        .get("mcp-protocol-version")
+        .and_then(|v| v.to_str().ok())
+        && !nasiko_mcp_gateway::types::SUPPORTED_PROTOCOL_VERSIONS.contains(&v)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unsupported MCP-Protocol-Version '{v}' (supported: {})",
+                nasiko_mcp_gateway::types::SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+            ),
+        )
+            .into_response();
+    }
+
     let traceparent = headers
         .get(nasiko_flow::TRACEPARENT_HEADER)
         .and_then(|v| v.to_str().ok());
