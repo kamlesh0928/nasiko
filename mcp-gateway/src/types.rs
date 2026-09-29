@@ -17,6 +17,10 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "
 /// What `handle_initialize` answers with when the client didn't ask for a
 /// version we recognize (unknown, missing, or non-string `protocolVersion`).
 pub const LATEST_PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
+/// Header name a client that negotiated a protocol version in `initialize`
+/// sends on every subsequent request (case-insensitive on the wire; `axum`'s
+/// `HeaderMap` normalizes lookups regardless of the case used here).
+pub const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 
 // ─── JSON-RPC 2.0 envelope ──────────────────────────────────────────────────
 

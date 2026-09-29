@@ -113,6 +113,22 @@ pub async fn handle_request(
     Some(result)
 }
 
+/// True for exactly the methods [`handle_request`]'s match answers itself
+/// (`initialize`, `ping`, `tools/list`, `tools/call`) rather than falling
+/// through to `METHOD_NOT_FOUND` — single source of truth with the match
+/// above, so a method added there must be added here too (see the unit test
+/// below, which pins both halves of that list together).
+///
+/// Used by the route layer (`oss/server/src/mcp/handlers/gateway.rs`) to gate
+/// `MCP-Protocol-Version` header enforcement: streamable-http clients probe
+/// with a method this gateway doesn't implement (e.g. `server/discover`)
+/// before ever calling `initialize`, relying on our `-32601` to trigger their
+/// fallback — that probe must not be rejected with a bare 400 just because it
+/// carries a protocol version we haven't negotiated yet.
+pub fn implements(method: &str) -> bool {
+    matches!(method, "initialize" | "ping" | "tools/list" | "tools/call")
+}
+
 /// Version reported in `initialize`'s `serverInfo.version` — the gateway's own
 /// release marker, unrelated to the negotiated MCP protocol version above it.
 const GATEWAY_SERVER_VERSION: &str = "1.1.0";
@@ -1378,6 +1394,19 @@ mod tests {
     use crate::types::Stance;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn implements_matches_the_dispatch_match_arms() {
+        for method in ["initialize", "ping", "tools/list", "tools/call"] {
+            assert!(implements(method), "{method} must report implemented");
+        }
+        assert!(
+            !implements("server/discover"),
+            "an unhandled method must report unimplemented so the route layer's \
+             MCP-Protocol-Version gate does not block a streamable-http client's \
+             fallback probe"
+        );
+    }
 
     fn test_state() -> McpState {
         let db = sqlx::PgPool::connect_lazy("postgres://user:pass@127.0.0.1:1/db")

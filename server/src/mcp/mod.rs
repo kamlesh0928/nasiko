@@ -41,7 +41,11 @@ pub use handlers::sharing::grant_response;
 /// [`upload_mutation_router`]'s own `DefaultBodyLimit`) — axum's blanket 2 MiB
 /// default would reject the inline `save_file` payloads a later task
 /// introduces, and raising the workspace-wide default is unwarranted for
-/// every other route.
+/// every other route. `DefaultBodyLimit` applies before token authentication
+/// (JSON body extraction happens first in the handler), so an unauthenticated
+/// caller can make the server buffer up to this many bytes before the 401 —
+/// acceptable for a single-tenant deployment; revisit if this route is ever
+/// exposed multi-tenant.
 pub fn agent_gateway_router(max_body_bytes: usize) -> Router<AppState> {
     Router::new()
         .route("/mcp", post(handlers::gateway::mcp_gateway))

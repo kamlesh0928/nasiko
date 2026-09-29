@@ -42,13 +42,16 @@ use crate::usage::TokenUsageBuilder;
     params(
         ("Authorization" = String, Header, description = "`Bearer <MCP_GATEWAY_TOKEN>` — the per-agent gateway credential injected into the container env at deploy time"),
         ("traceparent" = Option<String>, Header, description = "W3C trace context naming the flow this call belongs to — required for `tools/call`; the user identity is resolved from the flow record"),
+        ("MCP-Protocol-Version" = Option<String>, Header, description = "Negotiated MCP protocol version; an unsupported value is rejected with 400 on implemented methods"),
     ),
     request_body(content = Object, description = "JSON-RPC 2.0 request: `tools/list` or `tools/call`"),
     responses(
         (status = 200, description = "JSON-RPC 2.0 response (result or error object)", body = Object),
         (status = 202, description = "Notification accepted (no `id` in request); empty object body", body = Object),
+        (status = 400, description = "Unsupported or undecodable `MCP-Protocol-Version` on a method this gateway implements"),
         (status = 401, description = "Missing/unknown/revoked gateway token"),
         (status = 403, description = "`tools/call` outside a live flow the agent participates in, or identity store unavailable"),
+        (status = 413, description = "Request body over the configured `MCP_GATEWAY_MAX_BODY_BYTES` limit"),
     ),
 )]
 pub async fn mcp_gateway(
@@ -90,13 +93,16 @@ pub async fn mcp_gateway(
     params(
         ("token" = String, Path, description = "The per-agent `MCP_GATEWAY_TOKEN`, carried in the path for MCP clients that cannot set headers. Pre-composed as `MCP_GATEWAY_CONNECT_URL` in the container env."),
         ("traceparent" = Option<String>, Header, description = "W3C trace context naming the flow this call belongs to — required for `tools/call`; the user identity is resolved from the flow record"),
+        ("MCP-Protocol-Version" = Option<String>, Header, description = "Negotiated MCP protocol version; an unsupported value is rejected with 400 on implemented methods"),
     ),
     request_body(content = Object, description = "JSON-RPC 2.0 request: `tools/list` or `tools/call`"),
     responses(
         (status = 200, description = "JSON-RPC 2.0 response (result or error object)", body = Object),
         (status = 202, description = "Notification accepted (no `id` in request); empty object body", body = Object),
+        (status = 400, description = "Unsupported or undecodable `MCP-Protocol-Version` on a method this gateway implements"),
         (status = 401, description = "Unknown/revoked gateway token"),
         (status = 403, description = "`tools/call` outside a live flow the agent participates in, or identity store unavailable"),
+        (status = 413, description = "Request body over the configured `MCP_GATEWAY_MAX_BODY_BYTES` limit"),
     ),
 )]
 pub async fn mcp_gateway_via_url(
@@ -130,34 +136,57 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
         }
     };
 
-    // Per the MCP spec, a client that negotiated a protocol version in
-    // `initialize` sends `MCP-Protocol-Version` on every subsequent request.
-    // The header is optional — a client that never negotiated (or an old
-    // client predating this) never sends it — but a version we don't
-    // implement is rejected outright rather than silently ignored.
-    if let Some(v) = headers
-        .get("mcp-protocol-version")
-        .and_then(|v| v.to_str().ok())
-        && !nasiko_mcp_gateway::types::SUPPORTED_PROTOCOL_VERSIONS.contains(&v)
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "unsupported MCP-Protocol-Version '{v}' (supported: {})",
-                nasiko_mcp_gateway::types::SUPPORTED_PROTOCOL_VERSIONS.join(", ")
-            ),
-        )
-            .into_response();
-    }
-
-    let traceparent = headers
-        .get(nasiko_flow::TRACEPARENT_HEADER)
-        .and_then(|v| v.to_str().ok());
+    // `method` must be known before the protocol-version check below, because
+    // the check is gated on it: streamable-http clients (openai-agents,
+    // pydantic-ai, Claude Code) open a session with a method this gateway
+    // doesn't implement (e.g. `server/discover`), carrying whatever protocol
+    // version they intend to negotiate, and rely on our `-32601` to trigger
+    // their fallback to `initialize`. Rejecting that first probe with a bare
+    // 400 breaks the fallback outright, so the header is enforced only for
+    // methods this gateway actually answers (`protocol::implements`) — and
+    // never for `initialize` itself, which is the negotiation request.
     let method = body
         .get("method")
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
+
+    // Per the MCP spec, a client that negotiated a protocol version in
+    // `initialize` sends `MCP-Protocol-Version` on every subsequent request.
+    // The header is optional — a client that never negotiated (or an old
+    // client predating this) never sends it — but on a method we do
+    // implement, a version we don't (or a header we can't even decode) is
+    // rejected outright rather than silently ignored.
+    if method != "initialize" && protocol::implements(&method) {
+        match headers
+            .get(nasiko_mcp_gateway::types::PROTOCOL_VERSION_HEADER)
+            .map(|v| v.to_str())
+        {
+            None => {}
+            Some(Ok(v)) if nasiko_mcp_gateway::types::SUPPORTED_PROTOCOL_VERSIONS.contains(&v) => {}
+            Some(Ok(v)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "unsupported MCP-Protocol-Version '{v}' (supported: {})",
+                        nasiko_mcp_gateway::types::SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+                    ),
+                )
+                    .into_response();
+            }
+            Some(Err(_)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "MCP-Protocol-Version header is not valid visible ASCII",
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let traceparent = headers
+        .get(nasiko_flow::TRACEPARENT_HEADER)
+        .and_then(|v| v.to_str().ok());
     let tool_name = body
         .get("params")
         .and_then(|p| p.get("name"))

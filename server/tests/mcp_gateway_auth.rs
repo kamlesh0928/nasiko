@@ -572,3 +572,170 @@ async fn missing_protocol_version_header_still_succeeds() {
     assert_eq!(resp.status(), 200);
     server.cleanup().await;
 }
+
+#[tokio::test]
+#[serial]
+async fn unimplemented_method_probe_is_not_blocked_by_protocol_version_header() {
+    // openai-agents, pydantic-ai, and Claude Code's streamable-http clients open
+    // a session with a method this gateway doesn't implement (`server/discover`),
+    // carrying whatever protocol version they intend to negotiate, and rely on a
+    // clean -32601 to trigger their fallback to `initialize`. The header check
+    // must not block that first probe just because it names a version we've
+    // never negotiated — regression test for the ordering bug in 5ee205ca.
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "gw-owner-probe").await;
+    let agent_id = seed_agent(&server, owner, "probe-agent").await;
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+
+    let resp = server
+        .client
+        .post(server.url("/api/mcp"))
+        .bearer_auth(&token)
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .json(&rpc("server/discover"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"]["code"],
+        nasiko_mcp_gateway::types::codes::METHOD_NOT_FOUND,
+        "unhandled method must fall through to a clean JSON-RPC -32601, got: {body}"
+    );
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn initialize_negotiates_even_with_an_unnegotiated_header_value() {
+    // `initialize` is the negotiation request itself — it must never be gated
+    // by a header value the client couldn't yet have negotiated.
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "gw-owner-init-pv").await;
+    let agent_id = seed_agent(&server, owner, "init-pv-agent").await;
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+
+    let resp = server
+        .client
+        .post(server.url("/api/mcp"))
+        .bearer_auth(&token)
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .json(&rpc("initialize"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let negotiated = body["result"]["protocolVersion"]
+        .as_str()
+        .expect("initialize must return a protocolVersion");
+    assert!(
+        nasiko_mcp_gateway::types::SUPPORTED_PROTOCOL_VERSIONS.contains(&negotiated),
+        "negotiated version {negotiated} must be one we support"
+    );
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn implemented_method_still_gates_on_protocol_version_header() {
+    // The check must still bite where it should: a method the gateway does
+    // implement, carrying a version it doesn't.
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "gw-owner-gate").await;
+    let agent_id = seed_agent(&server, owner, "gate-agent").await;
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+
+    let resp = server
+        .client
+        .post(server.url("/api/mcp"))
+        .bearer_auth(&token)
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .json(&rpc("tools/list"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn undecodable_protocol_version_header_is_400() {
+    // A header that fails `to_str()` (not valid visible ASCII) must be
+    // rejected outright when the check applies, not silently treated as
+    // absent.
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "gw-owner-badenc").await;
+    let agent_id = seed_agent(&server, owner, "badenc-agent").await;
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+
+    let resp = server
+        .client
+        .post(server.url("/api/mcp"))
+        .bearer_auth(&token)
+        .header("MCP-Protocol-Version", &b"\xff\xfe"[..])
+        .json(&rpc("tools/list"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    server.cleanup().await;
+}
+
+// ─── `/api/mcp` body-size limit ────────────────────────────────────────────
+//
+// The gateway routes raise axum's blanket 2 MiB default to
+// `MCP_GATEWAY_MAX_BODY_BYTES` (8 MiB in this test config, matching
+// production's default) — see `oss/server/src/mcp/mod.rs::agent_gateway_router`.
+
+fn rpc_padded(method: &str, pad_bytes: usize) -> serde_json::Value {
+    serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method,
+        "params": {"name": "some__tool", "arguments": {}, "pad": "a".repeat(pad_bytes)}})
+}
+
+#[tokio::test]
+#[serial]
+async fn a_body_under_the_raised_limit_is_not_rejected() {
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "gw-owner-body-ok").await;
+    let agent_id = seed_agent(&server, owner, "body-agent-ok").await;
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+
+    let resp = server
+        .client
+        .post(server.url("/api/mcp"))
+        .bearer_auth(&token)
+        .json(&rpc_padded("tools/list", 3 * 1024 * 1024))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        413,
+        "a ~3 MiB body must fit under the raised 8 MiB limit — axum's own 2 MiB \
+         default would have rejected it"
+    );
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_body_over_the_raised_limit_is_413() {
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "gw-owner-body-big").await;
+    let agent_id = seed_agent(&server, owner, "body-agent-big").await;
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+
+    let resp = server
+        .client
+        .post(server.url("/api/mcp"))
+        .bearer_auth(&token)
+        .json(&rpc_padded("tools/list", 9 * 1024 * 1024))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413);
+    server.cleanup().await;
+}
