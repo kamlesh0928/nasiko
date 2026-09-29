@@ -1,20 +1,32 @@
 //! `provider_type='system'` connector rows — schema-only coverage for
-//! `0041_workspace.sql`.
+//! `0041_workspace.sql`, plus an end-to-end proof that a system connector
+//! actually works through the real gateway.
 //!
 //! `chk_connectors_provider_fields` (0003_mcp.sql) originally allowed only the
 //! `composio`/`mcp_server` field combinations; a `provider_type='system'` row
 //! (however `source_kind`/`auth_type` were set) was rejected by that CHECK
 //! even after `mcp_connectors_provider_type_check` was widened to permit the
-//! value. This proves the migration's follow-up fix — dropping and
-//! re-adding `chk_connectors_provider_fields` with a `system` clause — lets a
-//! minimal system-connector row actually insert. No route or application
-//! code is exercised here; a later task adds the row a real deployment would
-//! use (public grant, real loopback URL) and the routes that serve it.
+//! value. The three tests below prove the migration's follow-up fix —
+//! dropping and re-adding `chk_connectors_provider_fields` with a `system`
+//! clause — lets a minimal system-connector row actually insert, and that a
+//! NULL `url` / non-`none` `auth_type` are still rejected by the same clause.
+//!
+//! `system_connector_end_to_end_through_the_real_gateway` below is the actual
+//! acceptance test for Task 1.3/1.9: it inserts the rows a real deployment
+//! would use (public grant, synced tool catalog, per-agent access) against a
+//! real stub MCP backend and drives `/api/mcp` exactly as a deployed agent
+//! would — no route or application code is exercised in the three
+//! schema-only tests above.
 
 mod common;
 
+use std::sync::{Arc, Mutex};
+
+use axum::{Json, Router, extract::State, routing::post};
 use common::TestServer;
+use serde_json::{Value, json};
 use serial_test::serial;
+use uuid::Uuid;
 
 #[tokio::test]
 #[serial]
@@ -48,6 +60,296 @@ async fn a_minimal_system_connector_row_can_be_inserted() {
             .expect("row must be readable back");
     assert_eq!(provider_type, "system");
     assert_eq!(source_kind, "system");
+
+    server.cleanup().await;
+}
+
+/// `chk_connectors_provider_fields`'s `system` clause requires `url IS NOT
+/// NULL` — a system connector's whole point is a real loopback address, never
+/// the "not yet built" NULL a `source_kind='uploaded_build'` row can have.
+#[tokio::test]
+#[serial]
+async fn a_system_connector_row_with_null_url_is_rejected() {
+    let server = TestServer::start().await;
+
+    let result = sqlx::query(
+        "INSERT INTO mcp_connectors (provider_type, source_kind, name, url, auth_type) \
+         VALUES ('system', 'system', 'workspace-null-url', NULL, 'none')",
+    )
+    .execute(&server.db)
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a system row with NULL url must violate chk_connectors_provider_fields"
+    );
+
+    server.cleanup().await;
+}
+
+/// The same clause requires `auth_type IS NOT DISTINCT FROM 'none'` — a
+/// system connector is served by the control plane itself with no per-user
+/// credential (`credentials::build_server_config` never reaches any other
+/// auth_type arm for one), so any other value must be rejected.
+#[tokio::test]
+#[serial]
+async fn a_system_connector_row_with_bearer_auth_type_is_rejected() {
+    let server = TestServer::start().await;
+
+    let result = sqlx::query(
+        "INSERT INTO mcp_connectors (provider_type, source_kind, name, url, auth_type) \
+         VALUES ('system', 'system', 'workspace-bearer-auth', 'http://127.0.0.1:1/mcp', 'bearer')",
+    )
+    .execute(&server.db)
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a system row with auth_type='bearer' must violate chk_connectors_provider_fields"
+    );
+
+    server.cleanup().await;
+}
+
+// ─── End-to-end: a system connector through the real gateway ──────────────
+
+async fn seed_user(server: &TestServer, name: &str) -> Uuid {
+    sqlx::query_scalar("INSERT INTO users (username, email) VALUES ($1, $2) RETURNING id")
+        .bind(name)
+        .bind(format!("{name}@test.local"))
+        .fetch_one(&server.db)
+        .await
+        .expect("seed user")
+}
+
+async fn seed_agent(server: &TestServer, owner_id: Uuid, name: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO agents (name, owner_id, image, status) \
+         VALUES ($1, $2, 'nasiko/echo:1.0.0', 'running') RETURNING id",
+    )
+    .bind(name)
+    .bind(owner_id)
+    .fetch_one(&server.db)
+    .await
+    .expect("seed agent")
+}
+
+/// Names of the two tools the stub system backend advertises.
+const SAVE_FILE: &str = "save_file";
+const LIST_FILES: &str = "list_files";
+
+/// Tracks every `tools/call` the stub backend actually received, by tool name.
+type CallLog = Arc<Mutex<Vec<String>>>;
+
+/// A real MCP JSON-RPC backend standing in for a platform-owned system
+/// connector: answers `initialize` with a fixed `instructions` string,
+/// `tools/list` with `save_file`/`list_files`, and records every `tools/call`.
+/// Same shape as `mcp_e2e_agent_flow.rs::start_stub_mcp_backend` — a
+/// `provider_type='system'` connector is `trusted` (see
+/// `credentials::build_server_config`), so its calls bypass the SSRF guard
+/// entirely regardless of URL; unlike that file's test, no
+/// `MCP_ALLOW_PRIVATE_URLS` / `allow_private_urls()` dance is needed here
+/// because this test never goes through the guarded connector-registration
+/// HTTP route (`POST /api/mcp/connectors`) — the row is inserted directly by
+/// SQL, exactly as the platform itself would create one.
+async fn start_stub_system_backend() -> (String, CallLog) {
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+
+    async fn handle(State(calls): State<CallLog>, Json(body): Json<Value>) -> Json<Value> {
+        let id = body.get("id").cloned().unwrap_or(Value::Null);
+        let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+
+        match method {
+            "initialize" => Json(json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "serverInfo": {"name": "workspace-stub", "version": "1.0"},
+                    "instructions": "WS-E2E-INSTR",
+                },
+            })),
+            "tools/list" => Json(json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {
+                    "tools": [
+                        {"name": SAVE_FILE, "description": "save a file", "inputSchema": {"type": "object"}},
+                        {"name": LIST_FILES, "description": "list files", "inputSchema": {"type": "object"}},
+                    ]
+                },
+            })),
+            "tools/call" => {
+                let name = body["params"]["name"].as_str().unwrap_or("").to_string();
+                calls.lock().unwrap().push(name.clone());
+                Json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"content": [{"type": "text", "text": format!("stub executed '{name}'")}]},
+                }))
+            }
+            other => Json(json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": {"code": -32601, "message": format!("stub: method not found: {other}")},
+            })),
+        }
+    }
+
+    let app = Router::new()
+        .route("/mcp", post(handle))
+        .with_state(calls.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (format!("http://127.0.0.1:{port}/mcp"), calls)
+}
+
+/// Task 1.3/1.9's actual acceptance test: a `provider_type='system'`
+/// connector — the synced catalog (`mcp_connector_tools`), a public grant,
+/// and a per-agent access row, all inserted exactly as the platform itself
+/// would (via SQL, not the connector-registration API, which rejects any
+/// `provider_type` other than `mcp_server` — see `net.rs`'s and
+/// `types.rs`'s `trusted` doc comments) — driven through the real
+/// `/api/mcp` gateway exactly as a deployed agent would: its gateway
+/// bearer token plus the traceparent of a live flow it participates in.
+#[tokio::test]
+#[serial]
+async fn system_connector_end_to_end_through_the_real_gateway() {
+    // The default test config's `mcp_tool_search_mode` (`""`) parses to
+    // `ToolSearchMode::Semantic` (`config::ToolSearchMode::parse`'s fallback
+    // for an unrecognized value) — under which `tools/list` returns only
+    // search-index matches plus the `nasiko_search_tools` meta-tool, never
+    // the full manifest (`protocol::handle_tools_list`). This test asserts
+    // the literal bare tool-name set the manifest carries, so it needs the
+    // legacy eager-fan-out path; disable search explicitly, the same
+    // `TestServer::start_with` override mechanism
+    // `mcp_session_grant_stability.rs` uses for its own `McpConfig`.
+    let server = TestServer::start_with(|cfg| {
+        cfg.mcp_tool_search_mode = "none".to_string();
+    })
+    .await;
+
+    let owner = seed_user(&server, "ws-e2e-owner").await;
+    let agent_id = seed_agent(&server, owner, "ws-e2e-agent").await;
+
+    let (backend_url, backend_calls) = start_stub_system_backend().await;
+
+    let connector_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO mcp_connectors (provider_type, source_kind, name, url, auth_type, instructions) \
+         VALUES ('system', 'system', 'workspace-e2e-connector', $1, 'none', 'WS-E2E-INSTR') \
+         RETURNING id",
+    )
+    .bind(&backend_url)
+    .fetch_one(&server.db)
+    .await
+    .expect("insert system connector");
+
+    sqlx::query(
+        "INSERT INTO mcp_connector_grants (connector_id, grant_type, grantee_id) \
+         VALUES ($1, 'public', '*')",
+    )
+    .bind(connector_id)
+    .execute(&server.db)
+    .await
+    .expect("insert public grant");
+
+    for tool in [SAVE_FILE, LIST_FILES] {
+        sqlx::query("INSERT INTO mcp_connector_tools (connector_id, tool_name) VALUES ($1, $2)")
+            .bind(connector_id)
+            .bind(tool)
+            .execute(&server.db)
+            .await
+            .expect("insert synced connector tool");
+    }
+
+    sqlx::query(
+        "INSERT INTO mcp_agent_connector_access (agent_id, connector_id, enabled) \
+         VALUES ($1, $2, true)",
+    )
+    .bind(agent_id)
+    .bind(connector_id)
+    .execute(&server.db)
+    .await
+    .expect("insert agent connector access");
+
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+    let (_flow_id, traceparent) = common::open_flow(&server.db, owner, agent_id).await;
+
+    let mcp = |body: Value| {
+        server
+            .client
+            .post(server.url("/api/mcp"))
+            .bearer_auth(&token)
+            .header("traceparent", &traceparent)
+            .json(&body)
+    };
+
+    // ── initialize: the connector's harvested instructions ride along ──────
+    let res = mcp(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    let instructions = body["result"]["instructions"].as_str().unwrap_or_default();
+    assert!(
+        instructions.contains("WS-E2E-INSTR"),
+        "initialize must forward the connector's instructions: {body:?}"
+    );
+
+    // ── tools/list: exactly the two synced tools, bare (no connector prefix) ──
+    let res = mcp(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    let tools = body["result"]["tools"].as_array().expect("tools array");
+    let mut names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec![LIST_FILES, SAVE_FILE],
+        "tools/list must carry exactly the synced catalog's tools, un-namespaced: {body:?}"
+    );
+
+    // ── tools/call save_file: reaches the stub, by its bare name ────────────
+    let res = mcp(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": SAVE_FILE, "arguments": {}},
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert!(
+        body.get("error").is_none(),
+        "save_file call must not error: {body:?}"
+    );
+    assert_eq!(
+        backend_calls.lock().unwrap().as_slice(),
+        &[SAVE_FILE.to_string()],
+        "the stub must have recorded exactly one tools/call, for save_file"
+    );
+
+    // ── tools/call COMPOSIO_SEARCH_TOOLS: never reaches this stub ───────────
+    let res = mcp(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": {"name": "COMPOSIO_SEARCH_TOOLS", "arguments": {}},
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(res.status(), 200, "JSON-RPC errors are still HTTP 200");
+    assert_eq!(
+        backend_calls.lock().unwrap().as_slice(),
+        &[SAVE_FILE.to_string()],
+        "the stub's call log must be unchanged — a Composio meta-tool name \
+         must never reach the system backend, whatever error the gateway \
+         itself returns for it"
+    );
 
     server.cleanup().await;
 }

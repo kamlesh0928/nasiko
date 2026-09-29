@@ -88,7 +88,7 @@ fn classify_response(status: StatusCode, www_authenticate: &str) -> DetectedAuth
 /// its own. Both `None` for an unsuccessful or unparsable response — this is
 /// enrichment, never something a caller should fail over.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProbedMetadata {
+pub(crate) struct ProbedMetadata {
     pub instructions: Option<String>,
     pub server_description: Option<String>,
 }
@@ -106,8 +106,37 @@ impl ProbedMetadata {
     }
 }
 
+/// Harvested-instructions cap: this text is forwarded verbatim into every
+/// agent's `initialize` response and, from there, straight into the agent's
+/// own system prompt (`protocol.rs::connector_instructions`) — a third-party
+/// server is otherwise free to inject an unbounded amount of untrusted text
+/// there. 8 KiB is generous for a real `instructions` field (a sentence or
+/// two, per the MCP spec's intent) while bounding the worst case.
+const MAX_INSTRUCTIONS_BYTES: usize = 8 * 1024;
+
+/// Truncate `instructions` to [`MAX_INSTRUCTIONS_BYTES`] at a char boundary,
+/// warning when it actually cuts something — called once, at harvest time
+/// (`probe_initialize`), so every caller of `ProbedMetadata` downstream
+/// (registration, re-probe) gets an already-bounded value without having to
+/// remember to cap it themselves.
+fn cap_instructions(instructions: String) -> String {
+    if instructions.len() <= MAX_INSTRUCTIONS_BYTES {
+        return instructions;
+    }
+    let mut end = MAX_INSTRUCTIONS_BYTES;
+    while !instructions.is_char_boundary(end) {
+        end -= 1;
+    }
+    tracing::warn!(
+        original_bytes = instructions.len(),
+        capped_bytes = end,
+        "harvested MCP `instructions` exceeded the cap — truncating before it reaches any agent's system prompt"
+    );
+    instructions[..end].to_string()
+}
+
 /// POST a bare `initialize` and classify the response into an auth type + status.
-pub async fn probe_initialize(
+pub(crate) async fn probe_initialize(
     http_client: &reqwest::Client,
     url: &str,
 ) -> std::result::Result<(DetectedAuthType, u16, ProbedMetadata), reqwest::Error> {
@@ -168,7 +197,7 @@ pub async fn probe_initialize(
             })
             .and_then(|v| v.get("result").cloned())
             .map(|result| ProbedMetadata {
-                instructions: first_str(&result, &["instructions"]),
+                instructions: first_str(&result, &["instructions"]).map(cap_instructions),
                 server_description: result
                     .get("serverInfo")
                     .and_then(|si| first_str(si, &["description"])),
@@ -1434,6 +1463,38 @@ mod tests {
         // `serverInfo` here carries no `description` field at all — must not
         // be conflated with `instructions`.
         assert_eq!(metadata.server_description, None);
+    }
+
+    /// A third-party server's `instructions` is forwarded verbatim into every
+    /// agent's system prompt — an oversized value must be capped at harvest
+    /// time (`cap_instructions`), not left for every downstream consumer to
+    /// remember to bound.
+    #[tokio::test]
+    async fn probe_initialize_truncates_oversized_instructions() {
+        let oversized = "a".repeat(MAX_INSTRUCTIONS_BYTES + 1024);
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"instructions": oversized},
+        })
+        .to_string();
+
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/mcp")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let (_, _, metadata) = probe_initialize(&client, &format!("{}/mcp", server.url()))
+            .await
+            .unwrap();
+
+        let instructions = metadata.instructions.expect("instructions must be present");
+        assert_eq!(instructions.len(), MAX_INSTRUCTIONS_BYTES);
+        assert!(instructions.chars().all(|c| c == 'a'));
     }
 
     #[tokio::test]

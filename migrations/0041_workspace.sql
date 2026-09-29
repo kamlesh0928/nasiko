@@ -14,11 +14,23 @@ ALTER TABLE mcp_connectors ADD COLUMN IF NOT EXISTS instructions TEXT;
 -- mcp_server field combinations, so a provider_type='system' row (however
 -- source_kind/auth_type are set) still cannot be inserted without this.
 -- Existing clauses reproduced verbatim; only the trailing `system` clause is
--- new. A system connector is always url-set (loopback address, never NULL
--- pending a build like uploaded_build) and auth_type='none' (no per-user
--- credential — see credentials::build_server_config, which never reaches the
--- other auth_type arms for a provider_type='system' row today; that invariant
--- is enforced here, not just assumed).
+-- new. It requires url IS NOT NULL, source_kind='system' (ties the two
+-- columns together — nothing above stops a 'system' provider_type from
+-- pairing with, say, source_kind='external_url' otherwise), and
+-- auth_type='none' (no per-user credential — see
+-- credentials::build_server_config, which never reaches the other auth_type
+-- arms for a provider_type='system' row today).
+--
+-- The auth_type comparison uses `IS NOT DISTINCT FROM` rather than `=`: a
+-- CHECK constraint only rejects a row when its expression evaluates to
+-- FALSE, and treats NULL as passing, same as every other row-level check —
+-- so a plain `auth_type = 'none'` would let a system row with auth_type
+-- NULL silently through (the clause evaluates NULL, not FALSE) rather than
+-- rejecting it. `source_kind::text = 'system'` (not a bare `=` against the
+-- enum) is required because `source_kind` is only widened to accept the
+-- 'system' value a few statements above in this same migration file, and
+-- Postgres refuses to use a newly added enum value inside the transaction
+-- that added it; comparing as text sidesteps that restriction.
 ALTER TABLE mcp_connectors DROP CONSTRAINT IF EXISTS chk_connectors_provider_fields;
 ALTER TABLE mcp_connectors
     ADD CONSTRAINT chk_connectors_provider_fields CHECK (
@@ -30,5 +42,6 @@ ALTER TABLE mcp_connectors
                 (build_status = 'running' AND url IS NOT NULL)
             ))
         )) OR
-        (provider_type = 'system' AND url IS NOT NULL AND auth_type = 'none')
+        (provider_type = 'system' AND url IS NOT NULL
+            AND auth_type IS NOT DISTINCT FROM 'none' AND source_kind::text = 'system')
     );

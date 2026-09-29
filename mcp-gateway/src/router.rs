@@ -190,6 +190,41 @@ mod tests {
     }
 
     #[test]
+    fn system_server_with_empty_url_is_skipped_for_bare_names() {
+        // Same shape as `system_srv`, but `url` empty — the connector's
+        // container/backend isn't currently resolvable (mirrors
+        // `prefix_matches_connector_but_url_is_empty_is_treated_as_unavailable`
+        // for the namespaced-prefix path). A bare name it would otherwise own
+        // must fall through exactly as if the system server weren't present
+        // at all, never be routed to a backend with nowhere to send the call.
+        let mut sys = system_srv(&["save_file"]);
+        sys.url = String::new();
+        let composio = srv(ServerType::Composio, Uuid::nil(), "http://c");
+        let servers = vec![sys, composio];
+        let (s, orig) = route_tool("save_file", &servers).unwrap();
+        assert_eq!(s.kind, ServerType::Composio);
+        assert_eq!(orig, "save_file");
+    }
+
+    #[test]
+    fn prefixed_name_addressed_to_a_system_connector_still_routes_to_it() {
+        // Pins CURRENT behavior, not a requirement: nothing in `route_tool`'s
+        // namespaced-prefix branch excludes `system` servers — it matches on
+        // `kind == ServerType::Mcp` and the connector prefix alone, same as
+        // any other generic backend. So `{prefix}__save_file` addressed to a
+        // system connector's own prefix reaches it, exactly like a bare
+        // `save_file` would via the system-catalog branch above. This is
+        // intentional: an agent that happens to namespace a system tool's
+        // name still reaches the right backend, it's just redundant.
+        let sys = system_srv(&["save_file"]);
+        let name = format!("{}__save_file", connector_prefix(sys.connector_id));
+        let servers = vec![sys.clone()];
+        let (s, orig) = route_tool(&name, &servers).unwrap();
+        assert_eq!(s.connector_id, sys.connector_id);
+        assert_eq!(orig, "save_file");
+    }
+
+    #[test]
     fn bare_name_owned_by_nobody_errors_without_composio() {
         // Same as above, but with no Composio backend at all — the existing
         // "Unknown tool" error path, unchanged by the system server's presence.
