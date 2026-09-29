@@ -33,6 +33,10 @@ use crate::usage::TokenUsageBuilder;
 /// 1. bearer token missing/unknown/revoked → 401
 /// 2. `tools/list` (and initialize/ping) → allowed with agent-only identity
 /// 3. `tools/call` with no/unknown/dead-flow traceparent → 403
+/// 3b. …unless the agent's row is a CLI-bound local coding agent
+///     (`coding_agent_integration_id` set, spec §16 A3) — such a row is never
+///     dispatched through a flow, so a flow-less `tools/call` resolves to its
+///     owner instead of 403 (`coding_agent_owner`, below `dispatch`)
 /// 4. `tools/call` where the agent is not a recorded flow participant → 403
 /// 5. identity store unreachable → 403
 #[utoipa::path(
@@ -50,7 +54,7 @@ use crate::usage::TokenUsageBuilder;
         (status = 202, description = "Notification accepted (no `id` in request); empty object body", body = Object),
         (status = 400, description = "Unsupported or undecodable `MCP-Protocol-Version` on a method this gateway implements"),
         (status = 401, description = "Missing/unknown/revoked gateway token"),
-        (status = 403, description = "`tools/call` outside a live flow the agent participates in, or identity store unavailable"),
+        (status = 403, description = "`tools/call` outside a live flow the agent participates in (except a local coding-agent row, which resolves to its owner instead), or identity store unavailable"),
         (status = 413, description = "Request body over the configured `MCP_GATEWAY_MAX_BODY_BYTES` limit"),
     ),
 )]
@@ -101,7 +105,7 @@ pub async fn mcp_gateway(
         (status = 202, description = "Notification accepted (no `id` in request); empty object body", body = Object),
         (status = 400, description = "Unsupported or undecodable `MCP-Protocol-Version` on a method this gateway implements"),
         (status = 401, description = "Unknown/revoked gateway token"),
-        (status = 403, description = "`tools/call` outside a live flow the agent participates in, or identity store unavailable"),
+        (status = 403, description = "`tools/call` outside a live flow the agent participates in (except a local coding-agent row, which resolves to its owner instead), or identity store unavailable"),
         (status = 413, description = "Request body over the configured `MCP_GATEWAY_MAX_BODY_BYTES` limit"),
     ),
 )]
@@ -215,23 +219,40 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
     let (user_id, verified_flow_id) = match flow_user(state, traceparent, agent_id).await {
         Ok((user_id, flow_id)) => (user_id, Some(flow_id)),
         Err(denial) => {
-            if method == "tools/call" {
-                return denial;
-            }
-            match agent_owner(state, agent_id).await {
+            // Deliberate policy (MCP_GATEWAY_AGENT_AUTH.md §5, spec §16 A3): a
+            // local coding agent — a row the CLI bound with
+            // `coding_agent_integration_id` — is never dispatched through the
+            // proxy, so it never has a flow; it acts as its owner instead.
+            // Same predicate the LLM router uses for the same rows
+            // (`oss/llm-router/src/resolver/mod.rs`,
+            // `coding_agent_integration_id IS NOT NULL`), so the gateway and
+            // the router can never disagree about which rows are "personal
+            // desks". Every other flow-less `tools/call` stays denied;
+            // read-only methods keep the pre-existing owner fallback.
+            match coding_agent_owner(state, agent_id).await {
                 Ok(Some(owner)) => (owner, None),
-                Ok(None) => {
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        "agent no longer exists — gateway token is stale",
-                    )
-                        .into_response();
-                }
-                // Rule 5 again: an unreachable identity store is not "the agent
-                // is gone". Reporting 401 here would tell a healthy agent its
-                // credential is stale and trigger a pointless rotate/redeploy.
+                Ok(None) if method == "tools/call" => return denial,
+                Ok(None) => match agent_owner(state, agent_id).await {
+                    Ok(Some(owner)) => (owner, None),
+                    Ok(None) => {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            "agent no longer exists — gateway token is stale",
+                        )
+                            .into_response();
+                    }
+                    // Rule 5 again: an unreachable identity store is not "the
+                    // agent is gone". Reporting 401 here would tell a healthy
+                    // agent its credential is stale and trigger a pointless
+                    // rotate/redeploy.
+                    Err(e) => {
+                        tracing::error!(error = %e, %agent_id, "mcp gateway: owner lookup failed — failing closed");
+                        return (StatusCode::FORBIDDEN, "identity store unavailable")
+                            .into_response();
+                    }
+                },
                 Err(e) => {
-                    tracing::error!(error = %e, %agent_id, "mcp gateway: owner lookup failed — failing closed");
+                    tracing::error!(error = %e, %agent_id, "mcp gateway: coding-agent owner lookup failed — failing closed");
                     return (StatusCode::FORBIDDEN, "identity store unavailable").into_response();
                 }
             }
@@ -385,6 +406,25 @@ async fn agent_owner(state: &AppState, agent_id: Uuid) -> Result<Option<Uuid>, s
         .bind(agent_id)
         .fetch_optional(&state.db)
         .await
+}
+
+/// Owner of `agent_id` iff the row is a CLI-bound local coding agent
+/// (`coding_agent_integration_id` set — `oss/migrations/0019_coding_agent_identity.sql`);
+/// `None` for every other row, including a plain deployed agent with no flow.
+/// The predicate is deliberately the column itself, never agent metadata or
+/// name — matching `is_coding_agent` in `oss/llm-router/src/resolver/mod.rs`,
+/// so the gateway and the LLM router can never disagree about which rows this
+/// exemption covers. Such a row is single-owner by construction (the CLI only
+/// binds rows the login owns; `agent_owner_or_reject` gates every mint), so
+/// "the owner" is unambiguous.
+async fn coding_agent_owner(state: &AppState, agent_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT owner_id FROM agents
+         WHERE id = $1 AND deleted_at IS NULL AND coding_agent_integration_id IS NOT NULL",
+    )
+    .bind(agent_id)
+    .fetch_optional(&state.db)
+    .await
 }
 
 fn record_tool_usage(

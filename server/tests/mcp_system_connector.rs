@@ -707,3 +707,242 @@ async fn owner_fallback_tools_list_with_a_bogus_traceparent_signs_flow_id_none()
 
     server.cleanup().await;
 }
+
+/// Task 1.5's acceptance test (spec §16 A3): a local coding agent's row
+/// (`coding_agent_integration_id` set — no CLI ever dispatches it through a
+/// flow) makes a flow-less `tools/call` and the identity signed for a system
+/// backend carries the agent's *owner* as `user_id` and `flow_id: None` — the
+/// same policy `owner_fallback_tools_list_with_a_bogus_traceparent_signs_flow_id_none`
+/// proves for the read-only owner-fallback, but here for `tools/call`
+/// specifically, which every OTHER flow-less agent is still refused for
+/// (`mcp_gateway_auth.rs::coding_agent_row_without_flow_resolves_to_owner_for_tools_call`
+/// proves that half at the HTTP layer).
+#[tokio::test]
+#[serial]
+async fn coding_agent_flowless_tools_call_to_system_connector_signs_owner_identity() {
+    let server = TestServer::start_with(|cfg| {
+        cfg.mcp_tool_search_mode = "none".to_string();
+    })
+    .await;
+
+    let owner = seed_user(&server, "ws-coding-agent-owner").await;
+    let agent_id = seed_agent(&server, owner, "ws-coding-agent").await;
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(agent_id)
+        .execute(&server.db)
+        .await
+        .expect("stamp coding_agent_integration_id");
+
+    let (backend_url, _backend_calls, backend_headers) = start_stub_system_backend().await;
+
+    let connector_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO mcp_connectors (provider_type, source_kind, name, url, auth_type, instructions) \
+         VALUES ('system', 'system', 'ws-coding-agent-connector', $1, 'none', 'instr') \
+         RETURNING id",
+    )
+    .bind(&backend_url)
+    .fetch_one(&server.db)
+    .await
+    .expect("insert system connector");
+
+    sqlx::query(
+        "INSERT INTO mcp_connector_grants (connector_id, grant_type, grantee_id) \
+         VALUES ($1, 'public', '*')",
+    )
+    .bind(connector_id)
+    .execute(&server.db)
+    .await
+    .expect("insert public grant");
+
+    for tool in [SAVE_FILE, LIST_FILES] {
+        sqlx::query("INSERT INTO mcp_connector_tools (connector_id, tool_name) VALUES ($1, $2)")
+            .bind(connector_id)
+            .bind(tool)
+            .execute(&server.db)
+            .await
+            .expect("insert synced connector tool");
+    }
+
+    sqlx::query(
+        "INSERT INTO mcp_agent_connector_access (agent_id, connector_id, enabled) \
+         VALUES ($1, $2, true)",
+    )
+    .bind(agent_id)
+    .bind(connector_id)
+    .execute(&server.db)
+    .await
+    .expect("insert agent connector access");
+
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+
+    // No traceparent at all — a local coding agent, never dispatched through
+    // the proxy, never has one.
+    let res = server
+        .client
+        .post(server.url("/api/mcp"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": SAVE_FILE, "arguments": {}},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        200,
+        "a coding-agent row's flow-less tools/call must be admitted, not 403'd"
+    );
+    let body: Value = res.json().await.unwrap();
+    assert!(
+        body.get("error").is_none(),
+        "save_file call must not error: {body:?}"
+    );
+
+    let identity_header = {
+        let logged = backend_headers.lock().unwrap();
+        let (_, header) = logged
+            .iter()
+            .find(|(method, _)| method == "tools/call")
+            .expect("stub must have logged the tools/call request");
+        header
+            .clone()
+            .expect("system backend must receive x-nasiko-identity on tools/call")
+    };
+    let verified = nasiko_mcp_gateway::identity::SignedIdentity::verify(
+        &identity_header,
+        common::TEST_JWT_SECRET.as_bytes(),
+    )
+    .expect("the gateway's own signature must verify with the test signing key");
+    assert_eq!(verified.agent_id, agent_id);
+    assert_eq!(
+        verified.user_id, owner,
+        "the coding-agent owner policy's user must be the agent's owner"
+    );
+    assert_eq!(
+        verified.flow_id, None,
+        "a coding-agent row has no flow — flow_id must be None, never a \
+         fabricated value"
+    );
+
+    server.cleanup().await;
+}
+
+/// Task 1.5's third acceptance test: the owner policy is a fallback, never an
+/// override. When a coding-agent row DOES have a live flow, that flow's own
+/// user and flow id are used — seeded here for a user other than the agent's
+/// owner, so the assertion is meaningful (the owner policy would give the
+/// wrong answer if it ever won this race).
+#[tokio::test]
+#[serial]
+async fn coding_agent_row_with_a_live_flow_uses_the_flow_not_the_owner() {
+    let server = TestServer::start_with(|cfg| {
+        cfg.mcp_tool_search_mode = "none".to_string();
+    })
+    .await;
+
+    let owner = seed_user(&server, "ws-coding-agent-flow-owner").await;
+    let flow_user = seed_user(&server, "ws-coding-agent-flow-user").await;
+    let agent_id = seed_agent(&server, owner, "ws-coding-agent-flow").await;
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(agent_id)
+        .execute(&server.db)
+        .await
+        .expect("stamp coding_agent_integration_id");
+
+    let (backend_url, _backend_calls, backend_headers) = start_stub_system_backend().await;
+
+    let connector_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO mcp_connectors (provider_type, source_kind, name, url, auth_type, instructions) \
+         VALUES ('system', 'system', 'ws-coding-agent-flow-connector', $1, 'none', 'instr') \
+         RETURNING id",
+    )
+    .bind(&backend_url)
+    .fetch_one(&server.db)
+    .await
+    .expect("insert system connector");
+
+    sqlx::query(
+        "INSERT INTO mcp_connector_grants (connector_id, grant_type, grantee_id) \
+         VALUES ($1, 'public', '*')",
+    )
+    .bind(connector_id)
+    .execute(&server.db)
+    .await
+    .expect("insert public grant");
+
+    for tool in [SAVE_FILE, LIST_FILES] {
+        sqlx::query("INSERT INTO mcp_connector_tools (connector_id, tool_name) VALUES ($1, $2)")
+            .bind(connector_id)
+            .bind(tool)
+            .execute(&server.db)
+            .await
+            .expect("insert synced connector tool");
+    }
+
+    sqlx::query(
+        "INSERT INTO mcp_agent_connector_access (agent_id, connector_id, enabled) \
+         VALUES ($1, $2, true)",
+    )
+    .bind(agent_id)
+    .bind(connector_id)
+    .execute(&server.db)
+    .await
+    .expect("insert agent connector access");
+
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+    let (flow_id, traceparent) = common::open_flow(&server.db, flow_user, agent_id).await;
+
+    let res = server
+        .client
+        .post(server.url("/api/mcp"))
+        .bearer_auth(&token)
+        .header("traceparent", &traceparent)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": SAVE_FILE, "arguments": {}},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert!(
+        body.get("error").is_none(),
+        "save_file call must not error: {body:?}"
+    );
+
+    let identity_header = {
+        let logged = backend_headers.lock().unwrap();
+        let (_, header) = logged
+            .iter()
+            .find(|(method, _)| method == "tools/call")
+            .expect("stub must have logged the tools/call request");
+        header
+            .clone()
+            .expect("system backend must receive x-nasiko-identity on tools/call")
+    };
+    let verified = nasiko_mcp_gateway::identity::SignedIdentity::verify(
+        &identity_header,
+        common::TEST_JWT_SECRET.as_bytes(),
+    )
+    .expect("the gateway's own signature must verify with the test signing key");
+    assert_eq!(verified.agent_id, agent_id);
+    assert_eq!(
+        verified.user_id, flow_user,
+        "a live flow's own user must win over the coding-agent owner policy \
+         — the policy is a fallback, never an override"
+    );
+    assert_ne!(
+        verified.user_id, owner,
+        "sanity: the flow's user and the agent's owner must differ, or this \
+         assertion couldn't distinguish the two"
+    );
+    assert_eq!(
+        verified.flow_id.as_deref(),
+        Some(flow_id.as_str()),
+        "the signed identity must carry the live flow's own trace id"
+    );
+
+    server.cleanup().await;
+}

@@ -387,6 +387,51 @@ async fn tools_call_inside_a_live_flow_passes_the_auth_gate() {
     server.cleanup().await;
 }
 
+// ─── Coding-agent owner policy (spec §16 A3) ─────────────────────────────────
+//
+// A local coding agent (Claude Code / Codex / OpenCode, connected by the CLI)
+// is never dispatched through the proxy, so it never has a flow — `flow_user`
+// always fails for it. Its row is stamped `coding_agent_integration_id`, the
+// same predicate the LLM router uses (`oss/llm-router/src/resolver/mod.rs`)
+// to bill such calls to the owner with no flow; the gateway must resolve the
+// same rows to their owner so the two can never disagree. Every other
+// flow-less `tools/call` (a plain deployed agent) stays 403 — the policy is
+// narrow, keyed only on the column the platform itself sets.
+
+#[tokio::test]
+#[serial]
+async fn coding_agent_row_without_flow_resolves_to_owner_for_tools_call() {
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "gw-owner-coding").await;
+    let agent_id = seed_agent(&server, owner, "gw-agent-coding").await;
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(agent_id)
+        .execute(&server.db)
+        .await
+        .unwrap();
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+
+    // No traceparent, tools/call: a coding-agent row is admitted to the
+    // protocol layer, which answers the bogus tool name with a JSON-RPC
+    // error — but over HTTP 200, same "reached protocol handling" signal as
+    // `tools_call_inside_a_live_flow_passes_the_auth_gate` above.
+    let res = post_mcp(&server, Some(&token), None, &rpc("tools/call")).await;
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(
+        body.get("error").is_some(),
+        "unknown tool must be a JSON-RPC error, got {body}"
+    );
+
+    // A plain deployed agent (no coding_agent_integration_id) is still refused.
+    let other = seed_agent(&server, owner, "gw-agent-deployed").await;
+    let other_token = common::mint_gateway_token(&server.db, other).await;
+    let res = post_mcp(&server, Some(&other_token), None, &rpc("tools/call")).await;
+    assert_eq!(res.status(), 403);
+
+    server.cleanup().await;
+}
+
 // ─── URL-credential form: POST /api/mcp/s/{token} ────────────────────────────
 //
 // Same credential, same ladder — only the transport differs. These exist to
