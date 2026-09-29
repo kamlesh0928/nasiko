@@ -45,7 +45,7 @@ use crate::usage::TokenUsageBuilder;
     tag = "mcp",
     params(
         ("Authorization" = String, Header, description = "`Bearer <MCP_GATEWAY_TOKEN>` — the per-agent gateway credential injected into the container env at deploy time"),
-        ("traceparent" = Option<String>, Header, description = "W3C trace context naming the flow this call belongs to — required for `tools/call`; the user identity is resolved from the flow record"),
+        ("traceparent" = Option<String>, Header, description = "W3C trace context naming the flow this call belongs to — required for `tools/call`, except for a CLI-bound local coding-agent row (`coding_agent_integration_id` set), which resolves to its owner when the flow lookup fails; the user identity is resolved from the flow record"),
         ("MCP-Protocol-Version" = Option<String>, Header, description = "Negotiated MCP protocol version; an unsupported value is rejected with 400 on implemented methods"),
     ),
     request_body(content = Object, description = "JSON-RPC 2.0 request: `tools/list` or `tools/call`"),
@@ -87,16 +87,29 @@ pub async fn mcp_gateway(
 /// a credential in a URL is easier to leak than one in a header, so the server
 /// redacts this path before it reaches a span or log line
 /// (`crate::mcp::redact_credential_uri`). What keeps the exposure bounded is
-/// that this credential proves only *which agent* is calling — `tools/call`
-/// still requires a `traceparent` naming a live flow the agent participates in,
-/// so a leaked URL on its own cannot invoke a tool.
+/// that this credential proves only *which agent* is calling — for a
+/// deployed agent, `tools/call` still requires a `traceparent` naming a live
+/// flow the agent participates in, so a leaked URL on its own cannot invoke a
+/// tool.
+///
+/// That bound does NOT hold for a CLI-bound local coding-agent row
+/// (`coding_agent_integration_id` set, spec §16 A3/A4): such a row has no
+/// flow to require, so a leaked connect URL for one CAN call tools —
+/// attributed to, and scoped to, that row's owner (their own connectors and
+/// workspace only; never another user's, and never shareable to widen that
+/// scope — A4). This is the same attribution the LLM router already applies
+/// to these rows with no flow at all
+/// (`oss/llm-router/src/handlers/chat.rs:312-323`). The exposure is bounded
+/// the same way every gateway token already is: re-minting supersedes the
+/// old plaintext after a grace window (`nasiko_mcp_gateway::agent_tokens::mint`),
+/// which a CLI-triggered reconnect can drive going forward.
 #[utoipa::path(
     post,
     path = "/api/mcp/s/{token}",
     tag = "mcp",
     params(
         ("token" = String, Path, description = "The per-agent `MCP_GATEWAY_TOKEN`, carried in the path for MCP clients that cannot set headers. Pre-composed as `MCP_GATEWAY_CONNECT_URL` in the container env."),
-        ("traceparent" = Option<String>, Header, description = "W3C trace context naming the flow this call belongs to — required for `tools/call`; the user identity is resolved from the flow record"),
+        ("traceparent" = Option<String>, Header, description = "W3C trace context naming the flow this call belongs to — required for `tools/call`, except for a CLI-bound local coding-agent row (`coding_agent_integration_id` set), which resolves to its owner when the flow lookup fails; the user identity is resolved from the flow record"),
         ("MCP-Protocol-Version" = Option<String>, Header, description = "Negotiated MCP protocol version; an unsupported value is rejected with 400 on implemented methods"),
     ),
     request_body(content = Object, description = "JSON-RPC 2.0 request: `tools/list` or `tools/call`"),
@@ -200,7 +213,9 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
 
     // Resolve the user identity. `tools/call` (rules 3+4) requires the
     // traceparent to name a live flow this agent was dispatched into — the
-    // flow's user is the authorization subject. Read-only methods
+    // flow's user is the authorization subject — except for a CLI-bound
+    // local coding-agent row (rule 3b, `coding_agent_owner` below), which has
+    // no flow to require and resolves to its owner instead. Read-only methods
     // (initialize/ping/tools/list, rule 2) work agent-only: the flow user when
     // one resolves, else the agent's owner (startup-time tool discovery
     // happens outside any flow).

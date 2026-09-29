@@ -432,6 +432,52 @@ async fn coding_agent_row_without_flow_resolves_to_owner_for_tools_call() {
     server.cleanup().await;
 }
 
+#[tokio::test]
+#[serial]
+async fn soft_deleted_coding_agent_row_is_not_admitted() {
+    // A soft-deleted coding-agent row must not be waved through by the owner
+    // policy. In practice this is caught one layer up: `agent_tokens::authenticate`
+    // (rule 1) joins on `agents.deleted_at IS NULL`, so a deleted agent's
+    // gateway token stops authenticating at all — the request never reaches
+    // `dispatch`'s coding-agent-owner branch to begin with. `coding_agent_owner`
+    // itself repeats the same `deleted_at IS NULL` filter (see its doc comment
+    // in `gateway.rs`) as a second, independent safeguard, exactly like
+    // `agent_owner`'s pre-existing one — this test locks in the outcome that
+    // safeguard exists for, at the only layer an external test can observe it.
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "gw-owner-coding-del").await;
+    let agent_id = seed_agent(&server, owner, "gw-agent-coding-del").await;
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(agent_id)
+        .execute(&server.db)
+        .await
+        .unwrap();
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+
+    let res = post_mcp(&server, Some(&token), None, &rpc("tools/call")).await;
+    assert_eq!(
+        res.status(),
+        200,
+        "sanity: live coding-agent row is admitted"
+    );
+
+    sqlx::query("UPDATE agents SET deleted_at = now() WHERE id = $1")
+        .bind(agent_id)
+        .execute(&server.db)
+        .await
+        .expect("soft delete");
+
+    let res = post_mcp(&server, Some(&token), None, &rpc("tools/call")).await;
+    assert_eq!(
+        res.status(),
+        401,
+        "a soft-deleted coding-agent row's token must stop authenticating, \
+         not fall through to the owner policy"
+    );
+
+    server.cleanup().await;
+}
+
 // ─── URL-credential form: POST /api/mcp/s/{token} ────────────────────────────
 //
 // Same credential, same ladder — only the transport differs. These exist to
