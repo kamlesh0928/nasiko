@@ -20,6 +20,8 @@ fn cfg(url: String) -> MCPServerConfig {
         headers: HashMap::new(),
         transport: "streamable_http".into(),
         trusted: false,
+        system: false,
+        instructions: None,
     }
 }
 
@@ -123,6 +125,8 @@ async fn generic_injects_auth_headers() {
         headers,
         transport: "streamable_http".into(),
         trusted: false,
+        system: false,
+        instructions: None,
     };
     provider
         .list_tools(&server, std::time::Duration::from_secs(5), None)
@@ -616,6 +620,8 @@ fn loopback_cfg(port: u16, trusted: bool) -> MCPServerConfig {
         headers: HashMap::new(),
         transport: "streamable_http".into(),
         trusted,
+        system: false,
+        instructions: None,
     }
 }
 

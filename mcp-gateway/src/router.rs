@@ -36,9 +36,16 @@ pub fn route_tool<'a>(
             });
     }
 
-    // A bare (un-prefixed) name is only valid as a Composio meta-tool. Never
-    // guess a generic backend — the aggregator always namespaces generic tools,
-    // so an un-prefixed name that isn't Composio is malformed/hallucinated.
+    // Bare names belong to system backends first (they are the only generic
+    // servers exposed un-prefixed), then to Composio's meta-tools.
+    if let Some(system) = servers.iter().find(|s| s.system && !s.url.is_empty()) {
+        return Ok((system, tool_name.to_string()));
+    }
+
+    // A bare (un-prefixed) name is otherwise only valid as a Composio
+    // meta-tool. Never guess a generic backend — the aggregator always
+    // namespaces generic tools (except system ones, handled above), so an
+    // un-prefixed name that isn't Composio is malformed/hallucinated.
     if let Some(composio) = servers
         .iter()
         .find(|s| s.kind == ServerType::Composio && !s.url.is_empty())
@@ -82,6 +89,8 @@ mod tests {
             headers: HashMap::new(),
             transport: "streamable_http".into(),
             trusted: false,
+            system: false,
+            instructions: None,
         }
     }
 
@@ -111,6 +120,36 @@ mod tests {
     fn missing_prefix_is_rejected_not_fallback() {
         let servers = vec![srv(ServerType::Composio, Uuid::nil(), "http://c")];
         assert!(route_tool("abcd1234__search", &servers).is_err());
+    }
+
+    #[test]
+    fn bare_name_routes_to_a_system_server_before_composio() {
+        let sys = MCPServerConfig {
+            connector_id: Uuid::new_v4(),
+            kind: ServerType::Mcp,
+            name: "workspace".into(),
+            url: "http://127.0.0.1:1/x".into(),
+            headers: Default::default(),
+            transport: "streamable_http".into(),
+            trusted: true,
+            system: true,
+            instructions: None,
+        };
+        let composio = MCPServerConfig {
+            connector_id: Uuid::nil(),
+            kind: ServerType::Composio,
+            name: "composio".into(),
+            url: "http://c".into(),
+            headers: Default::default(),
+            transport: "streamable_http".into(),
+            trusted: false,
+            system: false,
+            instructions: None,
+        };
+        let servers = vec![composio, sys.clone()];
+        let (s, name) = route_tool("save_file", &servers).unwrap();
+        assert_eq!(s.connector_id, sys.connector_id);
+        assert_eq!(name, "save_file");
     }
 
     #[test]

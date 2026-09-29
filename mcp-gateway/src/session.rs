@@ -240,6 +240,8 @@ fn composio_config(
         headers,
         transport: "streamable_http".to_string(),
         trusted: false,
+        system: false,
+        instructions: None,
     }
 }
 

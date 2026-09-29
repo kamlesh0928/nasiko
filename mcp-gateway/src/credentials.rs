@@ -139,6 +139,7 @@ async fn build_server_config(
         }
     }
 
+    let system = connector.provider_type == "system";
     Ok(Ok(MCPServerConfig {
         connector_id: connector.id,
         kind: ServerType::Mcp,
@@ -149,10 +150,13 @@ async fn build_server_config(
             .transport
             .clone()
             .unwrap_or_else(|| "streamable_http".to_string()),
-        // The ONLY place `trusted` is ever computed — see MCPServerConfig's
-        // doc comment. Read straight off the already-joined connector row,
-        // no new query.
-        trusted: connector.source_kind == repo::SourceKind::UploadedBuild,
+        // The ONLY place `trusted`/`system` are ever computed — see
+        // MCPServerConfig's doc comment. Read straight off the already-joined
+        // connector row, no new query. Uploaded builds and system backends
+        // both live inside the platform's own network, so both are trusted.
+        trusted: connector.source_kind == repo::SourceKind::UploadedBuild || system,
+        system,
+        instructions: connector.instructions.clone(),
     }))
 }
 
@@ -423,6 +427,7 @@ mod tests {
             display_name: None,
             logo_url: None,
             description: None,
+            instructions: None,
             auth_config_id: None,
             auth_scheme: None,
             use_composio_managed: None,

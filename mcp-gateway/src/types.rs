@@ -322,6 +322,15 @@ pub struct MCPServerConfig {
     /// overridden anywhere else, and never accepted from external input.
     #[serde(default)]
     pub trusted: bool,
+    /// Platform-owned backend served by the control plane (provider_type='system'):
+    /// tools are exposed un-prefixed and requests skip the SSRF guard. Computed
+    /// only in `credentials::build_server_config`, like `trusted`.
+    #[serde(default)]
+    pub system: bool,
+    /// The backend's `initialize.instructions`, forwarded by the gateway's own
+    /// `initialize`. `None` for backends that advertise none.
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 fn default_transport() -> String {

@@ -64,17 +64,8 @@ pub async fn handle_request(
         ));
     }
 
-    match method {
-        "initialize" => {
-            return Some(handle_initialize(
-                &req_id,
-                body,
-                &state.config.gateway_instructions,
-                &[],
-            ));
-        }
-        "ping" => return Some(json!({ "jsonrpc": "2.0", "id": req_id, "result": {} })),
-        _ => {}
+    if method == "ping" {
+        return Some(json!({ "jsonrpc": "2.0", "id": req_id, "result": {} }));
     }
 
     let perms = match permissions::load_permission_context(state, agent_id).await {
@@ -85,6 +76,21 @@ pub async fn handle_request(
         Ok(r) => r,
         Err(e) => return Some(err(&req_id, e.json_rpc_code(), e.to_json_rpc().message)),
     };
+
+    // `initialize` is the one client-agnostic prompt channel the gateway has —
+    // every enabled connector's own harvested `instructions` rides on it,
+    // alongside the gateway's own sentence. This does mean `initialize` now
+    // performs the permission/session lookups above (it didn't before this
+    // was wired up); that's intended, not a leftover of moving the match arm.
+    if method == "initialize" {
+        let instr: Vec<String> = connector_instructions(&resolved.servers, &perms);
+        return Some(handle_initialize(
+            &req_id,
+            body,
+            &state.config.gateway_instructions,
+            &instr,
+        ));
+    }
 
     let result = match method {
         "tools/list" => {
@@ -178,6 +184,21 @@ pub fn handle_initialize(
         result["instructions"] = json!(instructions.join("\n\n"));
     }
     ok(req_id, result)
+}
+
+/// The instruction-collection step `handle_request` feeds into
+/// [`handle_initialize`]'s `connector_instructions` parameter: every backend
+/// enabled for this agent (Layer 2's connector-level gate — the same one
+/// `aggregator`/`tools/call` use) whose harvested `instructions` is present.
+/// Kept as its own pure function, separate from `resolve_session`/
+/// `load_permission_context` (which need a real DB this crate's hermetic unit
+/// tests can't provide), so the composition itself stays unit-testable.
+fn connector_instructions(servers: &[MCPServerConfig], perms: &PermissionContext) -> Vec<String> {
+    servers
+        .iter()
+        .filter(|s| perms.is_connector_enabled(s.connector_id))
+        .filter_map(|s| s.instructions.clone())
+        .collect()
 }
 
 /// `tools/list` — query-aware search (semantic/BM25) or eager fan-out (none mode).
@@ -1487,6 +1508,8 @@ mod tests {
                 headers: HashMap::new(),
                 transport: "streamable_http".into(),
                 trusted: false,
+                system: false,
+                instructions: None,
             }],
             connected_toolkits: vec!["gmail".into()],
             toolkit_to_connector: HashMap::from([("gmail".to_string(), cid)]),
@@ -1587,6 +1610,8 @@ mod tests {
                 headers: HashMap::new(),
                 transport: "streamable_http".into(),
                 trusted,
+                system: false,
+                instructions: None,
             }],
             connected_toolkits: vec![],
             toolkit_to_connector: HashMap::new(),
@@ -2197,5 +2222,57 @@ mod initialize_tests {
             &["  ".to_string(), " C ".to_string()],
         );
         assert_eq!(out["result"]["instructions"], json!("G\n\nC"));
+    }
+
+    // ─── connector_instructions() — the collection step `handle_request` feeds
+    // into `handle_initialize`. `resolve_session`/`load_permission_context`
+    // need a real DB this crate's hermetic tests can't provide, so the
+    // composition is tested here as its own pure function instead of through
+    // `handle_request` end-to-end (see Task 1.3's own note on this).
+
+    fn cfg(connector_id: Uuid, instructions: Option<&str>) -> MCPServerConfig {
+        MCPServerConfig {
+            connector_id,
+            kind: ServerType::Mcp,
+            name: "test".into(),
+            url: "http://127.0.0.1:1/mcp".into(),
+            headers: std::collections::HashMap::new(),
+            transport: "streamable_http".into(),
+            trusted: false,
+            system: false,
+            instructions: instructions.map(str::to_string),
+        }
+    }
+
+    fn ctx(enabled: &[Uuid]) -> PermissionContext {
+        PermissionContext {
+            agent_id: Uuid::nil(),
+            enabled_connectors: enabled.iter().copied().collect(),
+            rules: vec![],
+            hash: "h".into(),
+        }
+    }
+
+    #[test]
+    fn connector_instructions_collects_only_enabled_connectors_with_instructions() {
+        let enabled_with_instr = Uuid::new_v4();
+        let enabled_without_instr = Uuid::new_v4();
+        let disabled_with_instr = Uuid::new_v4();
+        let servers = vec![
+            cfg(enabled_with_instr, Some("WS-INSTR")),
+            cfg(enabled_without_instr, None),
+            cfg(disabled_with_instr, Some("SHOULD-NOT-APPEAR")),
+        ];
+        let perms = ctx(&[enabled_with_instr, enabled_without_instr]);
+        let got = connector_instructions(&servers, &perms);
+        assert_eq!(got, vec!["WS-INSTR".to_string()]);
+    }
+
+    #[test]
+    fn connector_instructions_is_empty_when_nothing_qualifies() {
+        let id = Uuid::new_v4();
+        let servers = vec![cfg(id, Some("X"))];
+        let perms = ctx(&[]); // never enabled
+        assert!(connector_instructions(&servers, &perms).is_empty());
     }
 }

@@ -162,6 +162,8 @@ fn mcp_session(connector_id: Uuid, backend_url: &str) -> ResolvedSession {
             headers: HashMap::new(),
             transport: "streamable_http".into(),
             trusted: false,
+            system: false,
+            instructions: None,
         }],
         connected_toolkits: vec![],
         toolkit_to_connector: HashMap::new(),

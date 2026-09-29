@@ -310,13 +310,21 @@ pub async fn register_connector(
     // field (confirmed live: Firecrawl populates this). Never blocks or fails
     // registration — a server requiring auth even for `initialize` (e.g.
     // Notion) or one that simply doesn't set `instructions` just leaves this
-    // `None`, same as before this existed.
+    // `None`, same as before this existed. The same probed value is also kept
+    // verbatim as its own column (`instructions`, distinct from
+    // `description` since 0041_workspace.sql) so the gateway's own
+    // `initialize` can forward it later, even though it's only used as a
+    // description *fallback* here.
+    let mut instructions: Option<String> = None;
     let mut description = match input.description {
         Some(d) => Some(d),
-        None => probe_initialize(&state.guarded_http_client, &input.url)
-            .await
-            .ok()
-            .and_then(|(_, _, instructions)| instructions),
+        None => {
+            instructions = probe_initialize(&state.guarded_http_client, &input.url)
+                .await
+                .ok()
+                .and_then(|(_, _, instructions)| instructions);
+            instructions.clone()
+        }
     };
 
     // LLM fallback — only reached when the server's own `initialize` response
@@ -346,6 +354,7 @@ pub async fn register_connector(
             display_name: input.display_name,
             logo_url: input.logo_url,
             description,
+            instructions,
             url: Some(input.url),
             transport: Some(input.transport),
             auth_type: Some(input.auth_type),

@@ -894,6 +894,7 @@ mod tests {
             display_name: None,
             logo_url: None,
             description: None,
+            instructions: None,
             auth_config_id: None,
             auth_scheme: None,
             use_composio_managed: None,

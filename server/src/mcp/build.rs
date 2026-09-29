@@ -468,6 +468,8 @@ pub async fn execute_mcp_server_build(
         headers: HashMap::new(),
         transport: "streamable_http".to_string(),
         trusted: true,
+        system: false,
+        instructions: None,
     };
     // The guarded client is never selected here (trusted is always true for
     // this one-off config), so a plain unconfigured client is fine as its slot.
@@ -921,6 +923,8 @@ mod tests {
             headers: HashMap::new(),
             transport: "streamable_http".to_string(),
             trusted: true,
+            system: false,
+            instructions: None,
         }
     }
 

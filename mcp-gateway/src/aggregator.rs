@@ -84,7 +84,14 @@ pub async fn aggregate_tools(
             if perms.decide(server.connector_id, &original) == ToolAccess::Denied {
                 continue;
             }
-            obj.insert("name".to_string(), json!(format!("{prefix}__{original}")));
+            // System backends are the only generic servers exposed un-prefixed
+            // (`router::route_tool` routes their bare names first) — the tool
+            // list is the model's prompt, and `{prefix}__save_file` is worse
+            // than `save_file` for a platform-owned backend the model already
+            // trusts implicitly.
+            if !server.system {
+                obj.insert("name".to_string(), json!(format!("{prefix}__{original}")));
+            }
             merged.push(tool);
         }
     }
@@ -171,6 +178,8 @@ mod tests {
             headers: HashMap::new(),
             transport: "streamable_http".into(),
             trusted: false,
+            system: false,
+            instructions: None,
         }
     }
 
@@ -497,6 +506,64 @@ mod tests {
         assert_eq!(
             merged[0]["name"],
             json!(format!("{}__read_email", connector_prefix(id)))
+        );
+    }
+
+    #[tokio::test]
+    async fn system_server_tool_keeps_its_bare_name_but_non_system_stays_prefixed() {
+        let mut sys_backend = mockito::Server::new_async().await;
+        sys_backend
+            .mock("POST", "/mcp")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"save_file"}]}}"#)
+            .create_async()
+            .await;
+        let mut generic_backend = mockito::Server::new_async().await;
+        generic_backend
+            .mock("POST", "/mcp")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"send_email"}]}}"#)
+            .create_async()
+            .await;
+
+        let sys_id = Uuid::new_v4();
+        let generic_id = Uuid::new_v4();
+        let mut sys = srv(
+            ServerType::Mcp,
+            sys_id,
+            &format!("{}/mcp", sys_backend.url()),
+        );
+        sys.system = true;
+        let generic = srv(
+            ServerType::Mcp,
+            generic_id,
+            &format!("{}/mcp", generic_backend.url()),
+        );
+
+        let state = test_state();
+        let merged = aggregate_tools(
+            &state,
+            Uuid::new_v4(),
+            &[sys, generic],
+            &[],
+            &perms_enabling(&[sys_id, generic_id]),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(merged.len(), 2);
+        assert!(
+            merged.iter().any(|t| t["name"] == json!("save_file")),
+            "a system server's tool must keep its bare name: {merged:?}"
+        );
+        assert!(
+            merged.iter().any(
+                |t| t["name"] == json!(format!("{}__send_email", connector_prefix(generic_id)))
+            ),
+            "a non-system generic server's tool must still be prefixed: {merged:?}"
         );
     }
 }
