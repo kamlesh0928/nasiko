@@ -77,11 +77,40 @@ fn classify_response(status: StatusCode, www_authenticate: &str) -> DetectedAuth
     DetectedAuthType::Bearer
 }
 
+/// What a bare `initialize` probe found in a successful response body, kept
+/// as two separate signals rather than one merged value: `instructions` is
+/// the server's own top-level self-description (MCP spec), stored verbatim
+/// in `mcp_connectors.instructions` and later forwarded by the gateway's own
+/// `initialize` — it must never be contaminated by `serverInfo.description`,
+/// a different field some servers set instead (confirmed live: Apify sets
+/// both, with different content). `server_description` is used only as a
+/// registration-time description *fallback*, never stored or forwarded on
+/// its own. Both `None` for an unsuccessful or unparsable response — this is
+/// enrichment, never something a caller should fail over.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbedMetadata {
+    pub instructions: Option<String>,
+    pub server_description: Option<String>,
+}
+
+impl ProbedMetadata {
+    /// The pre-split combined value (`instructions` preferred, else
+    /// `server_description`) — what `probe_initialize` used to return as a
+    /// single field, and what the probe endpoint's response still reports
+    /// under `"instructions"` for the caller's benefit (a preview, not
+    /// something stored).
+    fn description_fallback(&self) -> Option<String> {
+        self.instructions
+            .clone()
+            .or_else(|| self.server_description.clone())
+    }
+}
+
 /// POST a bare `initialize` and classify the response into an auth type + status.
 pub async fn probe_initialize(
     http_client: &reqwest::Client,
     url: &str,
-) -> std::result::Result<(DetectedAuthType, u16, Option<String>), reqwest::Error> {
+) -> std::result::Result<(DetectedAuthType, u16, ProbedMetadata), reqwest::Error> {
     let resp = http_client
         .post(url)
         .timeout(std::time::Duration::from_secs(10))
@@ -116,36 +145,40 @@ pub async fn probe_initialize(
     // server's own self-description, per the MCP spec (confirmed live:
     // Firecrawl and Apify both populate this, over an SSE-formatted response —
     // hence reusing `parse_jsonrpc` rather than a bare `serde_json::from_str`,
-    // which would silently fail to find it in that shape). Falls back to
-    // `serverInfo.description` when `instructions` is absent — a second,
-    // similar self-description field some servers set instead (confirmed
-    // live: Apify sets both). Only present on a successful response body;
-    // absent/unparsable bodies just yield `None`, never an error — this is
-    // enrichment, not something registration should ever fail over.
-    let instructions = if status.is_success() {
+    // which would silently fail to find it in that shape) — and separately,
+    // `serverInfo.description`, a second self-description field some servers
+    // set instead (confirmed live: Apify sets both, with different content —
+    // these must stay two distinct values, not merged here; see
+    // `ProbedMetadata`'s own doc comment for why). Only present on a
+    // successful response body; absent/unparsable bodies just yield
+    // `ProbedMetadata::default()`, never an error — this is enrichment, not
+    // something registration should ever fail over.
+    let metadata = if status.is_success() {
         let content_type = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        resp.text().await.ok().and_then(|body| {
-            crate::provider::generic::parse_jsonrpc(&content_type, &body, "probe")
-                .ok()
-                .and_then(|v| {
-                    let result = v.get("result")?;
-                    first_str(result, &["instructions"]).or_else(|| {
-                        result
-                            .get("serverInfo")
-                            .and_then(|si| first_str(si, &["description"]))
-                    })
-                })
-        })
+        resp.text()
+            .await
+            .ok()
+            .and_then(|body| {
+                crate::provider::generic::parse_jsonrpc(&content_type, &body, "probe").ok()
+            })
+            .and_then(|v| v.get("result").cloned())
+            .map(|result| ProbedMetadata {
+                instructions: first_str(&result, &["instructions"]),
+                server_description: result
+                    .get("serverInfo")
+                    .and_then(|si| first_str(si, &["description"])),
+            })
+            .unwrap_or_default()
     } else {
-        None
+        ProbedMetadata::default()
     };
 
-    Ok((auth_type, status.as_u16(), instructions))
+    Ok((auth_type, status.as_u16(), metadata))
 }
 
 /// `POST /connectors/probe` — detect a server's auth type without storing anything.
@@ -188,7 +221,7 @@ pub async fn probe_connector_view(state: &McpState, url: &str) -> Result<Value> 
     // Guarded client: `validate_public_url` is a one-shot pre-check; the probe
     // itself must go through the SSRF/DNS-rebinding-guarded client so a rebinding
     // DNS can't point it at an internal address between the two resolutions.
-    let (detected, status, instructions) = probe_initialize(&state.guarded_http_client, &url)
+    let (detected, status, metadata) = probe_initialize(&state.guarded_http_client, &url)
         .await
         .map_err(|e| McpError::Backend(format!("could not reach MCP server: {e}")))?;
 
@@ -216,12 +249,15 @@ pub async fn probe_connector_view(state: &McpState, url: &str) -> Result<Value> 
             None,
         ),
     };
+    // Reports the same combined value the probe endpoint always has — this is
+    // a caller-facing preview, not what gets stored (see
+    // `ProbedMetadata::description_fallback`'s own doc comment).
     let mut resp = json!({
         "url": url,
         "auth_type": detected.as_str(),
         "requires": requires,
         "hint": hint,
-        "instructions": instructions,
+        "instructions": metadata.description_fallback(),
     });
     if let Some(dcr) = supports_dcr {
         resp["supports_dcr"] = json!(dcr);
@@ -305,27 +341,23 @@ pub async fn register_connector(
         Some(serde_json::to_value(&headers).unwrap_or(Value::Null))
     };
 
-    // Best-effort auto-description: if the caller didn't supply one, probe the
-    // server's own `initialize` response for a self-published `instructions`
-    // field (confirmed live: Firecrawl populates this). Never blocks or fails
-    // registration — a server requiring auth even for `initialize` (e.g.
-    // Notion) or one that simply doesn't set `instructions` just leaves this
-    // `None`, same as before this existed. The same probed value is also kept
-    // verbatim as its own column (`instructions`, distinct from
-    // `description` since 0041_workspace.sql) so the gateway's own
-    // `initialize` can forward it later, even though it's only used as a
-    // description *fallback* here.
-    let mut instructions: Option<String> = None;
-    let mut description = match input.description {
-        Some(d) => Some(d),
-        None => {
-            instructions = probe_initialize(&state.guarded_http_client, &input.url)
-                .await
-                .ok()
-                .and_then(|(_, _, instructions)| instructions);
-            instructions.clone()
-        }
-    };
+    // Always probe the server's own `initialize` response — `instructions` is
+    // stored verbatim as its own column (0041_workspace.sql) regardless of
+    // whether the caller supplied a description, since it's a distinct value
+    // the gateway's own `initialize` forwards later, not a description
+    // substitute. The description itself keeps its original precedence:
+    // the caller's own description always wins; only a missing one falls
+    // back to the probed value (preferring `instructions`, else
+    // `serverInfo.description` — see `ProbedMetadata::description_fallback`).
+    // Never blocks or fails registration — a server requiring auth even for
+    // `initialize` (e.g. Notion) or one that simply doesn't set `instructions`
+    // just leaves both `None`, same as before this existed.
+    let probed = probe_initialize(&state.guarded_http_client, &input.url)
+        .await
+        .map(|(_, _, metadata)| metadata)
+        .unwrap_or_default();
+    let instructions = probed.instructions.clone();
+    let mut description = input.description.or_else(|| probed.description_fallback());
 
     // LLM fallback — only reached when the server's own `initialize` response
     // (just above) didn't publish a description either. No tool list is
@@ -1369,7 +1401,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let (detected, status, instructions) =
+        let (detected, status, metadata) =
             probe_initialize(&client, &format!("{}/mcp", server.url()))
                 .await
                 .unwrap();
@@ -1377,7 +1409,7 @@ mod tests {
         mock.assert_async().await;
         assert_eq!(detected, DetectedAuthType::None);
         assert_eq!(status, 200);
-        assert_eq!(instructions, None);
+        assert_eq!(metadata, ProbedMetadata::default());
     }
 
     #[tokio::test]
@@ -1394,11 +1426,14 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let (_, _, instructions) = probe_initialize(&client, &format!("{}/mcp", server.url()))
+        let (_, _, metadata) = probe_initialize(&client, &format!("{}/mcp", server.url()))
             .await
             .unwrap();
 
-        assert_eq!(instructions.as_deref(), Some("Use tool X for Y."));
+        assert_eq!(metadata.instructions.as_deref(), Some("Use tool X for Y."));
+        // `serverInfo` here carries no `description` field at all — must not
+        // be conflated with `instructions`.
+        assert_eq!(metadata.server_description, None);
     }
 
     #[tokio::test]
@@ -1418,11 +1453,14 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let (_, _, instructions) = probe_initialize(&client, &format!("{}/mcp", server.url()))
+        let (_, _, metadata) = probe_initialize(&client, &format!("{}/mcp", server.url()))
             .await
             .unwrap();
 
-        assert_eq!(instructions.as_deref(), Some("SSE-delivered description."));
+        assert_eq!(
+            metadata.instructions.as_deref(),
+            Some("SSE-delivered description.")
+        );
     }
 
     #[tokio::test]
@@ -1440,18 +1478,21 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let (_, _, instructions) = probe_initialize(&client, &format!("{}/mcp", server.url()))
+        let (_, _, metadata) = probe_initialize(&client, &format!("{}/mcp", server.url()))
             .await
             .unwrap();
 
-        assert_eq!(instructions, None);
+        assert_eq!(metadata, ProbedMetadata::default());
     }
 
     #[tokio::test]
     async fn probe_initialize_falls_back_to_server_info_description() {
         // Confirmed live: Apify sets `serverInfo.description` instead of (well,
         // actually alongside) `instructions`. A server that sets ONLY this
-        // field must still be captured.
+        // field must still be captured — as `server_description`, not
+        // `instructions` (they are two distinct signals since the
+        // instructions/description split; only `description_fallback()`
+        // merges them back for the description-fallback/probe-preview use).
         let mut server = mockito::Server::new_async().await;
         server
             .mock("POST", "/mcp")
@@ -1464,20 +1505,28 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let (_, _, instructions) = probe_initialize(&client, &format!("{}/mcp", server.url()))
+        let (_, _, metadata) = probe_initialize(&client, &format!("{}/mcp", server.url()))
             .await
             .unwrap();
 
+        assert_eq!(metadata.instructions, None);
         assert_eq!(
-            instructions.as_deref(),
+            metadata.server_description.as_deref(),
+            Some("Extract data from any website.")
+        );
+        assert_eq!(
+            metadata.description_fallback().as_deref(),
             Some("Extract data from any website.")
         );
     }
 
     #[tokio::test]
     async fn probe_initialize_prefers_instructions_over_server_info_description() {
-        // When both are present (confirmed live: Apify sets both), `instructions`
-        // is the richer, more authoritative field — it must win.
+        // When both are present (confirmed live: Apify sets both), each is
+        // captured separately — `instructions` is not discarded in favor of
+        // `server_description`, nor vice versa — but the combined
+        // `description_fallback()` value still prefers `instructions` as the
+        // richer, more authoritative field.
         let mut server = mockito::Server::new_async().await;
         server
             .mock("POST", "/mcp")
@@ -1490,10 +1539,18 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let (_, _, instructions) = probe_initialize(&client, &format!("{}/mcp", server.url()))
+        let (_, _, metadata) = probe_initialize(&client, &format!("{}/mcp", server.url()))
             .await
             .unwrap();
 
-        assert_eq!(instructions.as_deref(), Some("Full guide."));
+        assert_eq!(metadata.instructions.as_deref(), Some("Full guide."));
+        assert_eq!(
+            metadata.server_description.as_deref(),
+            Some("Short tagline.")
+        );
+        assert_eq!(
+            metadata.description_fallback().as_deref(),
+            Some("Full guide.")
+        );
     }
 }

@@ -163,6 +163,7 @@ fn mcp_session(connector_id: Uuid, backend_url: &str) -> ResolvedSession {
             transport: "streamable_http".into(),
             trusted: false,
             system: false,
+            tool_names: vec![],
             instructions: None,
         }],
         connected_toolkits: vec![],

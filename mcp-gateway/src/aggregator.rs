@@ -179,6 +179,7 @@ mod tests {
             transport: "streamable_http".into(),
             trusted: false,
             system: false,
+            tool_names: vec![],
             instructions: None,
         }
     }

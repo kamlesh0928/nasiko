@@ -1,7 +1,9 @@
 //! Tool-name → backend routing — inverse of the aggregator's id namespacing.
-//!   * `{connector_prefix}__{tool}` → (that connector's backend, `tool`)
-//!   * `COMPOSIO_*` / bare name     → the composio backend, unchanged
-//!   * bare name, no composio       → first live backend
+//!   * `{connector_prefix}__{tool}` → that connector's generic backend, `tool`
+//!   * bare name owned by a system backend's synced tool catalog → that
+//!     system backend, name unchanged (exact match only — never a heuristic)
+//!   * bare name otherwise (a Composio meta-tool or toolkit slug, e.g.
+//!     `COMPOSIO_SEARCH_TOOLS`/`GMAIL_SEND_EMAIL`) → the composio backend
 
 use std::collections::HashMap;
 
@@ -36,16 +38,25 @@ pub fn route_tool<'a>(
             });
     }
 
-    // Bare names belong to system backends first (they are the only generic
-    // servers exposed un-prefixed), then to Composio's meta-tools.
-    if let Some(system) = servers.iter().find(|s| s.system && !s.url.is_empty()) {
+    // A bare name is owned by a system backend only when its synced tool
+    // catalog says so, exactly — never by "it's the only bare-name backend
+    // around" or any other shape-based guess. Composio's own bare names
+    // (`COMPOSIO_SEARCH_TOOLS`, toolkit slugs like `GMAIL_SEND_EMAIL`, see
+    // aggregator.rs's meta-tool filter) are otherwise indistinguishable from
+    // a system tool by name alone, so an exact catalog match is the only
+    // deterministic way to tell them apart.
+    if let Some(system) = servers
+        .iter()
+        .find(|s| s.system && !s.url.is_empty() && s.tool_names.iter().any(|t| t == tool_name))
+    {
         return Ok((system, tool_name.to_string()));
     }
 
-    // A bare (un-prefixed) name is otherwise only valid as a Composio
-    // meta-tool. Never guess a generic backend — the aggregator always
-    // namespaces generic tools (except system ones, handled above), so an
-    // un-prefixed name that isn't Composio is malformed/hallucinated.
+    // Anything a system backend doesn't claim is otherwise only valid as a
+    // Composio meta-tool. Never guess a generic backend — the aggregator
+    // always namespaces generic tools (except system ones, matched above), so
+    // an un-prefixed name that isn't Composio's and isn't system-owned is
+    // malformed/hallucinated.
     if let Some(composio) = servers
         .iter()
         .find(|s| s.kind == ServerType::Composio && !s.url.is_empty())
@@ -90,6 +101,7 @@ mod tests {
             transport: "streamable_http".into(),
             trusted: false,
             system: false,
+            tool_names: vec![],
             instructions: None,
         }
     }
@@ -122,9 +134,11 @@ mod tests {
         assert!(route_tool("abcd1234__search", &servers).is_err());
     }
 
-    #[test]
-    fn bare_name_routes_to_a_system_server_before_composio() {
-        let sys = MCPServerConfig {
+    /// A system server that owns `tool_names: ["save_file"]` — the same
+    /// shape a live one would carry once `credentials::build_server_config`
+    /// loads its synced tool catalog.
+    fn system_srv(tool_names: &[&str]) -> MCPServerConfig {
+        MCPServerConfig {
             connector_id: Uuid::new_v4(),
             kind: ServerType::Mcp,
             name: "workspace".into(),
@@ -133,23 +147,55 @@ mod tests {
             transport: "streamable_http".into(),
             trusted: true,
             system: true,
+            tool_names: tool_names.iter().map(|s| s.to_string()).collect(),
             instructions: None,
-        };
-        let composio = MCPServerConfig {
-            connector_id: Uuid::nil(),
-            kind: ServerType::Composio,
-            name: "composio".into(),
-            url: "http://c".into(),
-            headers: Default::default(),
-            transport: "streamable_http".into(),
-            trusted: false,
-            system: false,
-            instructions: None,
-        };
+        }
+    }
+
+    #[test]
+    fn bare_name_owned_by_a_system_server_routes_to_it_even_with_composio_present() {
+        let sys = system_srv(&["save_file"]);
+        let composio = srv(ServerType::Composio, Uuid::nil(), "http://c");
         let servers = vec![composio, sys.clone()];
         let (s, name) = route_tool("save_file", &servers).unwrap();
         assert_eq!(s.connector_id, sys.connector_id);
         assert_eq!(name, "save_file");
+    }
+
+    #[test]
+    fn bare_composio_name_still_routes_to_composio_when_a_system_server_is_present() {
+        // The system server is present and owns `save_file`, but NOT
+        // `COMPOSIO_SEARCH_TOOLS` — a system server existing at all must not
+        // swallow every bare name, only the ones its catalog actually lists.
+        let sys = system_srv(&["save_file"]);
+        let composio = srv(ServerType::Composio, Uuid::nil(), "http://c");
+        let servers = vec![sys, composio];
+        let (s, orig) = route_tool("COMPOSIO_SEARCH_TOOLS", &servers).unwrap();
+        assert_eq!(s.kind, ServerType::Composio);
+        assert_eq!(orig, "COMPOSIO_SEARCH_TOOLS");
+    }
+
+    #[test]
+    fn bare_name_owned_by_nobody_falls_back_to_composio_when_present() {
+        // A system server is present but its catalog doesn't list this name —
+        // with a Composio backend also present, current (pre-existing)
+        // behavior is to hand it to Composio, same as if no system server
+        // existed at all.
+        let sys = system_srv(&["save_file"]);
+        let composio = srv(ServerType::Composio, Uuid::nil(), "http://c");
+        let servers = vec![sys, composio];
+        let (s, orig) = route_tool("totally_unowned_tool", &servers).unwrap();
+        assert_eq!(s.kind, ServerType::Composio);
+        assert_eq!(orig, "totally_unowned_tool");
+    }
+
+    #[test]
+    fn bare_name_owned_by_nobody_errors_without_composio() {
+        // Same as above, but with no Composio backend at all — the existing
+        // "Unknown tool" error path, unchanged by the system server's presence.
+        let sys = system_srv(&["save_file"]);
+        let servers = vec![sys];
+        assert!(route_tool("totally_unowned_tool", &servers).is_err());
     }
 
     #[test]

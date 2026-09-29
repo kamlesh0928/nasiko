@@ -241,6 +241,7 @@ fn composio_config(
         transport: "streamable_http".to_string(),
         trusted: false,
         system: false,
+        tool_names: vec![],
         instructions: None,
     }
 }

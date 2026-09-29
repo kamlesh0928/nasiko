@@ -1034,6 +1034,22 @@ pub async fn list_connector_tools(
     Ok(rows)
 }
 
+/// Just the synced tool names for a connector — lean alternative to
+/// [`list_connector_tools`] for [`MCPServerConfig::tool_names`]'s exact
+/// bare-name-ownership check (`credentials::build_server_config`), which
+/// needs nothing else off the row.
+///
+/// [`MCPServerConfig::tool_names`]: crate::types::MCPServerConfig::tool_names
+pub async fn list_connector_tool_names(db: &PgPool, connector_id: Uuid) -> Result<Vec<String>> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT tool_name FROM mcp_connector_tools WHERE connector_id = $1 ORDER BY tool_name",
+    )
+    .bind(connector_id)
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
+}
+
 // ─── Composio sessions ──────────────────────────────────────────────────────
 
 pub async fn get_composio_session(

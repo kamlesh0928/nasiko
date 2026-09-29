@@ -327,6 +327,14 @@ pub struct MCPServerConfig {
     /// only in `credentials::build_server_config`, like `trusted`.
     #[serde(default)]
     pub system: bool,
+    /// Bare tool names this backend owns; populated only for system backends,
+    /// from the synced `mcp_connector_tools` catalog, so bare-name routing is
+    /// exact (`router::route_tool` matches against this, never a naming
+    /// heuristic — a bare name is otherwise ambiguous with a Composio meta-tool
+    /// or toolkit slug, e.g. `GMAIL_SEND_EMAIL`). Empty for every non-system
+    /// backend.
+    #[serde(default)]
+    pub tool_names: Vec<String>,
     /// The backend's `initialize.instructions`, forwarded by the gateway's own
     /// `initialize`. `None` for backends that advertise none.
     #[serde(default)]

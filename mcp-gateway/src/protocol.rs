@@ -1509,6 +1509,7 @@ mod tests {
                 transport: "streamable_http".into(),
                 trusted: false,
                 system: false,
+                tool_names: vec![],
                 instructions: None,
             }],
             connected_toolkits: vec!["gmail".into()],
@@ -1611,6 +1612,7 @@ mod tests {
                 transport: "streamable_http".into(),
                 trusted,
                 system: false,
+                tool_names: vec![],
                 instructions: None,
             }],
             connected_toolkits: vec![],
@@ -2240,6 +2242,7 @@ mod initialize_tests {
             transport: "streamable_http".into(),
             trusted: false,
             system: false,
+            tool_names: vec![],
             instructions: instructions.map(str::to_string),
         }
     }

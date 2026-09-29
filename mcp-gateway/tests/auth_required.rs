@@ -267,6 +267,7 @@ fn composio_session(url: &str, toolkit_to_connector: HashMap<String, Uuid>) -> R
             transport: "streamable_http".into(),
             trusted: false,
             system: false,
+            tool_names: vec![],
             instructions: None,
         }],
         connected_toolkits: toolkit_to_connector.keys().cloned().collect(),

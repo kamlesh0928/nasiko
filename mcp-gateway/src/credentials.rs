@@ -140,6 +140,27 @@ async fn build_server_config(
     }
 
     let system = connector.provider_type == "system";
+    // A system backend's tool names must come from the synced catalog, never
+    // a naming heuristic — `router::route_tool` matches a bare name against
+    // this list exactly, since a bare name is otherwise ambiguous with a
+    // Composio meta-tool or toolkit slug (e.g. `GMAIL_SEND_EMAIL`). One extra
+    // query per system connector per request is fine (there is exactly one
+    // such connector); a lookup failure degrades to "owns nothing this
+    // cycle" rather than failing the whole session resolution over it.
+    let tool_names = if system {
+        repo::list_connector_tool_names(&state.db, connector.id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    connector = %connector.name, error = %e,
+                    "failed to load system connector's tool catalog — bare-name routing \
+                     will find nothing for it this cycle"
+                );
+                Vec::new()
+            })
+    } else {
+        Vec::new()
+    };
     Ok(Ok(MCPServerConfig {
         connector_id: connector.id,
         kind: ServerType::Mcp,
@@ -156,6 +177,7 @@ async fn build_server_config(
         // both live inside the platform's own network, so both are trusted.
         trusted: connector.source_kind == repo::SourceKind::UploadedBuild || system,
         system,
+        tool_names,
         instructions: connector.instructions.clone(),
     }))
 }

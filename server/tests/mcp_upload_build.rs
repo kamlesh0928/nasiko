@@ -227,6 +227,7 @@ async fn upload_builds_deploys_and_serves_real_tools() {
         transport: "streamable_http".to_string(),
         trusted: true,
         system: false,
+        tool_names: vec![],
         instructions: None,
     };
     let provider = GenericMcpProvider::new(reqwest::Client::new(), reqwest::Client::new());

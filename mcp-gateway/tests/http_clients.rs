@@ -21,6 +21,7 @@ fn cfg(url: String) -> MCPServerConfig {
         transport: "streamable_http".into(),
         trusted: false,
         system: false,
+        tool_names: vec![],
         instructions: None,
     }
 }
@@ -126,6 +127,7 @@ async fn generic_injects_auth_headers() {
         transport: "streamable_http".into(),
         trusted: false,
         system: false,
+        tool_names: vec![],
         instructions: None,
     };
     provider
@@ -621,6 +623,7 @@ fn loopback_cfg(port: u16, trusted: bool) -> MCPServerConfig {
         transport: "streamable_http".into(),
         trusted,
         system: false,
+        tool_names: vec![],
         instructions: None,
     }
 }

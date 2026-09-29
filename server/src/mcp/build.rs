@@ -469,6 +469,7 @@ pub async fn execute_mcp_server_build(
         transport: "streamable_http".to_string(),
         trusted: true,
         system: false,
+        tool_names: vec![],
         instructions: None,
     };
     // The guarded client is never selected here (trusted is always true for
@@ -924,6 +925,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             trusted: true,
             system: false,
+            tool_names: vec![],
             instructions: None,
         }
     }
