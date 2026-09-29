@@ -31,6 +31,7 @@ pub mod credentials;
 pub mod description_backfill;
 pub mod endpoint_refresh;
 pub mod error;
+pub mod identity;
 pub mod injector;
 pub mod net;
 pub mod oauth;

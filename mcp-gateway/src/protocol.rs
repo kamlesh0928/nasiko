@@ -72,7 +72,7 @@ pub async fn handle_request(
         Ok(p) => p,
         Err(e) => return Some(err(&req_id, e.json_rpc_code(), e.to_json_rpc().message)),
     };
-    let resolved = match session::resolve_session(state, user_id).await {
+    let mut resolved = match session::resolve_session(state, user_id).await {
         Ok(r) => r,
         Err(e) => return Some(err(&req_id, e.json_rpc_code(), e.to_json_rpc().message)),
     };
@@ -91,6 +91,22 @@ pub async fn handle_request(
             &instr,
         ));
     }
+
+    // Stamp every system backend's headers with a freshly-signed
+    // `(agent_id, user_id, flow_id)` so it can trust the caller's identity
+    // without re-deriving it — see `identity.rs`'s module doc. Only `initialize`
+    // (handled above) never needs this; both remaining methods route to a real
+    // backend.
+    let flow_id = traceparent
+        .and_then(nasiko_flow::FlowContext::from_traceparent)
+        .map(|c| c.flow_id);
+    inject_identity(
+        &mut resolved.servers,
+        agent_id,
+        user_id,
+        flow_id,
+        &state.config.identity_signing_key,
+    );
 
     let result = match method {
         "tools/list" => {
@@ -209,6 +225,35 @@ fn connector_instructions(servers: &[MCPServerConfig], perms: &PermissionContext
         .filter(|s| perms.is_connector_enabled(s.connector_id))
         .filter_map(|s| s.instructions.clone())
         .collect()
+}
+
+/// Stamps every system backend's `headers` with a freshly-signed
+/// [`crate::identity::SignedIdentity`] carrying `(agent_id, user_id, flow_id)`,
+/// so a system backend (the workspace server) can trust who's calling without
+/// re-deriving it — see `identity.rs`'s module doc. Non-system backends are
+/// left untouched: the identity header is meaningless (and untrusted) to any
+/// backend the platform doesn't itself serve on loopback. A no-op (no signing,
+/// no allocation) when there is no system backend in `servers` at all.
+///
+/// Pure and synchronous by design, unlike `handle_request` itself — that
+/// function's `resolve_session`/`load_permission_context` calls need a real
+/// DB this crate's hermetic unit tests can't provide, so this is the seam the
+/// tests below actually exercise.
+fn inject_identity(
+    servers: &mut [MCPServerConfig],
+    agent_id: Uuid,
+    user_id: Uuid,
+    flow_id: Option<String>,
+    key: &[u8],
+) {
+    if !servers.iter().any(|s| s.system) {
+        return;
+    }
+    let signed = crate::identity::SignedIdentity::new(agent_id, user_id, flow_id).sign(key);
+    for s in servers.iter_mut().filter(|s| s.system) {
+        s.headers
+            .insert(crate::identity::IDENTITY_HEADER.to_string(), signed.clone());
+    }
 }
 
 /// `tools/list` — query-aware search (semantic/BM25) or eager fan-out (none mode).
@@ -1502,6 +1547,7 @@ mod tests {
                 openai_api_key: None,
                 embedding_model: "".to_string(),
                 gateway_instructions: String::new(),
+                identity_signing_key: b"test-identity-signing-key".to_vec(),
             },
             providers: Providers {
                 composio: None,
@@ -2380,5 +2426,67 @@ mod initialize_tests {
         let servers = vec![cfg(id, Some("X"))];
         let perms = ctx(&[]); // never enabled
         assert!(connector_instructions(&servers, &perms).is_empty());
+    }
+
+    // ── inject_identity: stamps only system backends ─────────────────────────
+
+    fn system_cfg(connector_id: Uuid) -> MCPServerConfig {
+        let mut s = cfg(connector_id, None);
+        s.system = true;
+        s.trusted = true;
+        s
+    }
+
+    #[test]
+    fn inject_identity_stamps_only_system_servers_and_carries_the_right_identity() {
+        let key = b"test-identity-key".to_vec();
+        let agent_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let mut servers = vec![system_cfg(Uuid::new_v4()), cfg(Uuid::new_v4(), None)];
+
+        inject_identity(
+            &mut servers,
+            agent_id,
+            user_id,
+            Some("flow-abc".to_string()),
+            &key,
+        );
+
+        let system_server = servers.iter().find(|s| s.system).expect("system server");
+        let header = system_server
+            .headers
+            .get(crate::identity::IDENTITY_HEADER)
+            .expect("system server must carry the identity header");
+        let verified = crate::identity::SignedIdentity::verify(header, &key)
+            .expect("the gateway's own signature must verify with the same key");
+        assert_eq!(verified.agent_id, agent_id);
+        assert_eq!(verified.user_id, user_id);
+        assert_eq!(verified.flow_id.as_deref(), Some("flow-abc"));
+
+        let non_system = servers
+            .iter()
+            .find(|s| !s.system)
+            .expect("non-system server");
+        assert!(
+            !non_system
+                .headers
+                .contains_key(crate::identity::IDENTITY_HEADER),
+            "a non-system backend must never receive the identity header: {non_system:?}"
+        );
+    }
+
+    #[test]
+    fn inject_identity_is_a_no_op_when_there_is_no_system_backend() {
+        let key = b"test-identity-key".to_vec();
+        let mut servers = vec![cfg(Uuid::new_v4(), None), cfg(Uuid::new_v4(), None)];
+
+        inject_identity(&mut servers, Uuid::new_v4(), Uuid::new_v4(), None, &key);
+
+        assert!(
+            servers
+                .iter()
+                .all(|s| !s.headers.contains_key(crate::identity::IDENTITY_HEADER)),
+            "no backend is system, so nothing should be stamped: {servers:?}"
+        );
     }
 }

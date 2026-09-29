@@ -516,6 +516,10 @@ fn test_config(db_url: String, redis_url: String, s3_endpoint: String) -> Config
         allow_personal_emails: false,
         nasiko_bff_url: None,
         mcp_tool_search_meta_limit: 0,
+        mcp_gateway_instructions: String::new(),
+        // Matches the JWT_SECRET set above — `McpConfig::from_config` falls
+        // back to it when MCP_IDENTITY_SIGNING_KEY is unset, same as production.
+        mcp_identity_signing_key: TEST_JWT_SECRET.to_string(),
     }
 }
 

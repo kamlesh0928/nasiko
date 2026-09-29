@@ -292,6 +292,23 @@ pub struct Config {
     pub mcp_tool_search_tool_limit: usize,
     /// Max tools returned by the `nasiko_search_tools` meta-tool.
     pub mcp_tool_search_meta_limit: usize,
+    /// The gateway's own sentence advertised in `initialize.instructions`,
+    /// ahead of any per-connector instructions (`oss/mcp-gateway/src/protocol.rs`).
+    /// MCP_GATEWAY_INSTRUCTIONS. Blank (unset or whitespace-only) means "let the
+    /// gateway crate apply its own default sentence" — deliberately carried here
+    /// as a raw, possibly-blank string rather than pre-defaulted, since the
+    /// default text lives in `oss/mcp-gateway` (a crate that syncs to the public
+    /// repo) and this crate must not duplicate it.
+    pub mcp_gateway_instructions: String,
+    /// HMAC key the gateway signs the `x-nasiko-identity` header with when
+    /// forwarding a caller's `(agent_id, user_id, flow_id)` to a system backend
+    /// (`oss/mcp-gateway/src/identity.rs`) — the backend trusts that header
+    /// instead of re-deriving who is calling. MCP_IDENTITY_SIGNING_KEY; falls
+    /// back to the already-required `JWT_SECRET` when unset/empty, so a
+    /// deployment doesn't need to mint a second secret just for this. Empty
+    /// only when both are unset, which `McpConfig::from_config` rejects at
+    /// startup with a clear message.
+    pub mcp_identity_signing_key: String,
 }
 
 impl Config {
@@ -504,6 +521,15 @@ impl Config {
             mcp_tool_search_mode: env_or("MCP_TOOL_SEARCH_MODE", "semantic"),
             mcp_tool_search_tool_limit: env_parse("MCP_TOOL_SEARCH_TOOL_LIMIT", 15),
             mcp_tool_search_meta_limit: env_parse("MCP_TOOL_SEARCH_META_LIMIT", 10),
+            mcp_gateway_instructions: env_or("MCP_GATEWAY_INSTRUCTIONS", ""),
+            // No domain-separation prefix (unlike `oauth_state_signing_key`'s
+            // JWT_SECRET fallback in `oss/mcp-gateway/src/config.rs`) — this key
+            // signs a header, not a URL-embedded state blob, so there's no
+            // adjacent-signer collision to guard against.
+            mcp_identity_signing_key: std::env::var("MCP_IDENTITY_SIGNING_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| env_or("JWT_SECRET", "")),
         })
     }
 

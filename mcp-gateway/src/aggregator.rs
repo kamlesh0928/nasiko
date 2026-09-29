@@ -157,14 +157,21 @@ fn manifest_key(
 /// Stable hash of a backend's injected headers (the credential lives here). Keys
 /// sorted for determinism; the result is a hash, so the raw secret never appears
 /// in the cache key. Empty headers → empty string (no fingerprint contribution).
+///
+/// Excludes [`crate::identity::IDENTITY_HEADER`] (case-insensitively): unlike a
+/// real injected credential, that header carries a per-request `exp`
+/// (`identity::SignedIdentity::sign`), so folding it in here would mean the
+/// manifest cache never hits at all for any user with a system connector —
+/// every `tools/list` would mint a fresh signature and bust the key.
 fn headers_fingerprint(headers: &std::collections::HashMap<String, String>) -> String {
-    if headers.is_empty() {
-        return String::new();
-    }
     let mut pairs: Vec<(&str, &str)> = headers
         .iter()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case(crate::identity::IDENTITY_HEADER))
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
+    if pairs.is_empty() {
+        return String::new();
+    }
     pairs.sort();
     sha256_hex16(serde_json::to_string(&pairs).unwrap_or_default().as_bytes())
 }
@@ -244,6 +251,7 @@ mod tests {
                 openai_api_key: None,
                 embedding_model: "text-embedding-3-small".to_string(),
                 gateway_instructions: String::new(),
+                identity_signing_key: b"test-identity-signing-key".to_vec(),
             },
             providers: Providers {
                 composio: None,
@@ -313,6 +321,41 @@ mod tests {
         assert_eq!(
             k1, k2,
             "backends are sorted before hashing, so input order must not matter"
+        );
+    }
+
+    #[test]
+    fn manifest_key_ignores_the_identity_header_but_not_a_real_credential() {
+        let user = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let mut a = srv(ServerType::Mcp, id, "https://backend.example/mcp");
+        a.headers.insert(
+            crate::identity::IDENTITY_HEADER.to_string(),
+            "sig.one".into(),
+        );
+        // Same identity header key, different value (a later request's fresh
+        // `exp`/signature) — must NOT change the manifest key.
+        let mut b = a.clone();
+        b.headers.insert(
+            crate::identity::IDENTITY_HEADER.to_string(),
+            "sig.two-different-exp".into(),
+        );
+        let toolkits: Vec<String> = vec![];
+        let k_a = manifest_key(user, &[a.clone()], &toolkits, "h");
+        let k_b = manifest_key(user, &[b], &toolkits, "h");
+        assert_eq!(
+            k_a, k_b,
+            "the identity header carries a per-request exp and must not bust the manifest cache"
+        );
+
+        // A real header change (an actual injected credential) must still bust it.
+        let mut c = a.clone();
+        c.headers
+            .insert("authorization".into(), "Bearer other-token".into());
+        let k_c = manifest_key(user, &[c], &toolkits, "h");
+        assert_ne!(
+            k_a, k_c,
+            "a real header change must still change the manifest key"
         );
     }
 

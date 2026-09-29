@@ -97,6 +97,12 @@ pub struct McpConfig {
     /// defaults to a generic orientation sentence so the field is never
     /// blank on an unconfigured deployment.
     pub gateway_instructions: String,
+    /// HMAC key `identity::SignedIdentity::sign`/`verify` use for the
+    /// `x-nasiko-identity` header forwarded to every system backend — see
+    /// `identity.rs`'s module doc. Derived from `Config::mcp_identity_signing_key`
+    /// (itself `MCP_IDENTITY_SIGNING_KEY`, falling back to `JWT_SECRET`); never
+    /// empty past `from_config`, which panics rather than sign with no key.
+    pub identity_signing_key: Vec<u8>,
 }
 
 impl McpConfig {
@@ -137,15 +143,25 @@ impl McpConfig {
             tool_search_meta_limit: config.mcp_tool_search_meta_limit,
             openai_api_key: config.openai_api_key.clone(),
             embedding_model: config.embedding_model.clone(),
-            // Not (yet) a field on the central `Config` — read directly, same
-            // pattern as `oauth_state_signing_key` above, to keep this task's
-            // scope to `oss/mcp-gateway` alone. Blank (unset or whitespace-only)
-            // is treated as unset, same as `oauth_state_signing_key`'s own
-            // `.filter(|s| !s.is_empty())`.
-            gateway_instructions: std::env::var("MCP_GATEWAY_INSTRUCTIONS")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_GATEWAY_INSTRUCTIONS.to_string()),
+            // Central `Config` carries the raw (possibly blank) value; this
+            // crate owns the default text (it syncs to the public repo, so the
+            // default sentence can't live in `nasiko-config`).
+            gateway_instructions: if config.mcp_gateway_instructions.trim().is_empty() {
+                DEFAULT_GATEWAY_INSTRUCTIONS.to_string()
+            } else {
+                config.mcp_gateway_instructions.clone()
+            },
+            // Fails loudly (not silently signing with an empty key) — an empty
+            // key here means both `MCP_IDENTITY_SIGNING_KEY` and the required
+            // `JWT_SECRET` were unset, which central `Config::from_env` should
+            // never actually produce in a valid deployment.
+            identity_signing_key: Some(config.mcp_identity_signing_key.as_str())
+                .filter(|s| !s.is_empty())
+                .expect(
+                    "MCP_IDENTITY_SIGNING_KEY or JWT_SECRET must be set for MCP identity signing",
+                )
+                .as_bytes()
+                .to_vec(),
         }
     }
 
@@ -199,6 +215,7 @@ mod tests {
             openai_api_key: None,
             embedding_model: "text-embedding-3-small".to_string(),
             gateway_instructions: String::new(),
+            identity_signing_key: b"test-identity-signing-key".to_vec(),
         }
     }
 
