@@ -359,6 +359,50 @@ mod tests {
         );
     }
 
+    /// `headers_fingerprint` directly (not through `manifest_key`, which adds
+    /// unrelated connector-id/url noise to the hashed tuple): a mixed-case
+    /// spelling of the identity header name must be excluded exactly like the
+    /// canonical lowercase [`crate::identity::IDENTITY_HEADER`] constant
+    /// (HTTP header names are case-insensitive on the wire — `axum`'s
+    /// `HeaderMap` normalizes them, but this fn takes a plain `HashMap` a
+    /// caller could populate with any casing), and a header map whose ONLY
+    /// entry is the identity header must fingerprint identically to a map
+    /// with no headers at all — not merely "not contribute a *different*
+    /// value", which the empty-string early-return already guarantees but
+    /// this makes an explicit, named property.
+    #[test]
+    fn headers_fingerprint_excludes_identity_header_case_insensitively() {
+        let empty: HashMap<String, String> = HashMap::new();
+        let mut lower = HashMap::new();
+        lower.insert(
+            crate::identity::IDENTITY_HEADER.to_string(),
+            "sig.one".into(),
+        );
+        let mut mixed = HashMap::new();
+        mixed.insert(
+            "X-Nasiko-Identity".to_string(),
+            "sig.two-different-value".into(),
+        );
+
+        let fp_empty = headers_fingerprint(&empty);
+        assert_eq!(
+            fp_empty, "",
+            "no headers must fingerprint as the empty-string sentinel"
+        );
+        assert_eq!(
+            headers_fingerprint(&lower),
+            fp_empty,
+            "a header map containing ONLY the identity header must fingerprint \
+             the same as an empty map"
+        );
+        assert_eq!(
+            headers_fingerprint(&mixed),
+            fp_empty,
+            "a mixed-case identity header name (X-Nasiko-Identity) must be \
+             excluded just as the canonical lowercase name is"
+        );
+    }
+
     // ─── aggregate_tools() — per-backend error isolation ───────────────────
 
     #[tokio::test]

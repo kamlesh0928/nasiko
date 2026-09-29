@@ -200,14 +200,26 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
     // (initialize/ping/tools/list, rule 2) work agent-only: the flow user when
     // one resolves, else the agent's owner (startup-time tool discovery
     // happens outside any flow).
-    let user_id = match flow_user(state, traceparent, agent_id).await {
-        Ok(user_id) => user_id,
+    //
+    // `verified_flow_id` travels alongside `user_id` (rather than being
+    // re-derived from `traceparent` further down) because it's the one thing
+    // this function actually verified against `flows`/`flow_participants` —
+    // the raw `traceparent` a caller sends is not proof of anything on its
+    // own. On the owner-fallback branch below, `user_id` did NOT come from a
+    // verified flow, so `verified_flow_id` must be `None` even though
+    // `traceparent` may still be a well-formed (just unresolvable, or
+    // rejected) value: `protocol::handle_request` signs `verified_flow_id`,
+    // never `traceparent`, into the identity header it forwards to system
+    // backends, specifically so a caller can't launder an unverified trace id
+    // into a header a backend is told to trust unconditionally.
+    let (user_id, verified_flow_id) = match flow_user(state, traceparent, agent_id).await {
+        Ok((user_id, flow_id)) => (user_id, Some(flow_id)),
         Err(denial) => {
             if method == "tools/call" {
                 return denial;
             }
             match agent_owner(state, agent_id).await {
-                Ok(Some(owner)) => owner,
+                Ok(Some(owner)) => (owner, None),
                 Ok(None) => {
                     return (
                         StatusCode::UNAUTHORIZED,
@@ -227,8 +239,15 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
     };
 
     let started = std::time::Instant::now();
-    let Some(result) =
-        protocol::handle_request(&state.mcp, user_id, agent_id, &body, traceparent).await
+    let Some(result) = protocol::handle_request(
+        &state.mcp,
+        user_id,
+        agent_id,
+        &body,
+        traceparent,
+        verified_flow_id.as_deref(),
+    )
+    .await
     else {
         return (StatusCode::ACCEPTED, Json(json!({}))).into_response();
     };
@@ -295,12 +314,21 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 /// the authenticated agent to be a recorded participant. Every failure is a
 /// 403 with a descriptive body: presence is not the check, resolution is —
 /// there is nothing an agent can fabricate to pass.
+///
+/// Returns the flow id alongside the user on success — this is the only place
+/// that verifies a `traceparent`-named flow is live and this agent
+/// participates in it, so it's also the only place allowed to hand that flow
+/// id onward as trustworthy (`dispatch` forwards it to
+/// `protocol::handle_request` as `verified_flow_id`, which alone may be signed
+/// into the identity header sent to system backends). Callers on the
+/// owner-fallback path (this returns `Err`) must never substitute a raw,
+/// unverified `traceparent` in its place.
 #[allow(clippy::result_large_err)]
 async fn flow_user(
     state: &AppState,
     traceparent: Option<&str>,
     agent_id: Uuid,
-) -> Result<Uuid, Response> {
+) -> Result<(Uuid, String), Response> {
     let flow_id = traceparent
         .and_then(nasiko_flow::FlowContext::from_traceparent)
         .map(|ctx| ctx.flow_id)
@@ -332,7 +360,7 @@ async fn flow_user(
     })?;
 
     match row {
-        Some((user_id, true)) => Ok(user_id),
+        Some((user_id, true)) => Ok((user_id, flow_id)),
         Some((_, false)) => Err(deny(format!(
             "agent {agent_id} is not a participant of flow {flow_id}"
         ))),

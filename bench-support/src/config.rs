@@ -80,8 +80,11 @@ pub fn build_bench_config(database_url: String, mock_llm_base_url: &str) -> Conf
         mcp_tool_search_tool_limit: 15,
         mcp_tool_search_meta_limit: 10,
         mcp_gateway_instructions: String::new(),
-        // Matches the JWT_SECRET set above — `McpConfig::from_config` falls
-        // back to it when MCP_IDENTITY_SIGNING_KEY is unset, same as production.
+        // This literal is built directly, not through `Config::from_env` — so
+        // it bypasses that function's JWT_SECRET-derived fallback (which
+        // domain-separates with an `mcp-identity::` prefix; see
+        // `nasiko_config::mcp_identity_signing_key`). Set directly to
+        // `BENCH_JWT_SECRET`'s own value, unprefixed.
         mcp_identity_signing_key: BENCH_JWT_SECRET.to_string(),
         mcp_upload_max_bytes: 50 * 1024 * 1024,
         mcp_gateway_max_body_bytes: 8 * 1024 * 1024,

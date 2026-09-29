@@ -154,14 +154,28 @@ impl McpConfig {
             // Fails loudly (not silently signing with an empty key) — an empty
             // key here means both `MCP_IDENTITY_SIGNING_KEY` and the required
             // `JWT_SECRET` were unset, which central `Config::from_env` should
-            // never actually produce in a valid deployment.
-            identity_signing_key: Some(config.mcp_identity_signing_key.as_str())
-                .filter(|s| !s.is_empty())
-                .expect(
-                    "MCP_IDENTITY_SIGNING_KEY or JWT_SECRET must be set for MCP identity signing",
-                )
-                .as_bytes()
-                .to_vec(),
+            // never actually produce in a valid deployment. Trimmed already by
+            // `Config::from_env`'s own derivation, so no `.trim()` here.
+            identity_signing_key: {
+                let key = Some(config.mcp_identity_signing_key.as_str())
+                    .filter(|s| !s.is_empty())
+                    .expect(
+                        "MCP_IDENTITY_SIGNING_KEY or JWT_SECRET must be set for MCP identity signing",
+                    );
+                // A short key weakens HMAC-SHA256 far less than it would a
+                // block cipher, but a short, guessable value (a placeholder
+                // left over from a quickstart, say) is still worth flagging —
+                // a warning, not a hard failure, since a short-but-genuinely-
+                // random key is still valid.
+                if key.len() < 32 {
+                    tracing::warn!(
+                        key_bytes = key.len(),
+                        "MCP_IDENTITY_SIGNING_KEY (or its JWT_SECRET-derived fallback) is shorter \
+                         than 32 bytes — consider a longer value"
+                    );
+                }
+                key.as_bytes().to_vec()
+            },
         }
     }
 

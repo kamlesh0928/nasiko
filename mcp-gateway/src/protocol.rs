@@ -42,12 +42,26 @@ pub fn rpc_error(req_id: &Value, code: i64, message: impl Into<String>) -> Value
 
 /// Full JSON-RPC dispatch for the agent-facing gateway. Returns `None` for a
 /// notification (a request with no `id`).
+///
+/// `traceparent` and `verified_flow_id` are deliberately two different
+/// parameters, not one: `traceparent` is the raw header, propagated to
+/// backends and used to resolve unrelated things (a flow's title for tool
+/// search, a `context_id` for HITL) that only need a best-effort trace id.
+/// `verified_flow_id` is what the route layer (`oss/server/src/mcp/handlers/
+/// gateway.rs::flow_user`) actually proved resolves to a live flow this agent
+/// participates in — it alone may be signed into the identity header, because
+/// only it is trustworthy. A caller on the read-only owner-fallback path
+/// (flow lookup failed, so `user_id` is the agent's owner instead) must pass
+/// `None` here even when `traceparent` still carries a well-formed but
+/// unverified trace id — signing that trace id back out would launder an
+/// unverified claim into a header a backend is told to trust unconditionally.
 pub async fn handle_request(
     state: &McpState,
     user_id: Uuid,
     agent_id: Uuid,
     body: &Value,
     traceparent: Option<&str>,
+    verified_flow_id: Option<&str>,
 ) -> Option<Value> {
     let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
@@ -93,20 +107,21 @@ pub async fn handle_request(
     }
 
     // Stamp every system backend's headers with a freshly-signed
-    // `(agent_id, user_id, flow_id)` so it can trust the caller's identity
-    // without re-deriving it — see `identity.rs`'s module doc. Only `initialize`
-    // (handled above) never needs this; both remaining methods route to a real
-    // backend.
-    let flow_id = traceparent
-        .and_then(nasiko_flow::FlowContext::from_traceparent)
-        .map(|c| c.flow_id);
-    inject_identity(
-        &mut resolved.servers,
-        agent_id,
-        user_id,
-        flow_id,
-        &state.config.identity_signing_key,
-    );
+    // `(agent_id, user_id, verified_flow_id)` so it can trust the caller's
+    // identity without re-deriving it — see `identity.rs`'s module doc. Only
+    // `initialize` (handled above) never needs this; both remaining methods
+    // route to a real backend. `verified_flow_id` — never a re-parse of the
+    // raw `traceparent` — is the only acceptable source for the signed
+    // `flow_id`: see this function's own doc comment for why.
+    if resolved.servers.iter().any(|s| s.system) {
+        let signed = crate::identity::SignedIdentity::new(
+            agent_id,
+            user_id,
+            verified_flow_id.map(str::to_string),
+        )
+        .sign(&state.config.identity_signing_key);
+        inject_identity(&mut resolved.servers, &signed);
+    }
 
     let result = match method {
         "tools/list" => {
@@ -227,32 +242,29 @@ fn connector_instructions(servers: &[MCPServerConfig], perms: &PermissionContext
         .collect()
 }
 
-/// Stamps every system backend's `headers` with a freshly-signed
-/// [`crate::identity::SignedIdentity`] carrying `(agent_id, user_id, flow_id)`,
-/// so a system backend (the workspace server) can trust who's calling without
-/// re-deriving it — see `identity.rs`'s module doc. Non-system backends are
-/// left untouched: the identity header is meaningless (and untrusted) to any
-/// backend the platform doesn't itself serve on loopback. A no-op (no signing,
-/// no allocation) when there is no system backend in `servers` at all.
+/// Stamps every system backend's `headers` with `signed` — an already-built
+/// [`crate::identity::SignedIdentity::sign`] header value — so a system
+/// backend (the workspace server) can trust who's calling without
+/// re-deriving it. Non-system backends are left untouched: the identity
+/// header is meaningless (and untrusted) to any backend the platform doesn't
+/// itself serve on loopback.
+///
+/// Deliberately takes the pre-signed string rather than the identity's parts
+/// (`agent_id`/`user_id`/`flow_id`) plus a key: the caller (`handle_request`)
+/// already gates this whole call on "is there a system backend at all", so
+/// signing happens at most once regardless of how many system servers are
+/// present, and this function stays a plain, allocation-free stamp.
 ///
 /// Pure and synchronous by design, unlike `handle_request` itself — that
 /// function's `resolve_session`/`load_permission_context` calls need a real
 /// DB this crate's hermetic unit tests can't provide, so this is the seam the
 /// tests below actually exercise.
-fn inject_identity(
-    servers: &mut [MCPServerConfig],
-    agent_id: Uuid,
-    user_id: Uuid,
-    flow_id: Option<String>,
-    key: &[u8],
-) {
-    if !servers.iter().any(|s| s.system) {
-        return;
-    }
-    let signed = crate::identity::SignedIdentity::new(agent_id, user_id, flow_id).sign(key);
+fn inject_identity(servers: &mut [MCPServerConfig], signed: &str) {
     for s in servers.iter_mut().filter(|s| s.system) {
-        s.headers
-            .insert(crate::identity::IDENTITY_HEADER.to_string(), signed.clone());
+        s.headers.insert(
+            crate::identity::IDENTITY_HEADER.to_string(),
+            signed.to_string(),
+        );
     }
 }
 
@@ -1508,7 +1520,7 @@ mod tests {
     async fn unknown_method_is_rejected_before_permission_or_session_work() {
         let state = test_state();
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover"});
-        let res = handle_request(&state, Uuid::new_v4(), Uuid::new_v4(), &body, None)
+        let res = handle_request(&state, Uuid::new_v4(), Uuid::new_v4(), &body, None, None)
             .await
             .expect("a request with an id must produce a response");
         assert_eq!(
@@ -2438,19 +2450,16 @@ mod initialize_tests {
     }
 
     #[test]
-    fn inject_identity_stamps_only_system_servers_and_carries_the_right_identity() {
+    fn inject_identity_stamps_only_system_servers_with_the_given_header() {
         let key = b"test-identity-key".to_vec();
         let agent_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
+        let signed =
+            crate::identity::SignedIdentity::new(agent_id, user_id, Some("flow-abc".to_string()))
+                .sign(&key);
         let mut servers = vec![system_cfg(Uuid::new_v4()), cfg(Uuid::new_v4(), None)];
 
-        inject_identity(
-            &mut servers,
-            agent_id,
-            user_id,
-            Some("flow-abc".to_string()),
-            &key,
-        );
+        inject_identity(&mut servers, &signed);
 
         let system_server = servers.iter().find(|s| s.system).expect("system server");
         let header = system_server
@@ -2478,15 +2487,48 @@ mod initialize_tests {
     #[test]
     fn inject_identity_is_a_no_op_when_there_is_no_system_backend() {
         let key = b"test-identity-key".to_vec();
+        let signed =
+            crate::identity::SignedIdentity::new(Uuid::new_v4(), Uuid::new_v4(), None).sign(&key);
         let mut servers = vec![cfg(Uuid::new_v4(), None), cfg(Uuid::new_v4(), None)];
 
-        inject_identity(&mut servers, Uuid::new_v4(), Uuid::new_v4(), None, &key);
+        inject_identity(&mut servers, &signed);
 
         assert!(
             servers
                 .iter()
                 .all(|s| !s.headers.contains_key(crate::identity::IDENTITY_HEADER)),
             "no backend is system, so nothing should be stamped: {servers:?}"
+        );
+    }
+
+    /// The regression this guards: the gateway's owner-fallback path (flow
+    /// lookup failed, so `user_id` resolves to the agent's owner instead —
+    /// `oss/server/src/mcp/handlers/gateway.rs::flow_user`/`dispatch`) must
+    /// never sign a trace id out of the raw `traceparent` header, because
+    /// that trace id was never verified against `flows`/`flow_participants`
+    /// — it could name a flow the agent has nothing to do with, or no flow
+    /// at all. `handle_request` only ever signs `verified_flow_id`, which
+    /// that path passes as `None`; this proves the signed header reflects
+    /// exactly that, with no way for a raw traceparent to leak in.
+    #[test]
+    fn owner_fallback_with_no_verified_flow_id_signs_flow_id_none() {
+        let key = b"test-identity-key".to_vec();
+        let agent_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        // What `handle_request` actually does with `verified_flow_id: None`
+        // before calling `inject_identity` — see the `if resolved.servers...`
+        // block above. Exercised directly (not through the full
+        // `handle_request`, which needs a real DB) for the same reason
+        // `inject_identity` itself is tested directly.
+        let signed = crate::identity::SignedIdentity::new(agent_id, user_id, None).sign(&key);
+
+        let verified = crate::identity::SignedIdentity::verify(&signed, &key).unwrap();
+        assert_eq!(verified.agent_id, agent_id);
+        assert_eq!(verified.user_id, user_id);
+        assert_eq!(
+            verified.flow_id, None,
+            "the owner-fallback path must sign flow_id: None, never a trace id \
+             lifted from an unverified traceparent"
         );
     }
 }

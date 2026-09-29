@@ -517,8 +517,13 @@ fn test_config(db_url: String, redis_url: String, s3_endpoint: String) -> Config
         nasiko_bff_url: None,
         mcp_tool_search_meta_limit: 0,
         mcp_gateway_instructions: String::new(),
-        // Matches the JWT_SECRET set above — `McpConfig::from_config` falls
-        // back to it when MCP_IDENTITY_SIGNING_KEY is unset, same as production.
+        // This literal is built directly, not through `Config::from_env` — so
+        // it bypasses that function's JWT_SECRET-derived fallback (which
+        // domain-separates with an `mcp-identity::` prefix; see
+        // `nasiko_config::mcp_identity_signing_key`). Set directly to
+        // `TEST_JWT_SECRET`'s own value, unprefixed, so tests deriving the
+        // signing key for `identity::SignedIdentity::verify` have a fixed,
+        // known value to use (see `mcp_system_connector.rs`).
         mcp_identity_signing_key: TEST_JWT_SECRET.to_string(),
     }
 }

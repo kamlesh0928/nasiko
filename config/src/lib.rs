@@ -304,11 +304,42 @@ pub struct Config {
     /// forwarding a caller's `(agent_id, user_id, flow_id)` to a system backend
     /// (`oss/mcp-gateway/src/identity.rs`) — the backend trusts that header
     /// instead of re-deriving who is calling. MCP_IDENTITY_SIGNING_KEY; falls
-    /// back to the already-required `JWT_SECRET` when unset/empty, so a
-    /// deployment doesn't need to mint a second secret just for this. Empty
-    /// only when both are unset, which `McpConfig::from_config` rejects at
-    /// startup with a clear message.
+    /// back to a value *derived* from the already-required `JWT_SECRET` when
+    /// unset/empty (domain-separated with an `mcp-identity::` prefix, not a
+    /// bare reuse — see `from_env`), so a deployment doesn't need to mint a
+    /// second secret just for this, without literally handing the session-JWT
+    /// key to whichever out-of-process backend this key gets configured into.
+    /// Empty only when both are unset, which `McpConfig::from_config` rejects
+    /// at startup with a clear message.
     pub mcp_identity_signing_key: String,
+}
+
+/// `MCP_IDENTITY_SIGNING_KEY`, trimmed; when unset/blank, derives one from a
+/// trimmed `JWT_SECRET` with an `mcp-identity::` domain-separation prefix —
+/// never a bare reuse of the session-JWT key, mirroring
+/// `oauth_state_signing_key`'s own `mcp-oauth-state::` prefix in
+/// `oss/mcp-gateway/src/config.rs`. The point of domain separation here is
+/// specifically that this key may end up configured into an out-of-process
+/// backend (e.g. the workspace server, a later consumer of
+/// `identity_signing_key`) — an operator handing that backend the platform's
+/// "identity key" must never be handing over the same key that also signs
+/// every session JWT. Empty only when `JWT_SECRET` is empty too, which
+/// `McpConfig::from_config` (`oss/mcp-gateway/src/config.rs`) rejects at
+/// startup with a clear message — this function does not fail fast itself,
+/// since `nasiko-config` has no such policy for values it merely carries.
+fn mcp_identity_signing_key() -> String {
+    let dedicated = std::env::var("MCP_IDENTITY_SIGNING_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(key) = dedicated {
+        return key;
+    }
+    let jwt_secret = env_or("JWT_SECRET", "").trim().to_string();
+    if jwt_secret.is_empty() {
+        return String::new();
+    }
+    format!("mcp-identity::{jwt_secret}")
 }
 
 impl Config {
@@ -522,14 +553,7 @@ impl Config {
             mcp_tool_search_tool_limit: env_parse("MCP_TOOL_SEARCH_TOOL_LIMIT", 15),
             mcp_tool_search_meta_limit: env_parse("MCP_TOOL_SEARCH_META_LIMIT", 10),
             mcp_gateway_instructions: env_or("MCP_GATEWAY_INSTRUCTIONS", ""),
-            // No domain-separation prefix (unlike `oauth_state_signing_key`'s
-            // JWT_SECRET fallback in `oss/mcp-gateway/src/config.rs`) — this key
-            // signs a header, not a URL-embedded state blob, so there's no
-            // adjacent-signer collision to guard against.
-            mcp_identity_signing_key: std::env::var("MCP_IDENTITY_SIGNING_KEY")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| env_or("JWT_SECRET", "")),
+            mcp_identity_signing_key: mcp_identity_signing_key(),
         })
     }
 
