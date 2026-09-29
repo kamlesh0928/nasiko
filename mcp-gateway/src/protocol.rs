@@ -133,6 +133,7 @@ pub async fn handle_request(
                 &resolved.connected_toolkits,
                 &perms,
                 traceparent,
+                verified_flow_id,
             )
             .await
         }
@@ -271,11 +272,14 @@ fn inject_identity(servers: &mut [MCPServerConfig], signed: &str) {
 /// `tools/list` — query-aware search (semantic/BM25) or eager fan-out (none mode).
 ///
 /// When search is enabled (`MCP_TOOL_SEARCH_MODE != none`):
-/// - With traceparent: resolves the user's query from `flows.title`, runs flat
-///   search, returns top-k matched tools + pinned tools + `nasiko_search_tools`.
-/// - Without traceparent (agent startup): returns only `nasiko_search_tools`.
+/// - With a verified flow: resolves the user's query from `flows.title`, runs
+///   flat search, returns top-k matched tools + pinned tools +
+///   `nasiko_search_tools`.
+/// - Without one (agent startup, or a flow-less owner-fallback call): returns
+///   only `nasiko_search_tools`.
 ///
 /// When search is disabled (`none`): delegates to `aggregate_tools` (legacy fan-out).
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_tools_list(
     state: &McpState,
     user_id: Uuid,
@@ -284,11 +288,15 @@ pub async fn handle_tools_list(
     connected_toolkits: &[String],
     perms: &PermissionContext,
     traceparent: Option<&str>,
+    verified_flow_id: Option<&str>,
 ) -> Value {
     use crate::config::ToolSearchMode;
 
     if state.config.tool_search_mode == ToolSearchMode::None {
-        // Rollback path: eager fan-out (existing behavior).
+        // Rollback path: eager fan-out (existing behavior). `traceparent` here
+        // is only forwarded as the outbound W3C trace context for backend
+        // telemetry (`provider.list_tools`), never used to resolve identity or
+        // read another flow's data, so the raw header is fine.
         return match aggregator::aggregate_tools(
             state,
             user_id,
@@ -307,8 +315,14 @@ pub async fn handle_tools_list(
     // ── Search path ────────────────────────────────────────────────────────
     let mut tools: Vec<Value> = Vec::new();
 
-    // Resolve the user's query from the flow record (if traceparent present).
-    let user_query = resolve_flow_title(state, traceparent).await;
+    // Resolve the user's query from the flow record — keyed on
+    // `verified_flow_id`, never a re-parse of the raw `traceparent`: a
+    // coding-agent row's owner-fallback call carries `verified_flow_id: None`
+    // even when `traceparent` still names some OTHER user's live flow (it
+    // resolves to the owner precisely because it isn't a participant of
+    // that flow), and that other flow's `title` is that user's private query
+    // text — nothing this caller was ever proven to have a claim on.
+    let user_query = resolve_flow_title(state, verified_flow_id).await;
 
     if let Some(ref query) = user_query {
         // Get the connector IDs this user can access.
@@ -345,12 +359,18 @@ pub async fn handle_tools_list(
     ok(req_id, json!({ "tools": tools }))
 }
 
-/// Resolve `flows.title` (the user's original query) from a traceparent header.
-async fn resolve_flow_title(state: &McpState, traceparent: Option<&str>) -> Option<String> {
-    let tp = traceparent?;
-    let flow_id = nasiko_flow::FlowContext::from_traceparent(tp)?.flow_id;
+/// Resolve `flows.title` (the user's original query) for a *verified* flow
+/// id — never a raw `traceparent` re-parse. Only the route layer
+/// (`oss/server/src/mcp/handlers/gateway.rs::flow_user`) proves a trace id
+/// names a live flow this agent actually participates in; keying this lookup
+/// on anything less would let a caller with no claim on a flow (e.g. a
+/// coding-agent row's owner-fallback call, which carries a `None` here
+/// exactly because it ISN'T a participant) read another user's private query
+/// text out of `flows.title` by naming their trace id.
+async fn resolve_flow_title(state: &McpState, verified_flow_id: Option<&str>) -> Option<String> {
+    let flow_id = verified_flow_id?;
     sqlx::query_scalar::<_, Option<String>>("SELECT title FROM flows WHERE flow_id = $1")
-        .bind(&flow_id)
+        .bind(flow_id)
         .fetch_optional(&state.db)
         .await
         .ok()

@@ -946,3 +946,247 @@ async fn coding_agent_row_with_a_live_flow_uses_the_flow_not_the_owner() {
 
     server.cleanup().await;
 }
+
+/// Code-quality review of Task 1.5: the widening the owner policy introduces
+/// covers not just an *unknown* trace id but a REAL, live flow the
+/// coding-agent row simply isn't a participant of — a different user's,
+/// dispatched to a different agent entirely. Naming it must not let the
+/// coding-agent row ride along on it: `flow_user` still denies (rule 4, not a
+/// participant), exactly as it would for a plain deployed agent, and only
+/// then does the coding-agent owner policy take over — resolving to its OWN
+/// owner, never the foreign flow's user or trace id.
+#[tokio::test]
+#[serial]
+async fn coding_agent_row_with_a_foreign_live_flow_still_resolves_to_owner() {
+    let server = TestServer::start_with(|cfg| {
+        cfg.mcp_tool_search_mode = "none".to_string();
+    })
+    .await;
+
+    let owner = seed_user(&server, "ws-coding-agent-foreign-owner").await;
+    let agent_id = seed_agent(&server, owner, "ws-coding-agent-foreign").await;
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(agent_id)
+        .execute(&server.db)
+        .await
+        .expect("stamp coding_agent_integration_id");
+
+    let (backend_url, _backend_calls, backend_headers) = start_stub_system_backend().await;
+
+    let connector_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO mcp_connectors (provider_type, source_kind, name, url, auth_type, instructions) \
+         VALUES ('system', 'system', 'ws-coding-agent-foreign-connector', $1, 'none', 'instr') \
+         RETURNING id",
+    )
+    .bind(&backend_url)
+    .fetch_one(&server.db)
+    .await
+    .expect("insert system connector");
+
+    sqlx::query(
+        "INSERT INTO mcp_connector_grants (connector_id, grant_type, grantee_id) \
+         VALUES ($1, 'public', '*')",
+    )
+    .bind(connector_id)
+    .execute(&server.db)
+    .await
+    .expect("insert public grant");
+
+    for tool in [SAVE_FILE, LIST_FILES] {
+        sqlx::query("INSERT INTO mcp_connector_tools (connector_id, tool_name) VALUES ($1, $2)")
+            .bind(connector_id)
+            .bind(tool)
+            .execute(&server.db)
+            .await
+            .expect("insert synced connector tool");
+    }
+
+    sqlx::query(
+        "INSERT INTO mcp_agent_connector_access (agent_id, connector_id, enabled) \
+         VALUES ($1, $2, true)",
+    )
+    .bind(agent_id)
+    .bind(connector_id)
+    .execute(&server.db)
+    .await
+    .expect("insert agent connector access");
+
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+
+    // A REAL, live flow — belonging to a different user, dispatched to a
+    // different agent. Deliberately not `agent_id`.
+    let victim = seed_user(&server, "ws-coding-agent-foreign-victim").await;
+    let victim_agent = seed_agent(&server, victim, "ws-coding-agent-foreign-victim-agent").await;
+    let (_victim_flow_id, foreign_traceparent) =
+        common::open_flow(&server.db, victim, victim_agent).await;
+
+    let res = server
+        .client
+        .post(server.url("/api/mcp"))
+        .bearer_auth(&token)
+        .header("traceparent", &foreign_traceparent)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": SAVE_FILE, "arguments": {}},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        200,
+        "a coding-agent row must be admitted even when the traceparent names \
+         a real, live flow it isn't a participant of"
+    );
+    let body: Value = res.json().await.unwrap();
+    assert!(
+        body.get("error").is_none(),
+        "save_file call must not error: {body:?}"
+    );
+
+    let identity_header = {
+        let logged = backend_headers.lock().unwrap();
+        let (_, header) = logged
+            .iter()
+            .find(|(method, _)| method == "tools/call")
+            .expect("stub must have logged the tools/call request");
+        header
+            .clone()
+            .expect("system backend must receive x-nasiko-identity on tools/call")
+    };
+    let verified = nasiko_mcp_gateway::identity::SignedIdentity::verify(
+        &identity_header,
+        common::TEST_JWT_SECRET.as_bytes(),
+    )
+    .expect("the gateway's own signature must verify with the test signing key");
+    assert_eq!(verified.agent_id, agent_id);
+    assert_eq!(
+        verified.user_id, owner,
+        "a foreign live flow must never leak in as the caller's identity — \
+         the coding-agent row still acts only as its own owner"
+    );
+    assert_eq!(
+        verified.flow_id, None,
+        "the coding-agent row is not a participant of the foreign flow, so \
+         flow_id must be None, never that flow's own id"
+    );
+
+    server.cleanup().await;
+}
+
+/// The cross-user event-injection regression a code-quality review of Task
+/// 1.5 caught: on the same foreign-live-flow setup as the test above, an
+/// `ask`-stance tool call must not publish a `ToolApprovalRequired` event
+/// onto the FOREIGN flow's `FlowEventBus` channel. `a2a_dispatch.rs` forwards
+/// that channel straight into the flow owner's SSE stream, so before the fix
+/// a coding-agent row could name any live flow's trace id and land an
+/// attacker-chosen server/tool "needs approval" card in a completely
+/// unrelated user's chat — despite never being a participant of that flow.
+/// The fix keys the publish on `verified_flow_id` (`None` here, since this
+/// agent isn't a participant), never a re-parse of the raw `traceparent`.
+#[tokio::test]
+#[serial]
+async fn coding_agent_row_with_foreign_flow_does_not_leak_an_approval_event() {
+    let server = TestServer::start_with(|cfg| {
+        cfg.mcp_tool_search_mode = "none".to_string();
+    })
+    .await;
+
+    let owner = seed_user(&server, "ws-coding-agent-ask-owner").await;
+    let agent_id = seed_agent(&server, owner, "ws-coding-agent-ask").await;
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(agent_id)
+        .execute(&server.db)
+        .await
+        .expect("stamp coding_agent_integration_id");
+
+    let (backend_url, _backend_calls, _backend_headers) = start_stub_system_backend().await;
+
+    let connector_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO mcp_connectors (provider_type, source_kind, name, url, auth_type, instructions) \
+         VALUES ('system', 'system', 'ws-coding-agent-ask-connector', $1, 'none', 'instr') \
+         RETURNING id",
+    )
+    .bind(&backend_url)
+    .fetch_one(&server.db)
+    .await
+    .expect("insert system connector");
+
+    sqlx::query(
+        "INSERT INTO mcp_connector_grants (connector_id, grant_type, grantee_id) \
+         VALUES ($1, 'public', '*')",
+    )
+    .bind(connector_id)
+    .execute(&server.db)
+    .await
+    .expect("insert public grant");
+
+    for tool in [SAVE_FILE, LIST_FILES] {
+        sqlx::query("INSERT INTO mcp_connector_tools (connector_id, tool_name) VALUES ($1, $2)")
+            .bind(connector_id)
+            .bind(tool)
+            .execute(&server.db)
+            .await
+            .expect("insert synced connector tool");
+    }
+
+    // Ask-stance for save_file specifically — this is what makes the call
+    // answer TOOL_ASK instead of actually executing.
+    sqlx::query(
+        "INSERT INTO mcp_agent_connector_access (agent_id, connector_id, enabled, tool_rules) \
+         VALUES ($1, $2, true, $3)",
+    )
+    .bind(agent_id)
+    .bind(connector_id)
+    .bind(json!([{"pattern": SAVE_FILE, "stance": "ask"}]))
+    .execute(&server.db)
+    .await
+    .expect("insert agent connector access with ask-stance rule");
+
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+
+    let victim = seed_user(&server, "ws-coding-agent-ask-victim").await;
+    let victim_agent = seed_agent(&server, victim, "ws-coding-agent-ask-victim-agent").await;
+    let (victim_flow_id, foreign_traceparent) =
+        common::open_flow(&server.db, victim, victim_agent).await;
+
+    // Simulate the victim's live SSE subscription to their own flow — exactly
+    // what `a2a_dispatch.rs` sets up for a real chat session.
+    let mut victim_rx = server.flow_events.subscribe(&victim_flow_id).await;
+
+    let res = server
+        .client
+        .post(server.url("/api/mcp"))
+        .bearer_auth(&token)
+        .header("traceparent", &foreign_traceparent)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": SAVE_FILE, "arguments": {}},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        200,
+        "an ask-stance decision is a normal 200 JSON-RPC error, not an HTTP error"
+    );
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(
+        body["error"]["code"],
+        json!(nasiko_mcp_gateway::types::codes::TOOL_ASK),
+        "must be the normal ask decision: {body:?}"
+    );
+
+    // The regression: nothing must have been published onto the VICTIM's own
+    // flow, despite their trace id being the one carried on the wire.
+    match victim_rx.try_recv() {
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+        other => panic!(
+            "a coding-agent row naming a foreign live flow must publish \
+             NOTHING to it, got {other:?}"
+        ),
+    }
+
+    server.cleanup().await;
+}

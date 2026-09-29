@@ -314,9 +314,16 @@ pub struct Config {
     pub mcp_identity_signing_key: String,
 }
 
+/// Domain-separation prefix for the `JWT_SECRET`-derived fallback identity
+/// key (see [`derive_identity_signing_key`]) — the single source both this
+/// crate and `oss/mcp-gateway/src/config.rs` read, so the two never drift
+/// onto different literals (the gateway strips this exact prefix before
+/// measuring the fallback key's actual entropy for its short-key warning).
+pub const IDENTITY_KEY_PREFIX: &str = "mcp-identity::";
+
 /// `MCP_IDENTITY_SIGNING_KEY`, trimmed; when unset/blank, derives one from a
-/// trimmed `JWT_SECRET` with an `mcp-identity::` domain-separation prefix —
-/// never a bare reuse of the session-JWT key, mirroring
+/// trimmed `JWT_SECRET` with an [`IDENTITY_KEY_PREFIX`] domain-separation
+/// prefix — never a bare reuse of the session-JWT key, mirroring
 /// `oauth_state_signing_key`'s own `mcp-oauth-state::` prefix in
 /// `oss/mcp-gateway/src/config.rs`. The point of domain separation here is
 /// specifically that this key may end up configured into an out-of-process
@@ -336,7 +343,7 @@ fn mcp_identity_signing_key() -> String {
 /// Pure derivation behind [`mcp_identity_signing_key`], split out so the four
 /// cases below are unit-testable without touching the environment: a
 /// non-blank `dedicated` key (trimmed) always wins; otherwise a non-blank
-/// `jwt_secret` (trimmed) is domain-separated with the `mcp-identity::`
+/// `jwt_secret` (trimmed) is domain-separated with the [`IDENTITY_KEY_PREFIX`]
 /// prefix; if both are blank the result is empty, which `McpConfig::from_config`
 /// rejects at startup.
 fn derive_identity_signing_key(dedicated: Option<&str>, jwt_secret: &str) -> String {
@@ -347,7 +354,7 @@ fn derive_identity_signing_key(dedicated: Option<&str>, jwt_secret: &str) -> Str
     if jwt_secret.is_empty() {
         return String::new();
     }
-    format!("mcp-identity::{jwt_secret}")
+    format!("{IDENTITY_KEY_PREFIX}{jwt_secret}")
 }
 
 impl Config {
@@ -687,7 +694,7 @@ mod tests {
     fn no_dedicated_key_falls_back_to_prefixed_trimmed_jwt_secret() {
         assert_eq!(
             derive_identity_signing_key(None, "  jwt-secret  "),
-            "mcp-identity::jwt-secret"
+            format!("{IDENTITY_KEY_PREFIX}jwt-secret")
         );
     }
 
@@ -695,7 +702,7 @@ mod tests {
     fn blank_dedicated_key_falls_through_to_jwt_secret() {
         assert_eq!(
             derive_identity_signing_key(Some("   "), "jwt-secret"),
-            "mcp-identity::jwt-secret"
+            format!("{IDENTITY_KEY_PREFIX}jwt-secret")
         );
     }
 

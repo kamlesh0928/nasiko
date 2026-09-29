@@ -214,6 +214,12 @@ pub struct TestServer {
     /// observations (`set_instances`) and drive the hours meter directly.
     #[allow(dead_code)]
     pub runtime: Arc<FakeRuntime>,
+    /// Clone of the running server's `AppState::flow_events` — lets a test
+    /// subscribe to a flow's `FlowEventBus` channel directly and assert on
+    /// what actually got published (or didn't), rather than only on the HTTP
+    /// response.
+    #[allow(dead_code)]
+    pub flow_events: nasiko_flow::FlowEventBus,
     db_name: String,
     admin_pool: PgPool,
 }
@@ -320,6 +326,7 @@ impl TestServer {
         );
         let state =
             AppState::from_config_with_db(config, auth, runtime, oci_storage, db.clone()).await;
+        let flow_events = state.flow_events.clone();
 
         let app = nasiko_server::build_app(state, fallback);
 
@@ -335,6 +342,7 @@ impl TestServer {
             client: reqwest::Client::new(),
             db: db.clone(),
             runtime: fake_handle,
+            flow_events,
             db_name,
             admin_pool: admin,
         }

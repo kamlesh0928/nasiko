@@ -551,9 +551,12 @@ async fn url_credential_honours_revocation() {
 #[serial]
 async fn a_leaked_url_alone_cannot_call_a_tool() {
     // The property that makes carrying the credential in a URL an acceptable
-    // trade: the credential proves only *which agent*. Without a traceparent
-    // naming a live flow the agent participates in, `tools/call` is still 403 —
-    // so a URL scraped from a log or a trace cannot invoke anything.
+    // trade — for a deployed agent: the credential proves only *which agent*,
+    // and without a traceparent naming a live flow the agent participates in,
+    // `tools/call` is still 403, so a URL scraped from a log or a trace cannot
+    // invoke anything. This does NOT extend to a CLI-bound coding-agent row
+    // (`coding_agent_row_without_flow_resolves_to_owner_for_tools_call` above
+    // covers that case, deliberately, on its own).
     let server = TestServer::start().await;
     let owner = seed_user(&server, "gwu-owner-leak").await;
     let agent = seed_agent(&server, owner, "gwu-agent-leak").await;

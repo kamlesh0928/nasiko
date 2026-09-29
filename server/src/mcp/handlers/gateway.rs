@@ -3,11 +3,12 @@
 //! Deliberately NOT behind `require_auth`: agents authenticate with their own
 //! deploy-time credential (`Authorization: Bearer $MCP_GATEWAY_TOKEN`, minted
 //! by `mcp::wiring` and stored hashed in `agent_gateway_tokens`), and the user
-//! identity is resolved server-side from the request's `traceparent` via the
-//! `flows` row + `flow_participants` check — see
-//! docs/MCP_GATEWAY_AGENT_AUTH.md §2.4. This handler is thin — identity, usage
-//! tracking, flow events — all protocol logic lives in
-//! `nasiko_mcp_gateway::protocol`.
+//! identity is resolved server-side — from the request's `traceparent` via the
+//! `flows` row + `flow_participants` check, or, for a CLI-bound local
+//! coding-agent row with no flow (or none that resolves), from the row's own
+//! owner instead — see docs/MCP_GATEWAY_AGENT_AUTH.md §2.4 rule 3b. This
+//! handler is thin — identity, usage tracking, flow events — all protocol
+//! logic lives in `nasiko_mcp_gateway::protocol`.
 
 use axum::{
     Json,
@@ -36,7 +37,7 @@ use crate::usage::TokenUsageBuilder;
 /// 3b. …unless the agent's row is a CLI-bound local coding agent
 ///     (`coding_agent_integration_id` set, spec §16 A3) — such a row is never
 ///     dispatched through a flow, so a flow-less `tools/call` resolves to its
-///     owner instead of 403 (`coding_agent_owner`, below `dispatch`)
+///     owner instead of 403 (`agent_owner`, below `dispatch`)
 /// 4. `tools/call` where the agent is not a recorded flow participant → 403
 /// 5. identity store unreachable → 403
 #[utoipa::path(
@@ -45,7 +46,7 @@ use crate::usage::TokenUsageBuilder;
     tag = "mcp",
     params(
         ("Authorization" = String, Header, description = "`Bearer <MCP_GATEWAY_TOKEN>` — the per-agent gateway credential injected into the container env at deploy time"),
-        ("traceparent" = Option<String>, Header, description = "W3C trace context naming the flow this call belongs to — required for `tools/call`, except for a CLI-bound local coding-agent row (`coding_agent_integration_id` set), which resolves to its owner when the flow lookup fails; the user identity is resolved from the flow record"),
+        ("traceparent" = Option<String>, Header, description = "W3C trace context naming the flow this call belongs to — required for `tools/call`, except for a CLI-bound local coding-agent row (`coding_agent_integration_id` set), which resolves to its owner when the flow lookup fails; otherwise the user identity is resolved from the flow record"),
         ("MCP-Protocol-Version" = Option<String>, Header, description = "Negotiated MCP protocol version; an unsupported value is rejected with 400 on implemented methods"),
     ),
     request_body(content = Object, description = "JSON-RPC 2.0 request: `tools/list` or `tools/call`"),
@@ -95,21 +96,24 @@ pub async fn mcp_gateway(
 /// That bound does NOT hold for a CLI-bound local coding-agent row
 /// (`coding_agent_integration_id` set, spec §16 A3/A4): such a row has no
 /// flow to require, so a leaked connect URL for one CAN call tools —
-/// attributed to, and scoped to, that row's owner (their own connectors and
-/// workspace only; never another user's, and never shareable to widen that
-/// scope — A4). This is the same attribution the LLM router already applies
-/// to these rows with no flow at all
-/// (`oss/llm-router/src/handlers/chat.rs:312-323`). The exposure is bounded
-/// the same way every gateway token already is: re-minting supersedes the
-/// old plaintext after a grace window (`nasiko_mcp_gateway::agent_tokens::mint`),
-/// which a CLI-triggered reconnect can drive going forward.
+/// attributed to, and scoped to, that row's owner: exactly the connectors the
+/// owner can access (their own, plus anything shared to them) that are also
+/// enabled for this specific agent row, never another user's. This is the
+/// same attribution the LLM router already applies to these rows with no flow
+/// at all (`oss/llm-router/src/handlers/chat.rs:312-323`). Sharing such a row
+/// out to widen that scope will be enforced against by Task 1.6 (spec A4),
+/// not yet landed. The credential itself has no TTL of its own — it rotates
+/// only on re-mint (`nasiko_mcp_gateway::agent_tokens::mint`, same primitive
+/// every gateway token uses), and there is no CLI-triggered re-mint path for
+/// these rows yet (Task 1.7's `POST /api/agents/{id}/mcp-token`); until then a
+/// leaked coding-agent connect URL is live for as long as the row is.
 #[utoipa::path(
     post,
     path = "/api/mcp/s/{token}",
     tag = "mcp",
     params(
         ("token" = String, Path, description = "The per-agent `MCP_GATEWAY_TOKEN`, carried in the path for MCP clients that cannot set headers. Pre-composed as `MCP_GATEWAY_CONNECT_URL` in the container env."),
-        ("traceparent" = Option<String>, Header, description = "W3C trace context naming the flow this call belongs to — required for `tools/call`, except for a CLI-bound local coding-agent row (`coding_agent_integration_id` set), which resolves to its owner when the flow lookup fails; the user identity is resolved from the flow record"),
+        ("traceparent" = Option<String>, Header, description = "W3C trace context naming the flow this call belongs to — required for `tools/call`, except for a CLI-bound local coding-agent row (`coding_agent_integration_id` set), which resolves to its owner when the flow lookup fails; otherwise the user identity is resolved from the flow record"),
         ("MCP-Protocol-Version" = Option<String>, Header, description = "Negotiated MCP protocol version; an unsupported value is rejected with 400 on implemented methods"),
     ),
     request_body(content = Object, description = "JSON-RPC 2.0 request: `tools/list` or `tools/call`"),
@@ -214,7 +218,7 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
     // Resolve the user identity. `tools/call` (rules 3+4) requires the
     // traceparent to name a live flow this agent was dispatched into — the
     // flow's user is the authorization subject — except for a CLI-bound
-    // local coding-agent row (rule 3b, `coding_agent_owner` below), which has
+    // local coding-agent row (rule 3b, `agent_owner` below), which has
     // no flow to require and resolves to its owner instead. Read-only methods
     // (initialize/ping/tools/list, rule 2) work agent-only: the flow user when
     // one resolves, else the agent's owner (startup-time tool discovery
@@ -233,45 +237,42 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
     // into a header a backend is told to trust unconditionally.
     let (user_id, verified_flow_id) = match flow_user(state, traceparent, agent_id).await {
         Ok((user_id, flow_id)) => (user_id, Some(flow_id)),
-        Err(denial) => {
-            // Deliberate policy (MCP_GATEWAY_AGENT_AUTH.md §5, spec §16 A3): a
-            // local coding agent — a row the CLI bound with
+        Err(denial) => match agent_owner(state, agent_id).await {
+            // Deliberate policy (MCP_GATEWAY_AGENT_AUTH.md §5, rule 3b; spec
+            // §16 A3): a local coding agent — a row the CLI bound with
             // `coding_agent_integration_id` — is never dispatched through the
-            // proxy, so it never has a flow; it acts as its owner instead.
-            // Same predicate the LLM router uses for the same rows
-            // (`oss/llm-router/src/resolver/mod.rs`,
+            // proxy, so it never has a flow; it acts as its owner instead,
+            // even for `tools/call`. Same predicate the LLM router uses for
+            // the same rows (`oss/llm-router/src/resolver/mod.rs`,
             // `coding_agent_integration_id IS NOT NULL`), so the gateway and
-            // the router can never disagree about which rows are "personal
-            // desks". Every other flow-less `tools/call` stays denied;
-            // read-only methods keep the pre-existing owner fallback.
-            match coding_agent_owner(state, agent_id).await {
-                Ok(Some(owner)) => (owner, None),
-                Ok(None) if method == "tools/call" => return denial,
-                Ok(None) => match agent_owner(state, agent_id).await {
-                    Ok(Some(owner)) => (owner, None),
-                    Ok(None) => {
-                        return (
-                            StatusCode::UNAUTHORIZED,
-                            "agent no longer exists — gateway token is stale",
-                        )
-                            .into_response();
-                    }
-                    // Rule 5 again: an unreachable identity store is not "the
-                    // agent is gone". Reporting 401 here would tell a healthy
-                    // agent its credential is stale and trigger a pointless
-                    // rotate/redeploy.
-                    Err(e) => {
-                        tracing::error!(error = %e, %agent_id, "mcp gateway: owner lookup failed — failing closed");
-                        return (StatusCode::FORBIDDEN, "identity store unavailable")
-                            .into_response();
-                    }
-                },
-                Err(e) => {
-                    tracing::error!(error = %e, %agent_id, "mcp gateway: coding-agent owner lookup failed — failing closed");
-                    return (StatusCode::FORBIDDEN, "identity store unavailable").into_response();
-                }
+            // the router agree on which rows count as "personal desks" —
+            // though not on how they're billed: the router always attributes
+            // these rows to their owner with no flow at all, while the
+            // gateway takes a verified flow first (above) and only reaches
+            // this fallback when one doesn't resolve. That difference is
+            // unreachable today: a coding-agent row is never dispatched into,
+            // so nothing ever has an endpoint of its own to route a flow to.
+            Ok(Some((owner, true))) => (owner, None),
+            // Every other flow-less `tools/call` stays denied (rules 3+4).
+            Ok(_) if method == "tools/call" => return denial,
+            // Read-only methods (rule 2): agent-only identity via the owner —
+            // unchanged from before the coding-agent policy existed.
+            Ok(Some((owner, false))) => (owner, None),
+            Ok(None) => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    "agent no longer exists — gateway token is stale",
+                )
+                    .into_response();
             }
-        }
+            // Rule 5 again: an unreachable identity store is not "the agent
+            // is gone". Reporting 401 here would tell a healthy agent its
+            // credential is stale and trigger a pointless rotate/redeploy.
+            Err(e) => {
+                tracing::error!(error = %e, %agent_id, "mcp gateway: owner lookup failed — failing closed");
+                return (StatusCode::FORBIDDEN, "identity store unavailable").into_response();
+            }
+        },
     };
 
     let started = std::time::Instant::now();
@@ -300,7 +301,17 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
             .and_then(|e| e.get("code"))
             .and_then(|c| c.as_i64())
             == Some(codes::TOOL_ASK)
-            && let Some(flow_ctx) = traceparent.and_then(nasiko_flow::FlowContext::from_traceparent)
+            // `verified_flow_id`, never a re-parse of the raw `traceparent`:
+            // the owner-fallback path (coding-agent row, or a foreign/dead
+            // trace id) hands back `None` here specifically because nobody
+            // proved this call belongs to that flow. Re-parsing `traceparent`
+            // instead would let a coding-agent row — which resolves to its
+            // owner precisely because it has no flow of its own — name any
+            // OTHER user's live flow and land an approval card, naming an
+            // attacker-chosen server/tool, in that user's SSE stream
+            // (`a2a_dispatch.rs` forwards `FlowEventBus` events straight into
+            // the flow owner's chat).
+            && let Some(flow_id) = verified_flow_id.as_deref()
         {
             // Prefer the connector name the protocol layer attached (tool prefixes
             // are opaque connector-id hex); fall back to the prefix, then composio.
@@ -319,7 +330,7 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
             state
                 .flow_events
                 .publish(
-                    &flow_ctx.flow_id,
+                    flow_id,
                     nasiko_flow::FlowEvent::ToolApprovalRequired {
                         agent_id: agent_id.to_string(),
                         server,
@@ -410,32 +421,28 @@ fn deny(body: String) -> Response {
     (StatusCode::FORBIDDEN, body).into_response()
 }
 
-/// Owner of a live (non-deleted) agent — the agent-only identity used for
-/// read-only methods outside a flow.
+/// `(owner_id, is_coding_agent)` for a live (non-deleted) agent — one query
+/// where there used to be two (a plain `agent_owner` for the read-only
+/// fallback, a separate `coding_agent_owner` for rule 3b), because the
+/// `Err(denial)` arm above always needs both facts about the very same row at
+/// once. `is_coding_agent` is `coding_agent_integration_id IS NOT NULL`
+/// (`oss/migrations/0019_coding_agent_identity.sql`) — deliberately the
+/// column itself, never agent metadata or name — matching `is_coding_agent`
+/// in `oss/llm-router/src/resolver/mod.rs`, so the gateway and the LLM router
+/// agree on which rows this policy covers. Such a row is single-owner by
+/// construction (the CLI only binds rows the login owns;
+/// `agent_owner_or_reject` gates every mint), so "the owner" is unambiguous.
 ///
 /// `Ok(None)` means the agent is genuinely gone (401, stale credential);
 /// `Err` means the store could not answer (403, fail closed). Collapsing the
 /// two would misreport a database outage as a revoked agent.
-async fn agent_owner(state: &AppState, agent_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1 AND deleted_at IS NULL")
-        .bind(agent_id)
-        .fetch_optional(&state.db)
-        .await
-}
-
-/// Owner of `agent_id` iff the row is a CLI-bound local coding agent
-/// (`coding_agent_integration_id` set — `oss/migrations/0019_coding_agent_identity.sql`);
-/// `None` for every other row, including a plain deployed agent with no flow.
-/// The predicate is deliberately the column itself, never agent metadata or
-/// name — matching `is_coding_agent` in `oss/llm-router/src/resolver/mod.rs`,
-/// so the gateway and the LLM router can never disagree about which rows this
-/// exemption covers. Such a row is single-owner by construction (the CLI only
-/// binds rows the login owns; `agent_owner_or_reject` gates every mint), so
-/// "the owner" is unambiguous.
-async fn coding_agent_owner(state: &AppState, agent_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT owner_id FROM agents
-         WHERE id = $1 AND deleted_at IS NULL AND coding_agent_integration_id IS NOT NULL",
+async fn agent_owner(
+    state: &AppState,
+    agent_id: Uuid,
+) -> Result<Option<(Uuid, bool)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT owner_id, coding_agent_integration_id IS NOT NULL
+         FROM agents WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(agent_id)
     .fetch_optional(&state.db)

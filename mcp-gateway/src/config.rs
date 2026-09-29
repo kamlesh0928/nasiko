@@ -167,12 +167,17 @@ impl McpConfig {
                 // left over from a quickstart, say) is still worth flagging —
                 // a warning, not a hard failure, since a short-but-genuinely-
                 // random key is still valid. Measure the actual secret
-                // material, not the `mcp-identity::` domain-separation prefix
-                // the JWT_SECRET fallback path prepends (`Config`'s
-                // derivation): that prefix is constant across every
-                // deployment and contributes no entropy, so counting it would
-                // let a short JWT_SECRET hide under the threshold.
-                let secret_len = key.strip_prefix("mcp-identity::").unwrap_or(key).len();
+                // material, not the domain-separation prefix the JWT_SECRET
+                // fallback path prepends (`nasiko_config::IDENTITY_KEY_PREFIX`
+                // — the single source both crates read, so this strip can
+                // never drift from what `Config::from_env` actually prepends):
+                // that prefix is constant across every deployment and
+                // contributes no entropy, so counting it would let a short
+                // JWT_SECRET hide under the threshold.
+                let secret_len = key
+                    .strip_prefix(nasiko_config::IDENTITY_KEY_PREFIX)
+                    .unwrap_or(key)
+                    .len();
                 if secret_len < 32 {
                     tracing::warn!(
                         key_bytes = secret_len,
