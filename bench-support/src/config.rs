@@ -83,7 +83,7 @@ pub fn build_bench_config(database_url: String, mock_llm_base_url: &str) -> Conf
         // This literal is built directly, not through `Config::from_env` — so
         // it bypasses that function's JWT_SECRET-derived fallback (which
         // domain-separates with an `mcp-identity::` prefix; see
-        // `nasiko_config::mcp_identity_signing_key`). Set directly to
+        // `Config::from_env`'s own derivation in `nasiko-config`). Set directly to
         // `BENCH_JWT_SECRET`'s own value, unprefixed.
         mcp_identity_signing_key: BENCH_JWT_SECRET.to_string(),
         mcp_upload_max_bytes: 50 * 1024 * 1024,

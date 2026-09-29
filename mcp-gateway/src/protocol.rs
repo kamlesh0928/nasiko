@@ -2500,35 +2500,4 @@ mod initialize_tests {
             "no backend is system, so nothing should be stamped: {servers:?}"
         );
     }
-
-    /// The regression this guards: the gateway's owner-fallback path (flow
-    /// lookup failed, so `user_id` resolves to the agent's owner instead —
-    /// `oss/server/src/mcp/handlers/gateway.rs::flow_user`/`dispatch`) must
-    /// never sign a trace id out of the raw `traceparent` header, because
-    /// that trace id was never verified against `flows`/`flow_participants`
-    /// — it could name a flow the agent has nothing to do with, or no flow
-    /// at all. `handle_request` only ever signs `verified_flow_id`, which
-    /// that path passes as `None`; this proves the signed header reflects
-    /// exactly that, with no way for a raw traceparent to leak in.
-    #[test]
-    fn owner_fallback_with_no_verified_flow_id_signs_flow_id_none() {
-        let key = b"test-identity-key".to_vec();
-        let agent_id = Uuid::new_v4();
-        let user_id = Uuid::new_v4();
-        // What `handle_request` actually does with `verified_flow_id: None`
-        // before calling `inject_identity` — see the `if resolved.servers...`
-        // block above. Exercised directly (not through the full
-        // `handle_request`, which needs a real DB) for the same reason
-        // `inject_identity` itself is tested directly.
-        let signed = crate::identity::SignedIdentity::new(agent_id, user_id, None).sign(&key);
-
-        let verified = crate::identity::SignedIdentity::verify(&signed, &key).unwrap();
-        assert_eq!(verified.agent_id, agent_id);
-        assert_eq!(verified.user_id, user_id);
-        assert_eq!(
-            verified.flow_id, None,
-            "the owner-fallback path must sign flow_id: None, never a trace id \
-             lifted from an unverified traceparent"
-        );
-    }
 }

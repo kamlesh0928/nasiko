@@ -328,14 +328,22 @@ pub struct Config {
 /// startup with a clear message — this function does not fail fast itself,
 /// since `nasiko-config` has no such policy for values it merely carries.
 fn mcp_identity_signing_key() -> String {
-    let dedicated = std::env::var("MCP_IDENTITY_SIGNING_KEY")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    if let Some(key) = dedicated {
-        return key;
+    let dedicated = std::env::var("MCP_IDENTITY_SIGNING_KEY").ok();
+    let jwt_secret = env_or("JWT_SECRET", "");
+    derive_identity_signing_key(dedicated.as_deref(), &jwt_secret)
+}
+
+/// Pure derivation behind [`mcp_identity_signing_key`], split out so the four
+/// cases below are unit-testable without touching the environment: a
+/// non-blank `dedicated` key (trimmed) always wins; otherwise a non-blank
+/// `jwt_secret` (trimmed) is domain-separated with the `mcp-identity::`
+/// prefix; if both are blank the result is empty, which `McpConfig::from_config`
+/// rejects at startup.
+fn derive_identity_signing_key(dedicated: Option<&str>, jwt_secret: &str) -> String {
+    if let Some(key) = dedicated.map(str::trim).filter(|s| !s.is_empty()) {
+        return key.to_string();
     }
-    let jwt_secret = env_or("JWT_SECRET", "").trim().to_string();
+    let jwt_secret = jwt_secret.trim();
     if jwt_secret.is_empty() {
         return String::new();
     }
@@ -665,6 +673,36 @@ mod tests {
             openai_base_url_without_v1("https://example.com/openai/v1/proxy"),
             "https://example.com/openai/v1/proxy"
         );
+    }
+
+    #[test]
+    fn dedicated_identity_key_wins_and_is_trimmed() {
+        assert_eq!(
+            derive_identity_signing_key(Some("  dedicated-key  "), "jwt-secret"),
+            "dedicated-key"
+        );
+    }
+
+    #[test]
+    fn no_dedicated_key_falls_back_to_prefixed_trimmed_jwt_secret() {
+        assert_eq!(
+            derive_identity_signing_key(None, "  jwt-secret  "),
+            "mcp-identity::jwt-secret"
+        );
+    }
+
+    #[test]
+    fn blank_dedicated_key_falls_through_to_jwt_secret() {
+        assert_eq!(
+            derive_identity_signing_key(Some("   "), "jwt-secret"),
+            "mcp-identity::jwt-secret"
+        );
+    }
+
+    #[test]
+    fn both_blank_yields_empty_string() {
+        assert_eq!(derive_identity_signing_key(Some("  "), "  "), "");
+        assert_eq!(derive_identity_signing_key(None, ""), "");
     }
 }
 

@@ -166,10 +166,16 @@ impl McpConfig {
                 // block cipher, but a short, guessable value (a placeholder
                 // left over from a quickstart, say) is still worth flagging —
                 // a warning, not a hard failure, since a short-but-genuinely-
-                // random key is still valid.
-                if key.len() < 32 {
+                // random key is still valid. Measure the actual secret
+                // material, not the `mcp-identity::` domain-separation prefix
+                // the JWT_SECRET fallback path prepends (`Config`'s
+                // derivation): that prefix is constant across every
+                // deployment and contributes no entropy, so counting it would
+                // let a short JWT_SECRET hide under the threshold.
+                let secret_len = key.strip_prefix("mcp-identity::").unwrap_or(key).len();
+                if secret_len < 32 {
                     tracing::warn!(
-                        key_bytes = key.len(),
+                        key_bytes = secret_len,
                         "MCP_IDENTITY_SIGNING_KEY (or its JWT_SECRET-derived fallback) is shorter \
                          than 32 bytes — consider a longer value"
                     );

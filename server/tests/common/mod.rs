@@ -520,7 +520,7 @@ fn test_config(db_url: String, redis_url: String, s3_endpoint: String) -> Config
         // This literal is built directly, not through `Config::from_env` — so
         // it bypasses that function's JWT_SECRET-derived fallback (which
         // domain-separates with an `mcp-identity::` prefix; see
-        // `nasiko_config::mcp_identity_signing_key`). Set directly to
+        // `Config::from_env`'s own derivation in `nasiko-config`). Set directly to
         // `TEST_JWT_SECRET`'s own value, unprefixed, so tests deriving the
         // signing key for `identity::SignedIdentity::verify` have a fixed,
         // known value to use (see `mcp_system_connector.rs`).

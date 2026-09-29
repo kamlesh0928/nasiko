@@ -59,6 +59,9 @@ fn now_secs() -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
+/// Why [`SignedIdentity::verify`] rejected a header — the MAC is checked
+/// before any parsing (see `verify`'s own doc comment), so a variant here
+/// reflects exactly what was found bad, in the order it's actually checked.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum IdentityError {
     /// Not `<payload>.<hex signature>`, non-hex signature, non-base64
@@ -68,9 +71,10 @@ pub enum IdentityError {
     /// "your JSON was invalid" — both are just "not a well-formed identity".
     #[error("malformed identity header")]
     Malformed,
-    /// The payload parsed, but its HMAC doesn't match under this key —
-    /// tampering, or a key mismatch (e.g. verifying against the wrong
-    /// deployment's `MCP_IDENTITY_SIGNING_KEY`).
+    /// The HMAC doesn't match under this key — tampering, or a key mismatch
+    /// (e.g. verifying against the wrong deployment's
+    /// `MCP_IDENTITY_SIGNING_KEY`). Checked before any parsing, so this can
+    /// fire on a payload whose JSON shape was never even inspected.
     #[error("identity signature mismatch")]
     BadSignature,
     /// Signature verified, but `exp` has passed (or the clock read as
