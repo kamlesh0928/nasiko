@@ -7,6 +7,11 @@
 
 use nasiko_config::Config;
 
+/// Default `initialize.instructions` sentence when `MCP_GATEWAY_INSTRUCTIONS`
+/// is unset or blank — keeps the field non-empty on an unconfigured deployment.
+pub const DEFAULT_GATEWAY_INSTRUCTIONS: &str = "You are connected to the Nasiko MCP gateway. \
+    Tools listed here are the platform's connectors; call them directly by name.";
+
 /// Tool search mode — selects the `ToolSearchIndex` implementation wired at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolSearchMode {
@@ -134,12 +139,13 @@ impl McpConfig {
             embedding_model: config.embedding_model.clone(),
             // Not (yet) a field on the central `Config` — read directly, same
             // pattern as `oauth_state_signing_key` above, to keep this task's
-            // scope to `oss/mcp-gateway` alone.
-            gateway_instructions: std::env::var("MCP_GATEWAY_INSTRUCTIONS").unwrap_or_else(|_| {
-                "You are connected to the Nasiko MCP gateway. Tools listed here are the \
-                 platform's connectors; call them directly by name."
-                    .to_string()
-            }),
+            // scope to `oss/mcp-gateway` alone. Blank (unset or whitespace-only)
+            // is treated as unset, same as `oauth_state_signing_key`'s own
+            // `.filter(|s| !s.is_empty())`.
+            gateway_instructions: std::env::var("MCP_GATEWAY_INSTRUCTIONS")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_GATEWAY_INSTRUCTIONS.to_string()),
         }
     }
 

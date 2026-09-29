@@ -113,11 +113,15 @@ pub async fn handle_request(
     Some(result)
 }
 
+/// Version reported in `initialize`'s `serverInfo.version` — the gateway's own
+/// release marker, unrelated to the negotiated MCP protocol version above it.
+const GATEWAY_SERVER_VERSION: &str = "1.1.0";
+
 /// `initialize` — negotiate the protocol version (echo a supported client
 /// version, else our latest) and advertise instructions: the gateway's own
-/// sentence followed by each enabled connector's harvested instructions.
-/// Instructions are the one client-agnostic prompt channel we own, so they are
-/// never empty when a writable/system connector is enabled.
+/// sentence followed by each enabled connector's harvested instructions,
+/// joined with a blank line, trimmed, with empty entries dropped. The
+/// `instructions` key is omitted entirely when both sources are empty.
 pub fn handle_initialize(
     req_id: &Value,
     body: &Value,
@@ -145,7 +149,7 @@ pub fn handle_initialize(
     let mut result = json!({
         "protocolVersion": version,
         "capabilities": { "tools": {} },
-        "serverInfo": { "name": "MCP Gateway", "version": "1.1.0" },
+        "serverInfo": { "name": "MCP Gateway", "version": GATEWAY_SERVER_VERSION },
     });
     if !instructions.is_empty() {
         result["instructions"] = json!(instructions.join("\n\n"));
@@ -2081,12 +2085,42 @@ mod initialize_tests {
         );
     }
 
+    /// Backward-compat guarantee: every version this gateway claims to support
+    /// — including older ones like 2024-11-05 — is echoed back verbatim, not
+    /// silently upgraded to the latest.
     #[test]
-    fn initialize_falls_back_to_latest_supported_for_unknown_or_missing_version() {
+    fn initialize_echoes_every_supported_version_verbatim() {
+        for &v in SUPPORTED_PROTOCOL_VERSIONS {
+            let req = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":v}});
+            let out = handle_initialize(&json!(1), &req, "x", &[]);
+            assert_eq!(
+                out["result"]["protocolVersion"], v,
+                "version {v} should be echoed back unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn initialize_falls_back_to_latest_supported_for_unknown_version() {
         let req = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2031-01-01"}});
         let out = handle_initialize(&json!(1), &req, "x", &[]);
         assert_eq!(out["result"]["protocolVersion"], LATEST_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn initialize_falls_back_to_latest_supported_for_missing_params() {
         let out = handle_initialize(&json!(1), &json!({"method":"initialize"}), "x", &[]);
+        assert_eq!(out["result"]["protocolVersion"], LATEST_PROTOCOL_VERSION);
+    }
+
+    /// A non-string `protocolVersion` (a client sending a bare number instead
+    /// of a string) must not panic or coerce — `Value::as_str` returns `None`
+    /// for it, same fallback path as an unknown or missing version.
+    #[test]
+    fn initialize_falls_back_to_latest_supported_for_non_string_version() {
+        let req =
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2025}});
+        let out = handle_initialize(&json!(1), &req, "x", &[]);
         assert_eq!(out["result"]["protocolVersion"], LATEST_PROTOCOL_VERSION);
     }
 
@@ -2094,5 +2128,19 @@ mod initialize_tests {
     fn initialize_omits_instructions_when_empty() {
         let out = handle_initialize(&json!(1), &json!({"method":"initialize"}), "", &[]);
         assert!(out["result"].get("instructions").is_none());
+    }
+
+    /// Exact composition: gateway instructions first, then connector
+    /// instructions in order, joined by a blank line, each trimmed, and any
+    /// whitespace-only entry dropped rather than contributing a stray blank.
+    #[test]
+    fn initialize_composes_instructions_in_order_trimmed_and_joined() {
+        let out = handle_initialize(
+            &json!(1),
+            &json!({"method":"initialize"}),
+            "  G  ",
+            &["  ".to_string(), " C ".to_string()],
+        );
+        assert_eq!(out["result"]["instructions"], json!("G\n\nC"));
     }
 }

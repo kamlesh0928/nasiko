@@ -14,9 +14,9 @@ use uuid::Uuid;
 /// Versions this gateway implements. Order = preference. The first entry is
 /// what we answer when the client asks for something we don't know.
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+/// What `handle_initialize` answers with when the client didn't ask for a
+/// version we recognize (unknown, missing, or non-string `protocolVersion`).
 pub const LATEST_PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
-/// Kept for callers that only need *a* version string.
-pub const PROTOCOL_VERSION: &str = LATEST_PROTOCOL_VERSION;
 
 // ─── JSON-RPC 2.0 envelope ──────────────────────────────────────────────────
 
