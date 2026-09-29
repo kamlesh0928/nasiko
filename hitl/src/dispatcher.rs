@@ -53,6 +53,16 @@ pub enum NotifyError {
          call could not be authorized"
     )]
     FlowNotLive { context_id: String },
+    /// `context_id` does not name a `chat_sessions` row owned by this HITL row's own
+    /// `owner_user_id` — the `session_traces` insert's `WHERE EXISTS (... user_id = $4)` guard
+    /// found no match. Permanent by construction, same as `FlowNotLive`: a row's ownership never
+    /// changes, so no retry could ever make this succeed, and mapping it anyway would let this
+    /// notifier open a trace correlation into a chat session it does not own (found in review).
+    #[error(
+        "context {context_id} does not name a chat session owned by this request's own user, so \
+         no session_traces mapping could be registered"
+    )]
+    ContextNotOwned { context_id: String },
     #[error("transport error delivering resume notification: {0}")]
     Transport(#[from] reqwest::Error),
     #[error("peer rejected the resume notification: {0}")]
@@ -62,7 +72,9 @@ pub enum NotifyError {
 impl NotifyError {
     pub fn is_permanent(&self) -> bool {
         match self {
-            NotifyError::MissingContextId(_) | NotifyError::FlowNotLive { .. } => true,
+            NotifyError::MissingContextId(_)
+            | NotifyError::FlowNotLive { .. }
+            | NotifyError::ContextNotOwned { .. } => true,
             NotifyError::EndpointResolution { permanent, .. } => *permanent,
             NotifyError::Transport(_) | NotifyError::PeerError(_) => false,
         }
@@ -124,11 +136,8 @@ impl DispatcherConfig {
     /// Derived rather than documented because every input is independently env-tunable
     /// (`HITL_RESUME_MAX_ATTEMPTS`, `HITL_RESUME_RETRY_DELAY_SECS`, `HITL_RESUME_LEASE_MINUTES`),
     /// so a fixed default would go stale the moment one of them is raised. The sibling dispatcher
-    /// (`oss/server/src/hitl/mod.rs`'s `lease_secs` helper) enforces the same
-    /// never-shorter-than-`HITL_RESUME_LEASE_MINUTES` invariant off the same config field, floored
-    /// at what its own delivery shape needs instead of this one's — it claims once per delivery
-    /// attempt rather than holding one claim across a whole in-process retry loop, so its floor
-    /// only has to clear a single request's timeout, not every retry's.
+    /// (`oss/server/src/hitl/mod.rs`'s `LEASE_SECS`) states the same invariant as a comment; this
+    /// enforces it.
     fn effective_lease_minutes(&self) -> i64 {
         let attempts = i64::from(self.max_attempts).max(1);
         let secs = attempts * crate::notifier::RESUME_REQUEST_TIMEOUT_SECS as i64

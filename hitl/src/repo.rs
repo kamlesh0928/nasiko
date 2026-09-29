@@ -471,15 +471,18 @@ async fn resolve_linked_direct_chat_mirror(
 /// returns `Ask`.
 ///
 /// `owner_user_id` is a required predicate, not an afterthought:
-/// `context_id` alone is derived from the caller-supplied `traceparent`
-/// header (`session::resolve_context_id`), which is unauthenticated and
-/// fully controlled by whatever code the agent container runs — it is a
-/// trace-correlation id, not an identity boundary. Without also matching the
-/// caller's own `user_id` (from their delegation token, the one value here
-/// that actually is authenticated), an agent shared across users could
-/// replay a `context_id` it observed while serving one user to claim that
-/// user's approval decision on behalf of a different one (found in security
-/// review — this was exploitable before this parameter existed).
+/// `context_id` comes from `session::resolve_context_id`, seeded from the
+/// route layer's already-verified flow id (`verified_flow_id` —
+/// `oss/server/src/mcp/handlers/gateway.rs::flow_user` — never a raw,
+/// caller-supplied `traceparent` reparse), but it is still just a
+/// trace-correlation value, not itself an identity boundary. Without also
+/// matching the caller's own `user_id` (from their delegation token, the one
+/// value here that actually is authenticated), an agent shared across users
+/// could replay a `context_id` it legitimately observed while serving one
+/// user to claim that user's approval decision on behalf of a different one
+/// (found in security review — this was exploitable before this parameter
+/// existed, back when `context_id` was derived directly from the
+/// unauthenticated `traceparent` header).
 ///
 /// Deliberately excludes `session`-scoped approvals
 /// (`human_response->>'scope' = 'session'`): a session grant's reusability

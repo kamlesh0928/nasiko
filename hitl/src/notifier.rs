@@ -163,8 +163,15 @@ impl RuntimeResumeNotifier {
             // hands back a session belonging to the caller it resolved a
             // context for) this always matches; it only ever fires if some
             // other path ever persisted a `context_id` naming a different
-            // user's session, and it stops this notifier from creating a
-            // trace mapping into that user's conversation.
+            // user's session. A zero-row affect is not a no-op to shrug at
+            // (mirrors the `flows` registration guard below, same reasoning):
+            // silently skipping the mapping and returning `trace_id` anyway
+            // would hand back a `traceparent` this notifier itself never
+            // registered a `flows`/`flow_participants` row for, so the
+            // agent's retry would 403 with "traceparent does not resolve to
+            // a live flow" — the nudge must fail loudly instead of being
+            // delivered as if healthy, and must never create a trace mapping
+            // into a chat session it doesn't own.
             match sqlx::query(
                 "INSERT INTO session_traces (session_id, trace_id, agent_id)
                  SELECT $1, $2, $3
@@ -182,10 +189,13 @@ impl RuntimeResumeNotifier {
                 Ok(result) if result.rows_affected() == 0 => {
                     tracing::warn!(
                         %context_id, %owner_user_id,
-                        "resume nudge: context_id does not name a chat session owned by this \
-                         HITL row's owner — skipping the session_traces mapping (should never \
-                         happen for a row persisted through the normal verified-flow path)"
+                        "resume nudge aborted: context_id does not name a chat session owned by \
+                         this HITL row's owner (should never happen for a row persisted through \
+                         the normal verified-flow path)"
                     );
+                    return Err(NotifyError::ContextNotOwned {
+                        context_id: context_id.to_string(),
+                    });
                 }
                 Ok(_) => {}
                 Err(e) => {

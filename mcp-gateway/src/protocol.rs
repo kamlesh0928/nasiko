@@ -299,17 +299,22 @@ pub async fn handle_tools_list(
     use crate::config::ToolSearchMode;
 
     if state.config.tool_search_mode == ToolSearchMode::None {
-        // Rollback path: eager fan-out (existing behavior). `traceparent` here
-        // is only forwarded as the outbound W3C trace context for backend
-        // telemetry (`provider.list_tools`), never used to resolve identity or
-        // read another flow's data, so the raw header is fine.
+        // Rollback path: eager fan-out (existing behavior). The forwarded trace context is only
+        // ever used as outbound W3C trace context for backend telemetry (`provider.list_tools`),
+        // never to resolve identity or read another flow's data — but it still must not be the
+        // raw `traceparent` unconditionally: a coding-agent row's owner-fallback call can carry a
+        // well-formed traceparent naming a flow it isn't a participant of, and forwarding that
+        // verbatim would land this call's backend spans inside someone else's Tempo trace. Same
+        // `Option::and` collapse `handle_tools_call`'s `outbound_traceparent` uses — only `Some`
+        // on the verified path, where `traceparent` and `verified_flow_id` name the same flow
+        // anyway, so a deployed agent's behavior is unchanged.
         return match aggregator::aggregate_tools(
             state,
             user_id,
             servers,
             connected_toolkits,
             perms,
-            traceparent,
+            verified_flow_id.and(traceparent),
         )
         .await
         {
@@ -2170,13 +2175,19 @@ mod tests {
     async fn non_auth_required_reason_never_takes_the_auth_required_branch() {
         // NotConfigured/MissingCredential must still produce today's generic
         // "not available" error — only AuthRequired gets the new handling.
-        // A (well-formed but unresolvable) traceparent is deliberately
-        // supplied here: if the reason gate in `handle_tools_call` were ever
-        // loosened to match on `Some(_)` instead of `AuthRequired`
-        // specifically, this would start touching `state.db` — and, since
-        // `test_state()`'s pool can't reach a real Postgres, still degrade to
-        // the same generic error (not crash), but the whole point of the
-        // gate is to skip that DB work entirely for non-AuthRequired reasons.
+        // A (well-formed but unresolvable) traceparent AND a matching
+        // `verified_flow_id` are deliberately supplied here: if the reason
+        // gate in `handle_tools_call` were ever loosened to match on
+        // `Some(_)` instead of `AuthRequired` specifically, this would start
+        // touching `state.db` (`session::resolve_context_id`'s
+        // `session_traces` lookup) — and, since `test_state()`'s pool can't
+        // reach a real Postgres, still degrade to the same generic error
+        // (not crash), but the whole point of the gate is to skip that DB
+        // work entirely for non-AuthRequired reasons. Passing `None` here
+        // (as this test used to) made that a no-op regardless of the gate —
+        // `resolve_context_id` short-circuits on `None` before ever reaching
+        // `state.db` — so a loosened gate would have slipped past this test
+        // undetected (found in review).
         let cid = Uuid::new_v4();
         let resolved = unusable_mcp_session(cid, ConnectorUnusable::NotConfigured, "github");
         let p = perms(&[], vec![]);
@@ -2190,7 +2201,7 @@ mod tests {
             &resolved,
             &p,
             Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
-            None,
+            Some("0af7651916cd43dd8448eb211c80319c"),
         )
         .await;
 

@@ -21,10 +21,34 @@ mod common;
 use common::TestDb;
 
 impl TestDb {
+    /// Back a `context_id` with a real `chat_sessions` row owned by this fixture's own
+    /// `owner_user_id` — what every HITL row persisted through the normal verified-flow path
+    /// actually has. Without this, `RuntimeResumeNotifier::notify`'s `session_traces` insert (its
+    /// `WHERE EXISTS (... user_id = $4)` ownership guard) affects 0 rows and the nudge now aborts
+    /// with `NotifyError::ContextNotOwned` (mirroring the `flows` registration guard) rather than
+    /// warn-and-continue, so every fixture that exercises a real `notify()` call needs one of
+    /// these for its `context_id` unless it's deliberately testing that guard. `ON CONFLICT DO
+    /// NOTHING` because a raw 32-hex trace_id `context_id` (the BL4 fixtures) never reaches this
+    /// table anyway, but calling this for every `context_id` uniformly keeps the seed helpers
+    /// simple.
+    async fn seed_chat_session(&self, context_id: &str) {
+        sqlx::query(
+            "INSERT INTO chat_sessions (session_id, user_id, title) VALUES ($1, $2, $3) \
+             ON CONFLICT (session_id) DO NOTHING",
+        )
+        .bind(context_id)
+        .bind(self.owner_user_id)
+        .bind("test session")
+        .execute(&self.pool)
+        .await
+        .expect("seed chat session");
+    }
+
     /// Create and immediately resolve (approve) a `tool_approval` row for
     /// this fixture's agent/owner — the dispatcher only ever acts on
     /// `status = 'resolved'` rows.
     async fn seed_resolved_tool_approval(&self, context_id: &str) -> Uuid {
+        self.seed_chat_session(context_id).await;
         let created = repo::create_pending_tool_approval(
             &self.pool,
             repo::NewToolApproval {
@@ -58,6 +82,7 @@ impl TestDb {
     /// `'resolved'` ones (found missing in code review: a human's reject
     /// decision never reached the paused agent at all before this fix).
     async fn seed_rejected_tool_approval(&self, context_id: &str) -> Uuid {
+        self.seed_chat_session(context_id).await;
         let created = repo::create_pending_tool_approval(
             &self.pool,
             repo::NewToolApproval {
@@ -87,6 +112,7 @@ impl TestDb {
     }
 
     async fn seed_resolved_auth_required(&self, context_id: &str) -> Uuid {
+        self.seed_chat_session(context_id).await;
         let created = repo::create_pending_auth_required(
             &self.pool,
             NewAuthRequired {
@@ -483,6 +509,120 @@ async fn resume_nudge_never_adopts_another_users_flow_via_context_id() {
     assert_eq!(
         participant_count, 0,
         "the coding-agent row must never become a participant of the victim's flow"
+    );
+}
+
+/// The other half of the same guard: a `context_id` that is NOT a raw trace id (so it takes the
+/// `session_traces`-mapping branch, not the `is_raw_trace_id` one the test above exercises) but
+/// names a chat session owned by someone other than this HITL row's own owner. The `WHERE EXISTS`
+/// guard on the `session_traces` insert makes that insert affect 0 rows, and `notify` must abort
+/// right there rather than warn-and-continue with a `trace_id` no `flows`/`flow_participants` row
+/// was ever registered for.
+#[tokio::test]
+async fn resume_nudge_aborts_when_context_id_names_another_users_chat_session() {
+    let db = TestDb::new("hitl_context_not_owned_test").await;
+
+    // The victim: a different user, with their own chat session.
+    let victim_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, username, email) VALUES ($1, $2, $3)")
+        .bind(victim_id)
+        .bind(format!("victim-{}", victim_id.simple()))
+        .bind(format!("victim-{}@example.com", victim_id.simple()))
+        .execute(&db.pool)
+        .await
+        .expect("seed victim user");
+
+    let victim_session_id = format!("ses_victim_{}", Uuid::new_v4().simple());
+    sqlx::query("INSERT INTO chat_sessions (session_id, user_id, title) VALUES ($1, $2, $3)")
+        .bind(&victim_session_id)
+        .bind(victim_id)
+        .bind("victim session")
+        .execute(&db.pool)
+        .await
+        .expect("seed victim chat session");
+
+    // This fixture's own agent/owner stand in for the coding-agent row and its real owner — the
+    // HITL row is owned by `db.owner_user_id` but its `context_id` names the VICTIM's session,
+    // simulating a row that reached this notifier however it got here.
+    let created = repo::create_pending_tool_approval(
+        &db.pool,
+        repo::NewToolApproval {
+            agent_id: db.agent_id,
+            owner_user_id: db.owner_user_id,
+            connector_id: Uuid::new_v4(),
+            tool_name: "GITHUB_DELETE_REPO".to_string(),
+            context_id: victim_session_id.clone(),
+            question: serde_json::json!({"tool_name": "GITHUB_DELETE_REPO"}),
+        },
+    )
+    .await
+    .expect("create pending tool_approval");
+    repo::resolve(
+        &db.pool,
+        created.id,
+        ResolveDecision::Approve,
+        db.owner_user_id,
+        serde_json::json!({"decision": "approve"}),
+    )
+    .await
+    .expect("resolve")
+    .expect("row was pending");
+
+    let claimed = repo::claim_for_resume(&db.pool)
+        .await
+        .expect("claim query")
+        .expect("the resolved row is claimable");
+
+    let runtime = Arc::new(SimulatedRuntime::new("http://127.0.0.1:1".to_string()));
+    runtime
+        .deploy(&agent_spec(ContainerId::from_uuid(db.agent_id)))
+        .await
+        .expect("seed the simulated runtime's endpoint for this agent");
+
+    let notifier = RuntimeResumeNotifier::new(
+        db.pool.clone(),
+        runtime.clone(),
+        reqwest::Client::new(),
+        TEST_FLOW_TIMEOUT_SECS,
+    );
+
+    let err = notifier
+        .notify(&claimed)
+        .await
+        .expect_err("notify must abort rather than map onto another user's chat session");
+    assert!(
+        matches!(err, NotifyError::ContextNotOwned { .. }),
+        "expected ContextNotOwned, got {err:?}"
+    );
+    assert!(
+        err.is_permanent(),
+        "ownership of a chat session never changes on retry"
+    );
+
+    let session_traces_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM session_traces WHERE session_id = $1")
+            .bind(&victim_session_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("count query");
+    assert_eq!(
+        session_traces_count, 0,
+        "no session_traces mapping must be written for the victim's session"
+    );
+
+    let flows_count: i64 = sqlx::query_scalar("SELECT count(*) FROM flows")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count query");
+    assert_eq!(flows_count, 0, "no flow must be registered");
+
+    let participants_count: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_participants")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count query");
+    assert_eq!(
+        participants_count, 0,
+        "no flow participant must be registered"
     );
 }
 
