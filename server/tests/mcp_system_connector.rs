@@ -1177,6 +1177,16 @@ async fn coding_agent_row_with_foreign_flow_does_not_leak_an_approval_event() {
         json!(nasiko_mcp_gateway::types::codes::TOOL_ASK),
         "must be the normal ask decision: {body:?}"
     );
+    // Second regression (participant laundering through HITL context, caught
+    // in a follow-up review): a flow-less `tools/call` has no `verified_flow_id`,
+    // so `create_tool_approval_id` must refuse to persist anything — the
+    // response must not claim a `hitl_request_id` that resolves against the
+    // victim's flow.
+    assert!(
+        body["error"]["data"].get("hitl_request_id").is_none(),
+        "no verified flow means no context_id to persist against — must not \
+         claim a hitl_request_id that doesn't exist: {body:?}"
+    );
 
     // The regression: nothing must have been published onto the VICTIM's own
     // flow, despite their trace id being the one carried on the wire.
@@ -1187,6 +1197,24 @@ async fn coding_agent_row_with_foreign_flow_does_not_leak_an_approval_event() {
              NOTHING to it, got {other:?}"
         ),
     }
+
+    // And no `hitl_requests` row was ever persisted naming the victim's flow
+    // id as its `context_id` — the actual data this whole class of bug is
+    // about not leaking into (`oss/hitl/src/notifier.rs`'s resume path is
+    // what would otherwise treat that context as a flow to rejoin).
+    let leaked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM hitl_requests WHERE agent_id = $1 AND context_id = $2",
+    )
+    .bind(agent_id)
+    .bind(&victim_flow_id)
+    .fetch_one(&server.db)
+    .await
+    .expect("count query");
+    assert_eq!(
+        leaked, 0,
+        "no hitl_requests row for this coding-agent row may ever carry the \
+         victim's flow id as its context_id"
+    );
 
     server.cleanup().await;
 }

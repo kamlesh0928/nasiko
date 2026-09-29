@@ -154,19 +154,46 @@ impl RuntimeResumeNotifier {
             context_id.to_string()
         } else {
             let trace_id = Uuid::new_v4().simple().to_string();
-            if let Err(e) = sqlx::query(
-                "INSERT INTO session_traces (session_id, trace_id, agent_id) VALUES ($1, $2, $3)",
+            // Defense in depth (review finding): only map `trace_id` to
+            // `context_id` when `context_id` actually names a chat session
+            // owned by THIS HITL row's owner (`owner_user_id`) — the
+            // `WHERE EXISTS` makes the insert a no-op otherwise. On the
+            // normal path (a row persisted from a verified flow —
+            // `oss/mcp-gateway/src/session.rs::resolve_context_id` only ever
+            // hands back a session belonging to the caller it resolved a
+            // context for) this always matches; it only ever fires if some
+            // other path ever persisted a `context_id` naming a different
+            // user's session, and it stops this notifier from creating a
+            // trace mapping into that user's conversation.
+            match sqlx::query(
+                "INSERT INTO session_traces (session_id, trace_id, agent_id)
+                 SELECT $1, $2, $3
+                 WHERE EXISTS (
+                     SELECT 1 FROM chat_sessions WHERE session_id = $1 AND user_id = $4
+                 )",
             )
             .bind(context_id)
             .bind(&trace_id)
             .bind(agent_id)
+            .bind(owner_user_id)
             .execute(&self.db)
             .await
             {
-                tracing::warn!(
-                    %context_id, error = %e,
-                    "failed to record session_traces mapping for resume nudge traceparent"
-                );
+                Ok(result) if result.rows_affected() == 0 => {
+                    tracing::warn!(
+                        %context_id, %owner_user_id,
+                        "resume nudge: context_id does not name a chat session owned by this \
+                         HITL row's owner — skipping the session_traces mapping (should never \
+                         happen for a row persisted through the normal verified-flow path)"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        %context_id, error = %e,
+                        "failed to record session_traces mapping for resume nudge traceparent"
+                    );
+                }
             }
             trace_id
         };
@@ -174,13 +201,22 @@ impl RuntimeResumeNotifier {
         // On the fresh-trace-id path this is a plain INSERT, so `created_at` is now and the window
         // is live. On the `is_raw_trace_id` path it collides with the ORIGINAL call's own flow row,
         // whose `created_at` is fixed at that call — and `gateway.rs`'s `flow_user` requires
-        // `created_at > now() - flow_timeout_secs` as well as `status = 'running'`. Two things
-        // follow, both found in review:
+        // `created_at > now() - flow_timeout_secs` as well as `status = 'running'`. Three things
+        // follow, all found in review:
         //
         //   * The `DO UPDATE` is scoped by that same age bound. Without it, flipping `status` back
         //     to `running` re-opened a closed `/api/mcp` window for an unrelated, already-finished
         //     flow — and for every agent in its `flow_participants`, not just the one being nudged.
-        //   * When the bound excludes the row, `ON CONFLICT DO UPDATE ... WHERE` updates nothing
+        //   * It is ALSO scoped to `flows.user_id = $2` (this HITL row's own `owner_user_id`) —
+        //     without this, a `context_id` that happens to equal some OTHER live flow's trace id
+        //     (reachable if a HITL row's `context_id` were ever seeded from an unverified trace id
+        //     — see `oss/mcp-gateway/src/session.rs::resolve_context_id`'s own doc comment) would
+        //     have this UPDATE flip that flow back to `running` and the `INSERT INTO
+        //     flow_participants` below add THIS agent as one of its participants — after which
+        //     `gateway.rs`'s `flow_user` would resolve this agent's calls as acting for that
+        //     flow's actual (different) user. Scoping to the row's own owner means a mismatched
+        //     conflict updates nothing, same as the age bound.
+        //   * When either bound excludes the row, `ON CONFLICT DO UPDATE ... WHERE` updates nothing
         //     and returns no row. That is not a no-op to shrug at: it means the retry this nudge
         //     exists to prompt cannot be authorized, so the nudge must fail loudly rather than be
         //     delivered as if healthy (the agent would 403 with "traceparent does not resolve to a
@@ -190,6 +226,7 @@ impl RuntimeResumeNotifier {
                VALUES ($1, $2, $3, $4, $5)
                ON CONFLICT (flow_id) DO UPDATE SET status = $5
                  WHERE flows.created_at > now() - make_interval(secs => $6)
+                   AND flows.user_id = $2
                RETURNING flow_id"#,
         )
         .bind(&trace_id)
@@ -213,9 +250,10 @@ impl RuntimeResumeNotifier {
         };
         if registered.is_none() {
             tracing::warn!(
-                %trace_id, %context_id, timeout_secs = self.flow_timeout_secs,
-                "resume nudge aborted: the flow this context names is older than the platform's \
-                 flow timeout, so the agent's retried tool call could not be authorized"
+                %trace_id, %context_id, %owner_user_id, timeout_secs = self.flow_timeout_secs,
+                "resume nudge aborted: either the flow this context names is older than the \
+                 platform's flow timeout, or it belongs to a different user than this HITL \
+                 row's owner — either way the agent's retried tool call could not be authorized"
             );
             return Err(NotifyError::FlowNotLive {
                 context_id: context_id.to_string(),

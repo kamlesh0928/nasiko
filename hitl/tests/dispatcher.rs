@@ -13,7 +13,7 @@ use std::time::Duration;
 use nasiko_hitl::dispatcher::{self, DispatcherConfig};
 use nasiko_hitl::notifier::RuntimeResumeNotifier;
 use nasiko_hitl::repo::{self, NewAuthRequired, ResolveDecision};
-use nasiko_hitl::{HitlKind, HitlStatus, ResumeStatus};
+use nasiko_hitl::{HitlKind, HitlStatus, NotifyError, ResumeNotifier, ResumeStatus};
 use nasiko_runtime::{ContainerId, ContainerRuntime, DeploymentSpec, SimulatedRuntime};
 use uuid::Uuid;
 
@@ -363,6 +363,127 @@ async fn resolved_row_is_delivered_exactly_once_end_to_end() {
     assert_eq!(row.status, HitlStatus::Resolved);
     assert_eq!(row.resume_status, ResumeStatus::Completed);
     assert_eq!(row.resume_dispatch_attempts, 1);
+}
+
+/// The exploit a code-quality review of Task 1.5 caught: a coding-agent row's
+/// owner-fallback `tools/call` can carry a well-formed traceparent naming
+/// some OTHER user's (the "victim's") live or recently-live flow. Before this
+/// fix, `oss/mcp-gateway/src/session.rs::resolve_context_id` could hand that
+/// flow's own trace id back as a HITL row's `context_id` (no `session_traces`
+/// mapping yet), and this notifier's resume nudge would then upsert `flows`
+/// keyed on that trace id — flipping the victim's flow back to `running` and
+/// adding the coding-agent row to `flow_participants`, after which
+/// `gateway.rs::flow_user` would resolve the coding row's calls as acting
+/// for the VICTIM, not its real owner. `create_tool_approval_id` no longer
+/// seeds a `context_id` from anything but a verified flow (see its own doc
+/// comment) — this test instead proves the second, independent guard: even
+/// if a `context_id` naming another user's flow ever reaches this notifier
+/// (a persisted row is trusted input to `notify`, not re-validated against
+/// how it was created), `traceparent_for_context`'s `flows.user_id = $2`
+/// scope on the `ON CONFLICT DO UPDATE` must make the adoption attempt a
+/// no-op and the notify abort, rather than silently succeeding.
+#[tokio::test]
+async fn resume_nudge_never_adopts_another_users_flow_via_context_id() {
+    let db = TestDb::new("hitl_notifier_guard_test").await;
+
+    // The victim: a different user, with their own flow — deliberately
+    // seeded as `completed`, so a successful (buggy) adoption would be
+    // observable as this flipping back to `running`.
+    let victim_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, username, email) VALUES ($1, $2, $3)")
+        .bind(victim_id)
+        .bind(format!("victim-{}", victim_id.simple()))
+        .bind(format!("victim-{}@example.com", victim_id.simple()))
+        .execute(&db.pool)
+        .await
+        .expect("seed victim user");
+
+    let victim_flow_id = Uuid::new_v4().simple().to_string();
+    sqlx::query("INSERT INTO flows (flow_id, user_id, status) VALUES ($1, $2, 'completed')")
+        .bind(&victim_flow_id)
+        .bind(victim_id)
+        .execute(&db.pool)
+        .await
+        .expect("seed victim flow");
+
+    // This fixture's own agent/owner stand in for the coding-agent row and
+    // its real owner — the HITL row is persisted exactly as
+    // `create_tool_approval_id` would (owned by the coding row's owner), but
+    // with `context_id` set to the VICTIM's flow id, simulating a row that
+    // reached this notifier however it got here.
+    let created = repo::create_pending_tool_approval(
+        &db.pool,
+        repo::NewToolApproval {
+            agent_id: db.agent_id,
+            owner_user_id: db.owner_user_id,
+            connector_id: Uuid::new_v4(),
+            tool_name: "GITHUB_DELETE_REPO".to_string(),
+            context_id: victim_flow_id.clone(),
+            question: serde_json::json!({"tool_name": "GITHUB_DELETE_REPO"}),
+        },
+    )
+    .await
+    .expect("create pending tool_approval");
+    repo::resolve(
+        &db.pool,
+        created.id,
+        ResolveDecision::Approve,
+        db.owner_user_id,
+        serde_json::json!({"decision": "approve"}),
+    )
+    .await
+    .expect("resolve")
+    .expect("row was pending");
+
+    let claimed = repo::claim_for_resume(&db.pool)
+        .await
+        .expect("claim query")
+        .expect("the resolved row is claimable");
+
+    let runtime = Arc::new(SimulatedRuntime::new("http://127.0.0.1:1".to_string()));
+    let container_id = ContainerId::from_uuid(db.agent_id);
+    runtime
+        .deploy(&agent_spec(container_id))
+        .await
+        .expect("seed the simulated runtime's endpoint for this agent");
+
+    let notifier = RuntimeResumeNotifier::new(
+        db.pool.clone(),
+        runtime.clone(),
+        reqwest::Client::new(),
+        TEST_FLOW_TIMEOUT_SECS,
+    );
+
+    let result = notifier.notify(&claimed).await;
+    assert!(
+        matches!(result, Err(NotifyError::FlowNotLive { .. })),
+        "notify must abort rather than adopt the victim's flow: {result:?}"
+    );
+
+    let victim_flow_after: (String, Uuid) =
+        sqlx::query_as("SELECT status, user_id FROM flows WHERE flow_id = $1")
+            .bind(&victim_flow_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("victim flow row must still exist");
+    assert_eq!(
+        victim_flow_after,
+        ("completed".to_string(), victim_id),
+        "the victim's flow must be untouched — not resurrected, not reassigned"
+    );
+
+    let participant_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM flow_participants WHERE flow_id = $1 AND agent_id = $2",
+    )
+    .bind(&victim_flow_id)
+    .bind(db.agent_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("count query");
+    assert_eq!(
+        participant_count, 0,
+        "the coding-agent row must never become a participant of the victim's flow"
+    );
 }
 
 #[tokio::test]

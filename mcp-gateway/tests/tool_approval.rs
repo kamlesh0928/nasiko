@@ -86,6 +86,7 @@ async fn ask_persists_tool_approval_row_and_returns_tool_ask_with_id() {
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
 
@@ -139,6 +140,7 @@ async fn repeated_ask_for_the_same_tool_and_conversation_reuses_the_same_row() {
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     let second = handle_tools_call(
@@ -149,6 +151,7 @@ async fn repeated_ask_for_the_same_tool_and_conversation_reuses_the_same_row() {
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
 
@@ -189,6 +192,7 @@ async fn different_tool_on_the_same_connector_creates_a_distinct_row() {
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     let second = handle_tools_call(
@@ -199,6 +203,7 @@ async fn different_tool_on_the_same_connector_creates_a_distinct_row() {
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
 
@@ -233,6 +238,7 @@ async fn blocked_and_disabled_connector_never_persist_a_row() {
             vec![rule(connector_id, "*", Stance::Block)],
         ),
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     assert_eq!(
@@ -249,6 +255,7 @@ async fn blocked_and_disabled_connector_never_persist_a_row() {
         &resolved,
         &db.perms(&[], vec![]), // connector never enabled
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     assert_eq!(
@@ -377,6 +384,7 @@ async fn once_scope_approval_lets_the_retry_reach_the_backend_without_asking_aga
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     assert_eq!(first["error"]["code"], json!(codes::TOOL_ASK), "{first}");
@@ -397,6 +405,7 @@ async fn once_scope_approval_lets_the_retry_reach_the_backend_without_asking_aga
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     assert_eq!(
@@ -469,6 +478,7 @@ async fn once_scope_approval_is_denied_on_a_second_retry() {
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     let hitl_request_id: Uuid = first["error"]["data"]["hitl_request_id"]
@@ -488,6 +498,7 @@ async fn once_scope_approval_is_denied_on_a_second_retry() {
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     assert_eq!(retried_once["result"]["ok"], json!(true), "{retried_once}");
@@ -501,6 +512,7 @@ async fn once_scope_approval_is_denied_on_a_second_retry() {
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     assert_eq!(
@@ -562,6 +574,7 @@ async fn session_scope_approval_lets_a_second_call_succeed_without_reapproval() 
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     let hitl_request_id: Uuid = first["error"]["data"]["hitl_request_id"]
@@ -580,6 +593,7 @@ async fn session_scope_approval_lets_a_second_call_succeed_without_reapproval() 
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     assert_eq!(retry_a["result"]["ok"], json!(true), "{retry_a}");
@@ -594,6 +608,7 @@ async fn session_scope_approval_lets_a_second_call_succeed_without_reapproval() 
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     assert_eq!(
@@ -630,6 +645,7 @@ async fn rejected_retry_is_denied_without_a_backend_call() {
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     let hitl_request_id: Uuid = first["error"]["data"]["hitl_request_id"]
@@ -648,6 +664,7 @@ async fn rejected_retry_is_denied_without_a_backend_call() {
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     assert_eq!(
@@ -730,6 +747,7 @@ async fn batch_multi_execute_asks_for_every_unresolved_slug_and_persists_one_row
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
 
@@ -797,6 +815,7 @@ async fn batch_multi_execute_once_scope_approval_lets_that_slug_through_while_th
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     let ids: Vec<Uuid> = first["error"]["data"]["hitl_request_ids"]
@@ -834,6 +853,7 @@ async fn batch_multi_execute_once_scope_approval_lets_that_slug_through_while_th
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
 
@@ -903,6 +923,7 @@ async fn batch_multi_execute_session_grant_lets_the_same_slug_succeed_repeatedly
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     let hitl_request_id: Uuid = first["error"]["data"]["hitl_request_ids"][0]
@@ -921,6 +942,7 @@ async fn batch_multi_execute_session_grant_lets_the_same_slug_succeed_repeatedly
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     assert_eq!(retry_a["result"]["ok"], json!(true), "{retry_a}");
@@ -933,6 +955,7 @@ async fn batch_multi_execute_session_grant_lets_the_same_slug_succeed_repeatedly
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     assert_eq!(
@@ -971,6 +994,7 @@ async fn batch_multi_execute_all_rejected_slugs_are_denied_without_a_backend_cal
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     let hitl_request_id: Uuid = first["error"]["data"]["hitl_request_ids"][0]
@@ -989,6 +1013,7 @@ async fn batch_multi_execute_all_rejected_slugs_are_denied_without_a_backend_cal
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     assert_eq!(

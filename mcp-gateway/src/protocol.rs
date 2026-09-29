@@ -147,6 +147,7 @@ pub async fn handle_request(
                 &resolved,
                 &perms,
                 traceparent,
+                verified_flow_id,
             )
             .await
         }
@@ -279,6 +280,11 @@ fn inject_identity(servers: &mut [MCPServerConfig], signed: &str) {
 ///   only `nasiko_search_tools`.
 ///
 /// When search is disabled (`none`): delegates to `aggregate_tools` (legacy fan-out).
+// `verified_flow_id` pushed this from 7 to 8 (added for the same
+// participant-laundering fix `handle_tools_call` below carries) — a params
+// struct isn't worth it for one more `Option<&str>` on an internal function
+// with a single call site; `ask_with_hitl_request` below already carries the
+// same allow for the same reason.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_tools_list(
     state: &McpState,
@@ -431,6 +437,26 @@ fn needs_auth_required(
 }
 
 /// `tools/call` — route, enforce two-layer permissions, forward to the backend.
+///
+/// `traceparent` and `verified_flow_id` carry the same two-different-things
+/// split `handle_request`'s own doc comment explains: `traceparent` is the
+/// raw header (only ever used below as *outbound* trace context, gated to
+/// the verified case — see `outbound_traceparent`), `verified_flow_id` is
+/// what the route layer actually proved resolves to a live flow this agent
+/// participates in. Every HITL `context_id` resolution in this call tree
+/// (`handle_auth_required`, `create_tool_approval_id`,
+/// `resolve_tool_approval_retry`, and their `detect_composio_auth_required`/
+/// `ask_with_hitl_request` wrappers) takes `verified_flow_id`, never
+/// `traceparent` — see those functions' own docs for why: a raw traceparent
+/// naming a flow this agent isn't a participant of (the coding-agent
+/// owner-fallback path's whole reason for existing) must never seed a HITL
+/// row's `context_id`, or resolving that row would re-open and join the
+/// NAMED flow, not this call's actual one.
+// `verified_flow_id` pushed this from 7 to 8 — same call as `handle_tools_list`'s
+// own identical allow just above: not worth a params struct for one more
+// `Option<&str>` this fix required, on a function with exactly one call site
+// (`handle_request`).
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_tools_call(
     state: &McpState,
     user_id: Uuid,
@@ -439,7 +465,18 @@ pub async fn handle_tools_call(
     resolved: &ResolvedSession,
     perms: &PermissionContext,
     traceparent: Option<&str>,
+    verified_flow_id: Option<&str>,
 ) -> Value {
+    // Outbound trace context for backend calls only — never the fallback
+    // path's raw `traceparent`. A coding-agent row's owner-fallback call may
+    // carry a well-formed (self-generated, or another user's) traceparent
+    // even though `verified_flow_id` is `None`; forwarding it as-is would let
+    // that row's spans land inside someone else's Tempo trace. `Option::and`
+    // collapses to `None` unless BOTH sides are `Some` — i.e. only on the
+    // verified path, where `traceparent` and `verified_flow_id` name the same
+    // flow anyway, so a deployed agent's behavior is unchanged.
+    let outbound_traceparent = verified_flow_id.and(traceparent);
+
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let mut arguments = params
         .get("arguments")
@@ -516,7 +553,7 @@ pub async fn handle_tools_call(
                     perms.agent_id,
                     connector_id,
                     &info.name,
-                    traceparent,
+                    verified_flow_id,
                 )
                 .await;
             }
@@ -557,7 +594,7 @@ pub async fn handle_tools_call(
                         perms.agent_id,
                         connector.id,
                         &connector.name,
-                        traceparent,
+                        verified_flow_id,
                     )
                     .await;
                 }
@@ -601,7 +638,7 @@ pub async fn handle_tools_call(
                         perms.agent_id,
                         connector.id,
                         &connector.name,
-                        traceparent,
+                        verified_flow_id,
                     )
                     .await;
                 }
@@ -644,7 +681,7 @@ pub async fn handle_tools_call(
                     perms.agent_id,
                     server.connector_id,
                     &original,
-                    traceparent,
+                    verified_flow_id,
                 )
                 .await
                 {
@@ -667,7 +704,7 @@ pub async fn handle_tools_call(
                             &original,
                             &server.name,
                             req_id,
-                            traceparent,
+                            verified_flow_id,
                         )
                         .await;
                     }
@@ -705,7 +742,7 @@ pub async fn handle_tools_call(
                     perms.agent_id,
                     cid,
                     tool_name,
-                    traceparent,
+                    verified_flow_id,
                 )
                 .await
                 {
@@ -728,7 +765,7 @@ pub async fn handle_tools_call(
                             tool_name,
                             "composio",
                             req_id,
-                            traceparent,
+                            verified_flow_id,
                         )
                         .await;
                     }
@@ -802,7 +839,7 @@ pub async fn handle_tools_call(
                             perms.agent_id,
                             cid,
                             slug,
-                            traceparent,
+                            verified_flow_id,
                         )
                         .await
                         {
@@ -829,7 +866,7 @@ pub async fn handle_tools_call(
                         perms.agent_id,
                         *cid,
                         slug,
-                        traceparent,
+                        verified_flow_id,
                     )
                     .await
                     {
@@ -908,7 +945,7 @@ pub async fn handle_tools_call(
             &forward_name,
             &forward_args,
             DEFAULT_CALL_TIMEOUT,
-            traceparent,
+            outbound_traceparent,
         )
         .await
     {
@@ -927,7 +964,7 @@ pub async fn handle_tools_call(
                         req_id,
                         perms.agent_id,
                         connector_id,
-                        traceparent,
+                        verified_flow_id,
                         response,
                     )
                     .await
@@ -969,7 +1006,7 @@ pub async fn handle_tools_call(
                         &original,
                         &arguments,
                         DEFAULT_CALL_TIMEOUT,
-                        traceparent,
+                        outbound_traceparent,
                     )
                     .await
                 {
@@ -1024,7 +1061,7 @@ async fn detect_composio_auth_required(
     req_id: &Value,
     agent_id: Uuid,
     connector_id: Uuid,
-    traceparent: Option<&str>,
+    verified_flow_id: Option<&str>,
     original_response: Value,
 ) -> Value {
     let Some(provider) = &state.providers.composio else {
@@ -1058,7 +1095,7 @@ async fn detect_composio_auth_required(
         agent_id,
         connector_id,
         &connector.name,
-        traceparent,
+        verified_flow_id,
     )
     .await
 }
@@ -1086,7 +1123,7 @@ async fn handle_auth_required(
     agent_id: Uuid,
     connector_id: Uuid,
     connector_name: &str,
-    traceparent: Option<&str>,
+    verified_flow_id: Option<&str>,
 ) -> Value {
     let generic_error = || {
         err(
@@ -1099,13 +1136,19 @@ async fn handle_auth_required(
         )
     };
 
-    // No traceparent at all means nothing to correlate a resumable
+    // No verified flow at all means nothing to correlate a resumable
     // conversation against — fall back to today's generic error rather than
-    // persist a HITL row no future dispatcher could ever address.
-    let Some(context_id) = session::resolve_context_id(state, traceparent).await else {
+    // persist a HITL row no future dispatcher could ever address. Keyed on
+    // `verified_flow_id`, never the raw `traceparent`: a coding-agent row's
+    // owner-fallback call can carry a well-formed traceparent naming a flow
+    // it isn't a participant of, and seeding a HITL row's `context_id` from
+    // that would let approving it re-open and join that OTHER flow (see
+    // `oss/hitl/src/notifier.rs`'s resume path, and the guard added there
+    // against exactly this).
+    let Some(context_id) = session::resolve_context_id(state, verified_flow_id).await else {
         tracing::warn!(
             connector = %connector_name, %connector_id,
-            "auth_required detected but no traceparent to resolve a context_id from — falling back to generic error"
+            "auth_required detected but no verified flow to resolve a context_id from — falling back to generic error"
         );
         return generic_error();
     };
@@ -1179,27 +1222,34 @@ async fn handle_auth_required(
 
 /// Best-effort: persist a pending `tool_approval` row for one `(connector,
 /// tool)` `Stance::Ask` decision (M2's store), returning its id. `None` when
-/// there's no `traceparent` to resolve a `context_id` from (required by
+/// there's no verified flow to resolve a `context_id` from (required by
 /// `chk_hitl_tool_approval_identity`), or on a DB failure (logged) — either
 /// way the caller still returns `TOOL_ASK`; persistence never changes the
 /// ask/deny decision itself, only whether a row exists to resolve against
 /// later. Shared by the single-tool ask path (`ask_with_hitl_request`) and
 /// the `COMPOSIO_MULTI_EXECUTE_TOOL` batch-ask path, which persists one row
 /// per asked tool.
+///
+/// Takes `verified_flow_id`, never the raw `traceparent` — a `context_id`
+/// seeded from an unverified trace id would let a coding-agent row's
+/// owner-fallback call (no participant of the flow it names) plant a
+/// resolvable HITL row against someone else's conversation; see
+/// `oss/hitl/src/notifier.rs`'s resume path for what approving that row
+/// would otherwise do with it.
 async fn create_tool_approval_id(
     state: &McpState,
     user_id: Uuid,
     agent_id: Uuid,
     connector_id: Uuid,
     tool_name: &str,
-    traceparent: Option<&str>,
+    verified_flow_id: Option<&str>,
 ) -> Option<Uuid> {
-    let context_id = match session::resolve_context_id(state, traceparent).await {
+    let context_id = match session::resolve_context_id(state, verified_flow_id).await {
         Some(id) => id,
         None => {
             tracing::warn!(
                 tool = %tool_name, %connector_id,
-                "tool_approval ask with no traceparent to resolve a context_id from — skipping hitl persistence"
+                "tool_approval ask with no verified flow to resolve a context_id from — skipping hitl persistence"
             );
             return None;
         }
@@ -1262,15 +1312,19 @@ enum RetryOutcome {
 /// Takes a single `(connector_id, tool_name)` pair, so M8 reuses it unchanged
 /// per-slug inside the `COMPOSIO_MULTI_EXECUTE_TOOL` batch loop, alongside its
 /// two pre-existing single-tool call sites.
+///
+/// Takes `verified_flow_id`, never the raw `traceparent` — see
+/// `create_tool_approval_id`'s doc comment for why a `context_id` must never
+/// be seeded from a trace id this agent wasn't proven to participate in.
 async fn resolve_tool_approval_retry(
     state: &McpState,
     user_id: Uuid,
     agent_id: Uuid,
     connector_id: Uuid,
     tool_name: &str,
-    traceparent: Option<&str>,
+    verified_flow_id: Option<&str>,
 ) -> RetryOutcome {
-    let Some(context_id) = session::resolve_context_id(state, traceparent).await else {
+    let Some(context_id) = session::resolve_context_id(state, verified_flow_id).await else {
         return RetryOutcome::AskAgain;
     };
 
@@ -1370,7 +1424,7 @@ async fn ask_with_hitl_request(
     tool_name: &str,
     connector_label: &str,
     req_id: &Value,
-    traceparent: Option<&str>,
+    verified_flow_id: Option<&str>,
 ) -> Value {
     let mut data = json!({ "server": connector_label });
     if let Some(id) = create_tool_approval_id(
@@ -1379,7 +1433,7 @@ async fn ask_with_hitl_request(
         agent_id,
         connector_id,
         tool_name,
-        traceparent,
+        verified_flow_id,
     )
     .await
     {
@@ -1803,6 +1857,7 @@ mod tests {
             &resolved,
             &p,
             None,
+            None,
         )
         .await;
 
@@ -1835,6 +1890,7 @@ mod tests {
             &json!({ "name": tool, "arguments": {} }),
             &resolved,
             &p,
+            None,
             None,
         )
         .await;
@@ -1876,6 +1932,7 @@ mod tests {
             &resolved,
             &p,
             None,
+            None,
         )
         .await;
 
@@ -1908,6 +1965,7 @@ mod tests {
             &resolved,
             &p,
             None,
+            None,
         )
         .await;
         assert_eq!(res["error"]["code"], json!(codes::TOOL_BLOCKED), "{res}");
@@ -1926,6 +1984,7 @@ mod tests {
             &resolved,
             &p,
             None,
+            None,
         )
         .await;
         assert_eq!(res["error"]["code"], json!(codes::TOOL_BLOCKED), "{res}");
@@ -1943,6 +2002,7 @@ mod tests {
             &json!({ "name": "GMAIL_SEND_EMAIL", "arguments": {} }),
             &resolved,
             &p,
+            None,
             None,
         )
         .await;
@@ -1977,6 +2037,7 @@ mod tests {
             &resolved,
             &p,
             None,
+            None,
         )
         .await;
         assert_eq!(res["result"]["ok"], json!(true), "{res}");
@@ -2009,6 +2070,7 @@ mod tests {
             &json!({ "name": "COMPOSIO_SEARCH_TOOLS", "arguments": {} }),
             &resolved,
             &p,
+            None,
             None,
         )
         .await;
@@ -2062,6 +2124,7 @@ mod tests {
             &resolved,
             &p,
             None,
+            None,
         )
         .await;
 
@@ -2096,6 +2159,7 @@ mod tests {
             &resolved,
             &p,
             None,
+            None,
         )
         .await;
 
@@ -2126,6 +2190,7 @@ mod tests {
             &resolved,
             &p,
             Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+            None,
         )
         .await;
 
@@ -2156,6 +2221,7 @@ mod tests {
             &resolved,
             &p,
             None,
+            None,
         )
         .await;
 
@@ -2184,6 +2250,7 @@ mod tests {
             &resolved,
             &perms(&[cid], vec![rule(cid, "*", Stance::Block)]),
             None,
+            None,
         )
         .await;
         assert_eq!(
@@ -2199,6 +2266,7 @@ mod tests {
             &json!({ "name": tool, "arguments": {} }),
             &resolved,
             &perms(&[], vec![]), // connector never enabled
+            None,
             None,
         )
         .await;

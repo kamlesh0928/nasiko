@@ -81,6 +81,7 @@ async fn auth_required_persists_hitl_row_and_returns_auth_required_code() {
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
 
@@ -134,6 +135,7 @@ async fn auth_required_falls_back_to_raw_trace_id_when_no_session_trace_exists()
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
 
@@ -178,6 +180,7 @@ async fn repeated_calls_for_the_same_connector_and_conversation_reuse_the_same_h
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
     let second = handle_tools_call(
@@ -188,6 +191,7 @@ async fn repeated_calls_for_the_same_connector_and_conversation_reuse_the_same_h
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
 
@@ -225,6 +229,7 @@ async fn missing_credential_reason_never_persists_a_hitl_row() {
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
 
@@ -355,6 +360,7 @@ async fn composio_tool_call_failure_with_inactive_connection_triggers_auth_requi
         &resolved,
         &perms,
         Some(&traceparent),
+        Some(trace_id),
     )
     .await;
 
@@ -450,6 +456,7 @@ async fn composio_tool_call_failure_with_active_connection_passes_through_unchan
         &json!({ "name": "GITHUB_LIST_REPOS", "arguments": {} }),
         &resolved,
         &perms,
+        None,
         None,
     )
     .await;

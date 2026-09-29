@@ -89,25 +89,41 @@ pub async fn invalidate_session_cache(state: &McpState, user_id: Uuid) {
     cache::delete(&state.redis, &session_cache_key(user_id)).await;
 }
 
-/// Resolve the conversation id a paused `auth_required` HITL request should
-/// be recorded against — the closest thing MCP has to an A2A `contextId`,
-/// via `session_traces` (populated by `agent_proxy` on every forwarded user
-/// query: `trace_id -> chat_sessions.session_id`). Falls back to the raw
-/// `trace_id` when no such row exists yet (e.g. a call made before
-/// `agent_proxy`'s insert lands, or in a test harness) — still a stable,
-/// per-conversation value a future resume dispatcher can push against, just
-/// not yet resolved to the human-facing chat session. `None` only when no
-/// `traceparent` was forwarded at all, i.e. nothing to correlate against.
-pub async fn resolve_context_id(state: &McpState, traceparent: Option<&str>) -> Option<String> {
-    let trace_id = nasiko_flow::FlowContext::from_traceparent(traceparent?)?.flow_id;
+/// Resolve the conversation id a paused `auth_required`/`tool_approval` HITL
+/// request should be recorded against — the closest thing MCP has to an A2A
+/// `contextId`, via `session_traces` (populated by `agent_proxy` on every
+/// forwarded user query: `trace_id -> chat_sessions.session_id`). Falls back
+/// to the raw `trace_id` when no such row exists yet (e.g. a call made
+/// before `agent_proxy`'s insert lands, or in a test harness) — still a
+/// stable, per-conversation value a future resume dispatcher can push
+/// against, just not yet resolved to the human-facing chat session. `None`
+/// only when there is no verified flow at all, i.e. nothing to correlate
+/// against.
+///
+/// Takes `verified_flow_id` — the route layer's already-parsed, already-proven
+/// trace id (`oss/server/src/mcp/handlers/gateway.rs::flow_user`) — never a
+/// raw `traceparent` re-parse. A raw header is not proof of anything: a
+/// coding-agent row's owner-fallback call can carry a well-formed traceparent
+/// naming a flow it isn't a participant of, and seeding a `context_id` from
+/// that would let a human approving the resulting HITL row re-open and join
+/// that OTHER flow (`oss/hitl/src/notifier.rs`'s resume path treats a 32-hex
+/// context as a flow id) — acting as that flow's user from then on. See
+/// `oss/mcp-gateway/src/protocol.rs`'s `create_tool_approval_id`/
+/// `resolve_tool_approval_retry`/`handle_auth_required` doc comments for the
+/// three call sites this matters for.
+pub async fn resolve_context_id(
+    state: &McpState,
+    verified_flow_id: Option<&str>,
+) -> Option<String> {
+    let trace_id = verified_flow_id?;
     let session_id: Option<String> =
         sqlx::query_scalar("SELECT session_id FROM session_traces WHERE trace_id = $1")
-            .bind(&trace_id)
+            .bind(trace_id)
             .fetch_optional(&state.db)
             .await
             .ok()
             .flatten();
-    Some(session_id.unwrap_or(trace_id))
+    Some(session_id.unwrap_or_else(|| trace_id.to_string()))
 }
 
 /// Resolve the Composio Tool Router backend. `None` when Composio is disabled or
