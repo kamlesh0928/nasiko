@@ -156,6 +156,7 @@ impl TestDb {
                 tool_search_meta_limit: 0,
                 openai_api_key: None,
                 embedding_model: "".to_string(),
+                gateway_instructions: String::new(),
             },
             providers: Providers {
                 composio: None,

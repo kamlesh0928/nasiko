@@ -15,7 +15,10 @@ use crate::provider::generic::DEFAULT_CALL_TIMEOUT;
 use crate::router;
 use crate::session::{self, ResolvedSession};
 use crate::state::McpState;
-use crate::types::{ConnectorUnusable, MCPServerConfig, PROTOCOL_VERSION, ServerType, codes};
+use crate::types::{
+    ConnectorUnusable, LATEST_PROTOCOL_VERSION, MCPServerConfig, SUPPORTED_PROTOCOL_VERSIONS,
+    ServerType, codes,
+};
 
 fn ok(req_id: &Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": req_id, "result": result })
@@ -54,7 +57,14 @@ pub async fn handle_request(
     };
 
     match method {
-        "initialize" => return Some(handle_initialize(&req_id)),
+        "initialize" => {
+            return Some(handle_initialize(
+                &req_id,
+                body,
+                &state.config.gateway_instructions,
+                &[],
+            ));
+        }
         "ping" => return Some(json!({ "jsonrpc": "2.0", "id": req_id, "result": {} })),
         _ => {}
     }
@@ -103,16 +113,44 @@ pub async fn handle_request(
     Some(result)
 }
 
-/// `initialize` — gateway capability handshake.
-pub fn handle_initialize(req_id: &Value) -> Value {
-    ok(
-        req_id,
-        json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "MCP Gateway", "version": "1.0.0" },
-        }),
-    )
+/// `initialize` — negotiate the protocol version (echo a supported client
+/// version, else our latest) and advertise instructions: the gateway's own
+/// sentence followed by each enabled connector's harvested instructions.
+/// Instructions are the one client-agnostic prompt channel we own, so they are
+/// never empty when a writable/system connector is enabled.
+pub fn handle_initialize(
+    req_id: &Value,
+    body: &Value,
+    gateway_instructions: &str,
+    connector_instructions: &[String],
+) -> Value {
+    let requested = body
+        .get("params")
+        .and_then(|p| p.get("protocolVersion"))
+        .and_then(Value::as_str);
+    let version = match requested {
+        Some(v) if SUPPORTED_PROTOCOL_VERSIONS.contains(&v) => v,
+        _ => LATEST_PROTOCOL_VERSION,
+    };
+    let mut instructions: Vec<&str> = Vec::new();
+    if !gateway_instructions.trim().is_empty() {
+        instructions.push(gateway_instructions.trim());
+    }
+    instructions.extend(
+        connector_instructions
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty()),
+    );
+    let mut result = json!({
+        "protocolVersion": version,
+        "capabilities": { "tools": {} },
+        "serverInfo": { "name": "MCP Gateway", "version": "1.1.0" },
+    });
+    if !instructions.is_empty() {
+        result["instructions"] = json!(instructions.join("\n\n"));
+    }
+    ok(req_id, result)
 }
 
 /// `tools/list` — query-aware search (semantic/BM25) or eager fan-out (none mode).
@@ -188,7 +226,6 @@ pub async fn handle_tools_list(
 
     // Always include the search meta-tool so the agent can discover more tools.
     tools.push(nasiko_search_tools_definition());
-    tools.push(recover_compressed_definition());
 
     ok(req_id, json!({ "tools": tools }))
 }
@@ -242,55 +279,6 @@ fn nasiko_search_tools_definition() -> Value {
             "required": ["query"]
         }
     })
-}
-
-/// The W3C trace-id out of a `traceparent`, which is what a flow is keyed by.
-///
-/// Mirrors `nasiko_llm_router::routing::boundary::parse_flow_id`; duplicated rather than shared
-/// because this crate does not depend on the router.
-pub(crate) fn flow_id_of(traceparent: &str) -> Option<String> {
-    let parts: Vec<&str> = traceparent.split('-').collect();
-    if parts.len() < 4 {
-        return None;
-    }
-    let trace_id = parts[1];
-    let valid = trace_id.len() == 32
-        && trace_id.bytes().all(|b| b.is_ascii_hexdigit())
-        && trace_id.bytes().any(|b| b != b'0');
-    valid.then(|| trace_id.to_ascii_lowercase())
-}
-
-/// The `recover_compressed` meta-tool definition (PRD §9 IP-5).
-///
-/// Listed unconditionally, like the search meta-tool: an agent has to know it exists *before* it
-/// meets its first elision marker, because the marker is the only place the handle appears.
-fn recover_compressed_definition() -> Value {
-    json!({
-        "name": "recover_compressed",
-        "description": "Retrieve the full, uncompressed content that an elision marker stands in for. Call this when a payload you were given contains a marker like `[… 412 lines elided · recover: nasiko://c/9f3a… ]` and the elided part matters for your answer.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "handle": {
-                    "type": "string",
-                    "description": "The handle from the elision marker, with or without the `nasiko://c/` prefix"
-                }
-            },
-            "required": ["handle"]
-        }
-    })
-}
-
-/// Strip the marker's URI prefix and parse what is left as a handle.
-///
-/// The model copies the handle out of prose, so it arrives with whatever punctuation surrounded
-/// it. Accepting both forms is cheaper than teaching it one.
-fn parse_recovery_handle(raw: &str) -> Option<Uuid> {
-    raw.trim()
-        .trim_start_matches("nasiko://c/")
-        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-')
-        .parse()
-        .ok()
 }
 
 /// Whether a connector-connection lookup means an `auth_required` pause should fire. `Err` (a
@@ -362,69 +350,6 @@ pub async fn handle_tools_call(
                 "search_mode": format!("{:?}", state.config.tool_search_mode),
             }),
         );
-    }
-
-    // ── recover_compressed meta-tool (IP-5) ──────────────────────────────
-    if tool_name == "recover_compressed" {
-        let Some(handle) = arguments
-            .get("handle")
-            .and_then(|v| v.as_str())
-            .and_then(parse_recovery_handle)
-        else {
-            return err(
-                req_id,
-                codes::INVALID_PARAMS,
-                "recover_compressed requires `handle`, the identifier from an elision marker",
-            );
-        };
-
-        // Scope, not just lookup: the handle alone is a bearer token, so the row must also
-        // belong to this user and to the flow this call is being made inside. `flow_id` is the
-        // traceparent trace-id, which `tools/call` has already proven this agent participates in.
-        let Some(flow_id) = traceparent.and_then(crate::protocol::flow_id_of) else {
-            return err(
-                req_id,
-                codes::INVALID_PARAMS,
-                "recover_compressed is only available inside a flow",
-            );
-        };
-
-        let row: Result<Option<(String, String)>, _> = sqlx::query_as(
-            "SELECT content, content_type FROM compression_originals \
-             WHERE handle = $1 AND owner_id = $2 AND flow_id = $3",
-        )
-        .bind(handle)
-        .bind(user_id)
-        .bind(&flow_id)
-        .fetch_optional(&state.db)
-        .await;
-
-        return match row {
-            // Deliberately one message for "no such handle" and "not yours": distinguishing them
-            // would turn the handle into an existence oracle across flows.
-            Ok(None) => ok(
-                req_id,
-                json!({
-                    "content": [{
-                        "type": "text",
-                        "text": "No recoverable content for that handle. It may have expired, or belong to a different conversation."
-                    }],
-                    "isError": true
-                }),
-            ),
-            Ok(Some((content, content_type))) => ok(
-                req_id,
-                json!({
-                    "content": [{ "type": "text", "text": content }],
-                    "_meta": { "content_type": content_type }
-                }),
-            ),
-            Err(e) => err(
-                req_id,
-                codes::INTERNAL_ERROR,
-                format!("failed to read the recovery store: {e}"),
-            ),
-        };
     }
 
     let (server, original) = match router::route_tool(tool_name, &resolved.servers) {
@@ -1442,55 +1367,6 @@ fn unwrap_multi_execute_response(response: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-
-    // ── IP-5: recover_compressed ────────────────────────────────────────────
-
-    #[test]
-    fn recovery_handle_parses_out_of_a_marker_however_the_model_copies_it() {
-        let id = "9f3a1c2e-4b5d-6e7f-8a9b-0c1d2e3f4a5b";
-        for raw in [
-            id.to_string(),
-            format!("nasiko://c/{id}"),
-            format!(" nasiko://c/{id} "),
-            format!("`{id}`"),
-            format!("[{id}]"),
-        ] {
-            assert_eq!(
-                parse_recovery_handle(&raw).map(|u| u.to_string()),
-                Some(id.to_string()),
-                "failed to parse: {raw}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_non_handle_is_rejected_rather_than_guessed() {
-        for raw in ["", "nasiko://c/", "not-a-uuid", "../../etc/passwd"] {
-            assert!(parse_recovery_handle(raw).is_none(), "accepted: {raw}");
-        }
-    }
-
-    #[test]
-    fn flow_id_is_the_trace_id_of_the_traceparent() {
-        assert_eq!(
-            flow_id_of("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").as_deref(),
-            Some("4bf92f3577b34da6a3ce929d0e0e4736")
-        );
-        // An all-zero trace id is the "no trace" sentinel, not a flow.
-        assert!(flow_id_of("00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none());
-        assert!(flow_id_of("garbage").is_none());
-    }
-
-    #[test]
-    fn recover_compressed_is_offered_to_every_agent() {
-        // The handle only ever appears inside an elision marker, so an agent that has not been
-        // told the tool exists cannot act on the marker it is given.
-        let def = recover_compressed_definition();
-        assert_eq!(def["name"], "recover_compressed");
-        assert!(def["inputSchema"]["properties"]["handle"].is_object());
-        assert_eq!(def["inputSchema"]["required"][0], "handle");
-    }
-
     use super::*;
     use crate::config::{McpConfig, ToolSearchMode};
     use crate::permissions::PermissionRule;
@@ -1527,6 +1403,7 @@ mod tests {
                 tool_search_meta_limit: 0,
                 openai_api_key: None,
                 embedding_model: "".to_string(),
+                gateway_instructions: String::new(),
             },
             providers: Providers {
                 composio: None,
@@ -2171,5 +2048,51 @@ mod tests {
         });
         let unwrapped = unwrap_multi_execute_response(response.clone());
         assert_eq!(unwrapped, response);
+    }
+}
+
+#[cfg(test)]
+mod initialize_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn initialize_echoes_a_supported_client_version() {
+        let req = json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}});
+        let out = handle_initialize(
+            &json!(1),
+            &req,
+            "GATEWAY-INSTR",
+            &["CONNECTOR-INSTR".to_string()],
+        );
+        assert_eq!(out["result"]["protocolVersion"], "2025-06-18");
+        assert!(
+            out["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("GATEWAY-INSTR")
+        );
+        assert!(
+            out["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("CONNECTOR-INSTR")
+        );
+    }
+
+    #[test]
+    fn initialize_falls_back_to_latest_supported_for_unknown_or_missing_version() {
+        let req = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2031-01-01"}});
+        let out = handle_initialize(&json!(1), &req, "x", &[]);
+        assert_eq!(out["result"]["protocolVersion"], LATEST_PROTOCOL_VERSION);
+        let out = handle_initialize(&json!(1), &json!({"method":"initialize"}), "x", &[]);
+        assert_eq!(out["result"]["protocolVersion"], LATEST_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn initialize_omits_instructions_when_empty() {
+        let out = handle_initialize(&json!(1), &json!({"method":"initialize"}), "", &[]);
+        assert!(out["result"].get("instructions").is_none());
     }
 }

@@ -223,6 +223,7 @@ mod tests {
                 tool_search_meta_limit: 10,
                 openai_api_key: None,
                 embedding_model: "text-embedding-3-small".to_string(),
+                gateway_instructions: String::new(),
             },
             providers: Providers {
                 composio: None,

@@ -11,9 +11,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-/// MCP protocol version advertised in the `initialize` handshake. Matches the
-/// version the PoC negotiated and the streamable-HTTP transport expects.
-pub const PROTOCOL_VERSION: &str = "2024-11-05";
+/// Versions this gateway implements. Order = preference. The first entry is
+/// what we answer when the client asks for something we don't know.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+pub const LATEST_PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
+/// Kept for callers that only need *a* version string.
+pub const PROTOCOL_VERSION: &str = LATEST_PROTOCOL_VERSION;
 
 // ─── JSON-RPC 2.0 envelope ──────────────────────────────────────────────────
 

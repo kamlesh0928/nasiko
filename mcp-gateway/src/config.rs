@@ -87,6 +87,11 @@ pub struct McpConfig {
     pub openai_api_key: Option<String>,
     /// Embedding model name (e.g. `text-embedding-3-small`).
     pub embedding_model: String,
+    /// The gateway's own sentence advertised in `initialize.instructions`,
+    /// ahead of any per-connector instructions. MCP_GATEWAY_INSTRUCTIONS,
+    /// defaults to a generic orientation sentence so the field is never
+    /// blank on an unconfigured deployment.
+    pub gateway_instructions: String,
 }
 
 impl McpConfig {
@@ -127,6 +132,14 @@ impl McpConfig {
             tool_search_meta_limit: config.mcp_tool_search_meta_limit,
             openai_api_key: config.openai_api_key.clone(),
             embedding_model: config.embedding_model.clone(),
+            // Not (yet) a field on the central `Config` — read directly, same
+            // pattern as `oauth_state_signing_key` above, to keep this task's
+            // scope to `oss/mcp-gateway` alone.
+            gateway_instructions: std::env::var("MCP_GATEWAY_INSTRUCTIONS").unwrap_or_else(|_| {
+                "You are connected to the Nasiko MCP gateway. Tools listed here are the \
+                 platform's connectors; call them directly by name."
+                    .to_string()
+            }),
         }
     }
 
@@ -179,6 +192,7 @@ mod tests {
             tool_search_meta_limit: 10,
             openai_api_key: None,
             embedding_model: "text-embedding-3-small".to_string(),
+            gateway_instructions: String::new(),
         }
     }
 
