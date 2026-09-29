@@ -103,9 +103,69 @@ async fn a_system_connector_row_with_bearer_auth_type_is_rejected() {
     .execute(&server.db)
     .await;
 
+    let err = result.expect_err(
+        "a system row with auth_type='bearer' must violate chk_connectors_provider_fields",
+    );
     assert!(
-        result.is_err(),
-        "a system row with auth_type='bearer' must violate chk_connectors_provider_fields"
+        err.to_string().contains("chk_connectors_provider_fields"),
+        "error must name the violated constraint: {err}"
+    );
+
+    server.cleanup().await;
+}
+
+/// `auth_type IS NOT DISTINCT FROM 'none'` (not a bare `=`) is exactly what
+/// makes a NULL `auth_type` fail too: `NULL IS NOT DISTINCT FROM 'none'`
+/// evaluates to FALSE (unlike `NULL = 'none'`, which evaluates to NULL and
+/// would let the row pass a CHECK). This is the migration's whole point — the
+/// bearer test above only proves *some* non-'none' value is rejected; this
+/// proves the NULL case the `IS NOT DISTINCT FROM` rewrite specifically exists
+/// for is rejected too.
+#[tokio::test]
+#[serial]
+async fn a_system_connector_row_with_null_auth_type_is_rejected() {
+    let server = TestServer::start().await;
+
+    let result = sqlx::query(
+        "INSERT INTO mcp_connectors (provider_type, source_kind, name, url, auth_type) \
+         VALUES ('system', 'system', 'workspace-null-auth-type', 'http://127.0.0.1:1/mcp', NULL)",
+    )
+    .execute(&server.db)
+    .await;
+
+    let err = result
+        .expect_err("a system row with NULL auth_type must violate chk_connectors_provider_fields");
+    assert!(
+        err.to_string().contains("chk_connectors_provider_fields"),
+        "error must name the violated constraint: {err}"
+    );
+
+    server.cleanup().await;
+}
+
+/// The `system` clause also requires `source_kind::text = 'system'` — ties the
+/// two columns together so a `provider_type='system'` row can't pair with, say,
+/// `source_kind='external_url'` (a combination nothing else in the schema rules
+/// out on its own, since `source_kind='external_url'` is otherwise valid for
+/// `provider_type='mcp_server'`).
+#[tokio::test]
+#[serial]
+async fn a_system_connector_row_with_external_url_source_kind_is_rejected() {
+    let server = TestServer::start().await;
+
+    let result = sqlx::query(
+        "INSERT INTO mcp_connectors (provider_type, source_kind, name, url, auth_type) \
+         VALUES ('system', 'external_url', 'workspace-wrong-source-kind', 'http://127.0.0.1:1/mcp', 'none')",
+    )
+    .execute(&server.db)
+    .await;
+
+    let err = result.expect_err(
+        "a system row with source_kind='external_url' must violate chk_connectors_provider_fields",
+    );
+    assert!(
+        err.to_string().contains("chk_connectors_provider_fields"),
+        "error must name the violated constraint: {err}"
     );
 
     server.cleanup().await;
@@ -138,6 +198,18 @@ async fn seed_agent(server: &TestServer, owner_id: Uuid, name: &str) -> Uuid {
 const SAVE_FILE: &str = "save_file";
 const LIST_FILES: &str = "list_files";
 
+/// The `mcp_connectors.instructions` column's value — the source of truth the
+/// gateway must forward. Deliberately different from
+/// [`STUB_LIVE_INITIALIZE_INSTRUCTIONS`] below so the assertion can't pass by
+/// coincidence.
+const DB_INSTRUCTIONS: &str = "WS-E2E-INSTR-FROM-DB-COLUMN";
+
+/// What the stub backend's own live `initialize` response advertises — never
+/// what the gateway is supposed to forward (`connector.instructions`, harvested
+/// once at registration/probe time, is the source of truth; the gateway never
+/// re-probes a system backend's `initialize` per request).
+const STUB_LIVE_INITIALIZE_INSTRUCTIONS: &str = "WS-E2E-INSTR-FROM-STUB-LIVE-INITIALIZE";
+
 /// Tracks every `tools/call` the stub backend actually received, by tool name.
 type CallLog = Arc<Mutex<Vec<String>>>;
 
@@ -166,7 +238,7 @@ async fn start_stub_system_backend() -> (String, CallLog) {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {},
                     "serverInfo": {"name": "workspace-stub", "version": "1.0"},
-                    "instructions": "WS-E2E-INSTR",
+                    "instructions": STUB_LIVE_INITIALIZE_INSTRUCTIONS,
                 },
             })),
             "tools/list" => Json(json!({
@@ -237,10 +309,11 @@ async fn system_connector_end_to_end_through_the_real_gateway() {
 
     let connector_id: Uuid = sqlx::query_scalar(
         "INSERT INTO mcp_connectors (provider_type, source_kind, name, url, auth_type, instructions) \
-         VALUES ('system', 'system', 'workspace-e2e-connector', $1, 'none', 'WS-E2E-INSTR') \
+         VALUES ('system', 'system', 'workspace-e2e-connector', $1, 'none', $2) \
          RETURNING id",
     )
     .bind(&backend_url)
+    .bind(DB_INSTRUCTIONS)
     .fetch_one(&server.db)
     .await
     .expect("insert system connector");
@@ -285,7 +358,10 @@ async fn system_connector_end_to_end_through_the_real_gateway() {
             .json(&body)
     };
 
-    // ── initialize: the connector's harvested instructions ride along ──────
+    // ── initialize: the DB column's instructions ride along, never the stub's
+    //    own live `initialize` response — the gateway forwards what was
+    //    harvested into `mcp_connectors.instructions` at registration/probe
+    //    time, not a live re-probe of the backend.
     let res = mcp(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
         .send()
         .await
@@ -294,8 +370,13 @@ async fn system_connector_end_to_end_through_the_real_gateway() {
     let body: Value = res.json().await.unwrap();
     let instructions = body["result"]["instructions"].as_str().unwrap_or_default();
     assert!(
-        instructions.contains("WS-E2E-INSTR"),
-        "initialize must forward the connector's instructions: {body:?}"
+        instructions.contains(DB_INSTRUCTIONS),
+        "initialize must forward the connector row's DB instructions: {body:?}"
+    );
+    assert!(
+        !instructions.contains(STUB_LIVE_INITIALIZE_INSTRUCTIONS),
+        "initialize must never forward the stub's own live `initialize` instructions \
+         — the DB column is the source of truth: {body:?}"
     );
 
     // ── tools/list: exactly the two synced tools, bare (no connector prefix) ──

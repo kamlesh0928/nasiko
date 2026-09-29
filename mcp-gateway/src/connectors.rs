@@ -1465,6 +1465,39 @@ mod tests {
         assert_eq!(metadata.server_description, None);
     }
 
+    /// `cap_instructions`'s char-boundary back-off, exercised directly (not
+    /// through `probe_initialize`/mockito): a multi-byte character (a 4-byte
+    /// emoji) straddles the `MAX_INSTRUCTIONS_BYTES` cut point — a naive
+    /// byte-oriented truncation would slice through the middle of it and
+    /// produce invalid UTF-8 (a panic on the `String` indexing, in fact,
+    /// since `str` slicing at a non-boundary index panics). Proves the
+    /// back-off walks the cut point back to the nearest boundary and the
+    /// result is always valid UTF-8, at or under the cap.
+    #[test]
+    fn cap_instructions_backs_off_to_a_char_boundary_when_a_multi_byte_char_straddles_the_cap() {
+        // `MAX_INSTRUCTIONS_BYTES - 1` ASCII bytes, then a 4-byte emoji whose
+        // first byte lands exactly one byte before the cap — its remaining
+        // three bytes straddle `MAX_INSTRUCTIONS_BYTES`, so a bare
+        // `s[..MAX_INSTRUCTIONS_BYTES]` would panic (not just misbehave).
+        let prefix = "a".repeat(MAX_INSTRUCTIONS_BYTES - 1);
+        let oversized = format!("{prefix}😀 more text after it");
+
+        let capped = cap_instructions(oversized);
+
+        assert!(
+            capped.len() <= MAX_INSTRUCTIONS_BYTES,
+            "must never exceed the cap: {}",
+            capped.len()
+        );
+        assert!(
+            std::str::from_utf8(capped.as_bytes()).is_ok(),
+            "must be valid UTF-8"
+        );
+        // The whole multi-byte char must have been dropped, not sliced —
+        // the back-off must land exactly where the prefix ends.
+        assert_eq!(capped, prefix);
+    }
+
     /// A third-party server's `instructions` is forwarded verbatim into every
     /// agent's system prompt — an oversized value must be capped at harvest
     /// time (`cap_instructions`), not left for every downstream consumer to
