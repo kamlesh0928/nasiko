@@ -610,7 +610,10 @@ async fn unimplemented_method_probe_is_not_blocked_by_protocol_version_header() 
 #[serial]
 async fn initialize_negotiates_even_with_an_unnegotiated_header_value() {
     // `initialize` is the negotiation request itself — it must never be gated
-    // by a header value the client couldn't yet have negotiated.
+    // by a header value the client couldn't yet have negotiated. Stronger
+    // than "some supported version comes back": the header carries a
+    // DIFFERENT (but supported) version than `params.protocolVersion`, so
+    // this proves negotiation is driven by params, never by the header.
     let server = TestServer::start().await;
     let owner = seed_user(&server, "gw-owner-init-pv").await;
     let agent_id = seed_agent(&server, owner, "init-pv-agent").await;
@@ -620,19 +623,20 @@ async fn initialize_negotiates_even_with_an_unnegotiated_header_value() {
         .client
         .post(server.url("/api/mcp"))
         .bearer_auth(&token)
-        .header("MCP-Protocol-Version", "2025-11-25")
-        .json(&rpc("initialize"))
+        .header("MCP-Protocol-Version", "2025-06-18")
+        .json(
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "0"}}}),
+        )
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    let negotiated = body["result"]["protocolVersion"]
-        .as_str()
-        .expect("initialize must return a protocolVersion");
-    assert!(
-        nasiko_mcp_gateway::types::SUPPORTED_PROTOCOL_VERSIONS.contains(&negotiated),
-        "negotiated version {negotiated} must be one we support"
+    assert_eq!(
+        body["result"]["protocolVersion"], "2024-11-05",
+        "negotiation must come from params.protocolVersion, not the header: {body}"
     );
     server.cleanup().await;
 }
@@ -711,9 +715,9 @@ async fn a_body_under_the_raised_limit_is_not_rejected() {
         .send()
         .await
         .unwrap();
-    assert_ne!(
+    assert_eq!(
         resp.status(),
-        413,
+        200,
         "a ~3 MiB body must fit under the raised 8 MiB limit — axum's own 2 MiB \
          default would have rejected it"
     );

@@ -56,6 +56,14 @@ pub async fn handle_request(
         return None;
     };
 
+    if !implements(method) {
+        return Some(err(
+            &req_id,
+            codes::METHOD_NOT_FOUND,
+            format!("Method not found: {method}"),
+        ));
+    }
+
     match method {
         "initialize" => {
             return Some(handle_initialize(
@@ -104,20 +112,18 @@ pub async fn handle_request(
             )
             .await
         }
-        other => err(
-            &req_id,
-            codes::METHOD_NOT_FOUND,
-            format!("Method not found: {other}"),
-        ),
+        other => unreachable!("implements() gate admitted unhandled method {other}"),
     };
     Some(result)
 }
 
-/// True for exactly the methods [`handle_request`]'s match answers itself
-/// (`initialize`, `ping`, `tools/list`, `tools/call`) rather than falling
-/// through to `METHOD_NOT_FOUND` — single source of truth with the match
-/// above, so a method added there must be added here too (see the unit test
-/// below, which pins both halves of that list together).
+/// True for exactly the methods [`handle_request`] answers itself
+/// (`initialize`, `ping`, `tools/list`, `tools/call`) — the single source of
+/// truth for `-32601`. `handle_request` returns `METHOD_NOT_FOUND` for
+/// anything this says `false` to, before either match runs, so a method added
+/// to either match must be added here too (see the unit tests below, which
+/// pin both halves of that list together and prove an unknown method never
+/// reaches `load_permission_context`/`resolve_session`).
 ///
 /// Used by the route layer (`oss/server/src/mcp/handlers/gateway.rs`) to gate
 /// `MCP-Protocol-Version` header enforcement: streamable-http clients probe
@@ -130,7 +136,8 @@ pub fn implements(method: &str) -> bool {
 }
 
 /// Version reported in `initialize`'s `serverInfo.version` — the gateway's own
-/// release marker, unrelated to the negotiated MCP protocol version above it.
+/// release marker, unrelated to the negotiated MCP protocol version computed
+/// in `handle_initialize` below.
 const GATEWAY_SERVER_VERSION: &str = "1.1.0";
 
 /// `initialize` — negotiate the protocol version (echo a supported client
@@ -1405,6 +1412,25 @@ mod tests {
             "an unhandled method must report unimplemented so the route layer's \
              MCP-Protocol-Version gate does not block a streamable-http client's \
              fallback probe"
+        );
+    }
+
+    /// Step 0 (carry-over hardening): an unimplemented method must be rejected
+    /// by the `implements()` gate before `load_permission_context`/
+    /// `resolve_session` ever run. `test_state()`'s pool is lazily connected
+    /// to an unreachable address, so this would hang/error instead of
+    /// returning promptly if the gate ran after either DB call.
+    #[tokio::test]
+    async fn unknown_method_is_rejected_before_permission_or_session_work() {
+        let state = test_state();
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover"});
+        let res = handle_request(&state, Uuid::new_v4(), Uuid::new_v4(), &body, None)
+            .await
+            .expect("a request with an id must produce a response");
+        assert_eq!(
+            res["error"]["code"],
+            json!(codes::METHOD_NOT_FOUND),
+            "{res}"
         );
     }
 
