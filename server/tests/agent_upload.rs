@@ -236,10 +236,43 @@ async fn upload_persists_agent_and_build_record() {
     server.cleanup().await;
 }
 
+/// Row snapshot for [`upload_rejects_when_name_collides_with_a_coding_agent_row_owned_by_the_caller`]
+/// — everything the upsert's `DO UPDATE SET` would touch, plus `coding_agent_integration_id`
+/// itself (which that `DO UPDATE SET` never lists, so asserting only that column would still pass
+/// even if the guard ran *after* the upsert — see the test's own doc comment).
+#[derive(Debug, PartialEq, sqlx::FromRow)]
+struct AgentUpsertSnapshot {
+    coding_agent_integration_id: Option<String>,
+    version: String,
+    image: Option<String>,
+    status: String,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+async fn snapshot_agent(server: &common::TestServer, agent_id: uuid::Uuid) -> AgentUpsertSnapshot {
+    sqlx::query_as(
+        "SELECT coding_agent_integration_id, version, image, status, updated_at \
+         FROM agents WHERE id = $1",
+    )
+    .bind(agent_id)
+    .fetch_one(&server.db)
+    .await
+    .unwrap()
+}
+
+async fn build_jobs_count(server: &common::TestServer, agent_id: uuid::Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM build_jobs WHERE agent_id = $1")
+        .bind(agent_id)
+        .fetch_one(&server.db)
+        .await
+        .unwrap()
+}
+
 /// Task 1.6 (spec §16 A4): the `(owner_id, name)` upsert must reject — not clear
 /// `coding_agent_integration_id` and deploy over it — when an existing row by that key is a
-/// CLI-bound coding agent. The check runs before the `ON CONFLICT (owner_id, name)` write, so a
-/// name collision with a coding-agent row must never bump its version or image.
+/// CLI-bound coding agent. The check runs before the `ON CONFLICT (owner_id, name)` write and
+/// before a new `build_jobs` row is ever queued, so a name collision with a coding-agent row must
+/// never bump its version/image/status or start a build.
 #[tokio::test]
 #[serial]
 async fn upload_rejects_when_name_collides_with_a_coding_agent_row_owned_by_the_caller() {
@@ -276,6 +309,9 @@ async fn upload_rejects_when_name_collides_with_a_coding_agent_row_owned_by_the_
         .await
         .unwrap();
 
+    let before = snapshot_agent(&server, agent_id).await;
+    let jobs_before = build_jobs_count(&server, agent_id).await;
+
     let zip = make_valid_structure_zip();
     let second = upload(
         &server,
@@ -294,14 +330,18 @@ async fn upload_rejects_when_name_collides_with_a_coding_agent_row_owned_by_the_
         "expected coding_agent_not_deployable, got: {text}"
     );
 
-    // Unchanged: the rejected upload must never have reached the upsert.
-    let still_coding: Option<String> =
-        sqlx::query_scalar("SELECT coding_agent_integration_id FROM agents WHERE id = $1")
-            .bind(agent_id)
-            .fetch_one(&server.db)
-            .await
-            .unwrap();
-    assert_eq!(still_coding.as_deref(), Some("claude"));
+    // Unchanged: the rejected upload must never have reached the upsert. Asserting the full
+    // snapshot (not just `coding_agent_integration_id`, which `ON CONFLICT ... DO UPDATE SET`
+    // never lists anyway) is what actually proves the guard ran BEFORE the upsert rather than
+    // after it — version/image/status/updated_at would move even though the column the guard
+    // reads stayed put, if the upsert had run first.
+    let after = snapshot_agent(&server, agent_id).await;
+    assert_eq!(after, before, "the upsert must never have run");
+    assert_eq!(
+        build_jobs_count(&server, agent_id).await,
+        jobs_before,
+        "no new build_jobs row must be queued for a rejected upload"
+    );
 
     // Control: an ordinary (non-colliding) upload in the same test still gets through as today.
     let zip = make_valid_structure_zip();

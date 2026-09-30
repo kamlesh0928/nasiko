@@ -386,6 +386,55 @@ async fn deploy_onto_existing_agent_name_rejects_non_owner() {
     s.server.cleanup().await;
 }
 
+/// Task 1.6 (spec §16 A4): a coding-agent row must never be deployed onto, even by its own
+/// owner — it would inherit the MCP gateway's owner-fallback policy while becoming dispatchable.
+#[tokio::test]
+#[serial]
+async fn deploy_onto_existing_agent_name_rejects_coding_agent_row() {
+    let (s, agent_id) = Scenario::setup("deploy-coding-agent").await;
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(agent_id)
+        .execute(&s.server.db)
+        .await
+        .unwrap();
+    let path = s.server.url("/api/containers");
+
+    let res = s
+        .as_owner(s.server.client.post(&path))
+        .json(&json!({"image": "owner/image:1.0.0", "name": "deploy-coding-agent"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        409,
+        "the owner must not be able to deploy onto their own coding-agent row"
+    );
+    let text = res.text().await.unwrap();
+    assert!(
+        text.contains("coding_agent_not_deployable"),
+        "expected coding_agent_not_deployable, got: {text}"
+    );
+
+    // Control: redeploying an ordinary, already-registered agent the owner owns still gets
+    // through as today.
+    let normal_name = "deploy-coding-agent-normal-sibling";
+    seed_agent(&s.server, s.owner_id, normal_name).await;
+    let normal_res = s
+        .as_owner(s.server.client.post(&path))
+        .json(&json!({"image": "owner/image:1.0.0", "name": normal_name}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        normal_res.status(),
+        201,
+        "a normal (non-coding) agent must be unaffected"
+    );
+
+    s.server.cleanup().await;
+}
+
 // ─── list: GET /api/containers must be scoped to the caller's own agents ───
 
 #[tokio::test]

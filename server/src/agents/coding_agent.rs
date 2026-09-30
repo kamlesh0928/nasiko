@@ -8,15 +8,26 @@
 //!   - **Sharing** the row via an `agent_grants` insert — a listing would then show it to
 //!     someone other than its owner, and a future route-to-local-agent feature would silently
 //!     violate the "owner == the only user this row ever resolves to" invariant.
-//!   - **Deploying** a container onto the row — `PUT /api/agents/{id}/update`, its rollback path,
-//!     and the `nasiko upload` `(owner_id, name)` upsert all keep `coding_agent_integration_id` as
-//!     is, so an uploaded/rolled-back container would inherit the owner policy while being
-//!     dispatchable, which is the precondition of a participant-laundering chain.
+//!   - **Deploying** a container onto the row — every upsert-or-deploy path that keys off
+//!     `(owner_id, name)` or an existing `id` keeps `coding_agent_integration_id` as is, so a
+//!     deployed container would inherit the owner policy while being dispatchable, which is the
+//!     precondition of a participant-laundering chain.
 //!
 //! Both are rejected here with a 409, from one shared check called by every mutation that could
-//! do either: OSS `agents::grants`, `agents::update`, `agents::upload`, and — wrapping, never
-//! forking, this OSS check — `ee/server/src/grants.rs`'s own seven `agent_grants`-inserting
-//! handlers.
+//! do either:
+//!
+//!   - `agents::grants` (`make_public`, `add_user_grant`) and `agents::update`
+//!     (`update_agent`, `rollback_agent`)
+//!   - `agents::upload::upload_and_deploy`'s `(owner_id, name)` upsert
+//!   - `github::github_clone`'s `(owner_id, name)` upsert
+//!   - `catalog::import::import_registry`'s registry-import upsert
+//!   - `admin::routes::deploy`'s by-name deploy
+//!   - and — wrapping, never forking, this OSS check — any edition-specific grants handler that
+//!     inserts into `agent_grants` of its own
+//!
+//! A DB error while answering "is this a coding agent" fails the request closed (500), not open:
+//! silently treating an error as "not a coding agent" would let the share/deploy proceed exactly
+//! when the check couldn't actually be performed.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -28,8 +39,8 @@ use uuid::Uuid;
 pub enum CodingAgentGuard {
     /// An `agent_grants` insert: user, team/org-unit, organization, agent-to-agent, or public.
     Unshareable,
-    /// A redeploy: `PUT /api/agents/{id}/update`, its rollback path, or the `nasiko upload`
-    /// `(owner_id, name)` upsert.
+    /// A redeploy: an update/rollback/upload/import/admin-deploy path targeting an existing
+    /// coding-agent row.
     NotDeployable,
 }
 
@@ -57,10 +68,15 @@ impl CodingAgentGuard {
     }
 }
 
-/// `true` for a live (non-soft-deleted) coding-agent row. A missing/deleted agent answers
-/// `false` — callers needing "does this agent exist at all" have their own existence check
-/// already; this only ever needs to answer "is it a coding agent".
-async fn is_coding_agent(db: &PgPool, agent_id: Uuid) -> bool {
+fn internal_error() -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+}
+
+/// `Ok(true)` for a live (non-soft-deleted) coding-agent row, `Ok(false)` for an ordinary or
+/// missing/deleted one — callers needing "does this agent exist at all" have their own existence
+/// check already; this only ever needs to answer "is it a coding agent". `Err` (500) on a DB
+/// failure — never silently treated as `false` (see module doc).
+async fn is_coding_agent(db: &PgPool, agent_id: Uuid) -> Result<bool, Response> {
     sqlx::query_scalar::<_, bool>(
         "SELECT coding_agent_integration_id IS NOT NULL FROM agents \
          WHERE id = $1 AND deleted_at IS NULL",
@@ -68,15 +84,22 @@ async fn is_coding_agent(db: &PgPool, agent_id: Uuid) -> bool {
     .bind(agent_id)
     .fetch_optional(db)
     .await
-    .ok()
-    .flatten()
-    .unwrap_or(false)
+    .map(|row| row.unwrap_or(false))
+    .map_err(|e| {
+        tracing::error!(%e, %agent_id, "coding_agent guard: db error checking coding_agent_integration_id by id");
+        internal_error()
+    })
 }
 
-/// Same check keyed on `(owner_id, name)` instead of `id` — the upload upsert's own key
-/// (`ON CONFLICT (owner_id, name)`). Needed because that path must reject *before* the upsert
-/// runs, i.e. before there is a resolved `id` for an existing row to check.
-async fn is_coding_agent_by_owner_and_name(db: &PgPool, owner_id: Uuid, name: &str) -> bool {
+/// Same check keyed on `(owner_id, name)` instead of `id` — the upload/import/GitHub-deploy
+/// upserts' own key (`ON CONFLICT (owner_id, name)`). Needed because those paths must reject
+/// *before* the upsert runs, i.e. before there is a resolved `id` for an existing row to check.
+/// `Err` (500) on a DB failure, same as [`is_coding_agent`].
+async fn is_coding_agent_by_owner_and_name(
+    db: &PgPool,
+    owner_id: Uuid,
+    name: &str,
+) -> Result<bool, Response> {
     sqlx::query_scalar::<_, bool>(
         "SELECT coding_agent_integration_id IS NOT NULL FROM agents \
          WHERE owner_id = $1 AND name = $2 AND deleted_at IS NULL",
@@ -85,30 +108,38 @@ async fn is_coding_agent_by_owner_and_name(db: &PgPool, owner_id: Uuid, name: &s
     .bind(name)
     .fetch_optional(db)
     .await
-    .ok()
-    .flatten()
-    .unwrap_or(false)
+    .map(|row| row.unwrap_or(false))
+    .map_err(|e| {
+        tracing::error!(
+            %e, %owner_id, %name,
+            "coding_agent guard: db error checking coding_agent_integration_id by (owner_id, name)"
+        );
+        internal_error()
+    })
 }
 
 /// 409 if `agent_id` names a coding-agent row — call before any mutation that would share or
 /// redeploy it. A non-coding-agent row (including a nonexistent one — its own existence check
-/// belongs to the caller) passes through untouched.
+/// belongs to the caller) passes through untouched. 500 if the check itself fails (see module
+/// doc) — this must never fail open.
 pub async fn reject_if_coding_agent(
     db: &PgPool,
     agent_id: Uuid,
     guard: CodingAgentGuard,
 ) -> Result<(), Response> {
-    guard.reject_if(is_coding_agent(db, agent_id).await)
+    guard.reject_if(is_coding_agent(db, agent_id).await?)
 }
 
-/// 409 if `(owner_id, name)` already names a coding-agent row — the `nasiko upload` upsert's own
-/// pre-check, run before its `ON CONFLICT (owner_id, name)` write (see module doc). Always
-/// [`CodingAgentGuard::NotDeployable`]: upload only ever (re)deploys, never shares.
+/// 409 if `(owner_id, name)` already names a coding-agent row — the pre-check every
+/// `(owner_id, name)`-keyed upsert (upload, GitHub deploy, registry import) runs before its own
+/// `ON CONFLICT (owner_id, name)` write (see module doc). Always
+/// [`CodingAgentGuard::NotDeployable`]: these paths only ever (re)deploy, never share. 500 if the
+/// check itself fails, same as [`reject_if_coding_agent`].
 pub async fn reject_if_coding_agent_by_owner_and_name(
     db: &PgPool,
     owner_id: Uuid,
     name: &str,
 ) -> Result<(), Response> {
     CodingAgentGuard::NotDeployable
-        .reject_if(is_coding_agent_by_owner_and_name(db, owner_id, name).await)
+        .reject_if(is_coding_agent_by_owner_and_name(db, owner_id, name).await?)
 }

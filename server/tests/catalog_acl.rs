@@ -463,12 +463,15 @@ async fn list_excludes_internal_agent_even_for_superuser() {
     server.cleanup().await;
 }
 
-/// Task 1.6 (spec §16 A4): a coding-agent row must never appear in the catalog listing, even
-/// when marked `is_public` directly — a listing showing it to someone other than its owner would
-/// violate the single-owner precondition Task 1.5's MCP-gateway owner-fallback policy relies on.
+/// Task 1.6 (spec §16 A4): a coding-agent row is visible ONLY to its own owner, even when marked
+/// `is_public` directly — never via `is_public`, a grant, or a superuser's normally-unrestricted
+/// view. A listing showing it to anyone else would violate the single-owner precondition Task
+/// 1.5's MCP-gateway owner-fallback policy relies on. The owner themselves must still see it,
+/// though (the product expectation that a connected coding agent shows in its own owner's list) —
+/// unlike `is_internal`, this exclusion is owner-scoped, not absolute.
 #[tokio::test]
 #[serial]
-async fn list_excludes_coding_agent_row_even_when_marked_public() {
+async fn list_shows_coding_agent_row_only_to_its_owner() {
     let server = common::TestServer::start().await;
     let admin = init_admin(&server).await;
     let uid = admin["user_id"].as_str().unwrap();
@@ -476,7 +479,7 @@ async fn list_excludes_coding_agent_row_even_when_marked_public() {
     let coding_agent = create_agent(
         &server,
         uid,
-        json!({"name": "cat3-coding-hidden", "version": "1.0.0"}),
+        json!({"name": "cat3-coding-owner-only", "version": "1.0.0"}),
     )
     .await;
     let coding_id = coding_agent["id"].as_str().unwrap();
@@ -498,16 +501,46 @@ async fn list_excludes_coding_agent_row_even_when_marked_public() {
     .await;
     let normal_id = normal["id"].as_str().unwrap();
 
-    let seen = list_agents(&server, uid, true).await;
-    let ids: Vec<&str> = seen.iter().filter_map(|a| a["id"].as_str()).collect();
+    let bob = create_user(&server, uid, "cat3-coding-bob").await;
+    let bob_id = bob["id"].as_str().unwrap();
 
+    // A second superuser, distinct from the coding row's owner — the general "superuser sees
+    // everything" bypass must not extend to a coding-agent row it doesn't own.
+    let other_super_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO users (username, email, is_superuser) VALUES ($1, $2, true) RETURNING id",
+    )
+    .bind("cat3-coding-other-super")
+    .bind("cat3-coding-other-super@test.local")
+    .fetch_one(&server.db)
+    .await
+    .unwrap();
+
+    let owner_seen = list_agents(&server, uid, true).await;
+    let owner_ids: Vec<&str> = owner_seen.iter().filter_map(|a| a["id"].as_str()).collect();
     assert!(
-        !ids.contains(&coding_id),
-        "a coding-agent row must not appear in the list, even marked public"
+        owner_ids.contains(&coding_id),
+        "the owner must see their own coding-agent row"
     );
     assert!(
-        ids.contains(&normal_id),
+        owner_ids.contains(&normal_id),
         "an ordinary agent's visibility must be unaffected"
+    );
+
+    let bob_seen = list_agents(&server, bob_id, false).await;
+    let bob_ids: Vec<&str> = bob_seen.iter().filter_map(|a| a["id"].as_str()).collect();
+    assert!(
+        !bob_ids.contains(&coding_id),
+        "a non-owner must not see another user's coding-agent row, even marked public"
+    );
+
+    let other_super_seen = list_agents(&server, &other_super_id.to_string(), true).await;
+    let other_super_ids: Vec<&str> = other_super_seen
+        .iter()
+        .filter_map(|a| a["id"].as_str())
+        .collect();
+    assert!(
+        !other_super_ids.contains(&coding_id),
+        "a superuser who does not own the coding-agent row must not see it either"
     );
 
     server.cleanup().await;
@@ -638,6 +671,57 @@ async fn search_includes_public_agent_for_non_owner() {
     assert!(
         !names.contains(&"cat3-search-priv"),
         "non-owner must not see a private, non-granted agent via search"
+    );
+
+    server.cleanup().await;
+}
+
+/// Task 1.6 (spec §16 A4): `search()` used to run `agent_access_predicate` with no
+/// `coding_agent_integration_id` filter at all, so a coding-agent row marked `is_public` leaked
+/// through search to any caller. Same owner-only visibility rule as `list`/`by_skill`.
+#[tokio::test]
+#[serial]
+async fn search_shows_coding_agent_row_only_to_its_owner() {
+    let server = common::TestServer::start().await;
+    let admin = init_admin(&server).await;
+    let uid = admin["user_id"].as_str().unwrap();
+
+    let coding_agent = create_agent(
+        &server,
+        uid,
+        json!({"name": "cat3-search-coding", "version": "1.0.0"}),
+    )
+    .await;
+    let coding_id = coding_agent["id"].as_str().unwrap();
+    sqlx::query(
+        "UPDATE agents SET is_public = true, coding_agent_integration_id = 'claude' WHERE id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(coding_id).unwrap())
+    .execute(&server.db)
+    .await
+    .unwrap();
+
+    let bob = create_user(&server, uid, "cat3-search-coding-bob").await;
+    let bob_id = bob["id"].as_str().unwrap();
+
+    let owner_results = search(&server, uid, true, "cat3-search-coding").await;
+    let owner_names: Vec<&str> = owner_results
+        .iter()
+        .filter_map(|a| a["name"].as_str())
+        .collect();
+    assert!(
+        owner_names.contains(&"cat3-search-coding"),
+        "the owner must see their own coding-agent row via search"
+    );
+
+    let bob_results = search(&server, bob_id, false, "cat3-search-coding").await;
+    let bob_names: Vec<&str> = bob_results
+        .iter()
+        .filter_map(|a| a["name"].as_str())
+        .collect();
+    assert!(
+        !bob_names.contains(&"cat3-search-coding"),
+        "a non-owner must not see another user's coding-agent row via search, even marked public"
     );
 
     server.cleanup().await;
