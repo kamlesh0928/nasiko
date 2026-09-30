@@ -27,6 +27,14 @@ pub struct McpInjector {
     pub gateway_public_url: Option<String>,
 }
 
+/// Compose the credential-bearing connect URL for a gateway token: the same
+/// form whether the token was injected into a deployed container's env or
+/// minted on demand for a local process (`POST /api/agents/{id}/mcp-token`).
+/// The single place this URL shape is written, so the two callers can't drift.
+pub fn connect_url(public_url: &str, token: &str) -> String {
+    format!("{}/s/{}", public_url.trim_end_matches('/'), token)
+}
+
 impl InstrumentationInjector for McpInjector {
     fn inject(&self, env_vars: &mut HashMap<String, String>, _ctx: &AgentContext) {
         let Some(url) = &self.gateway_public_url else {
@@ -49,11 +57,11 @@ impl InstrumentationInjector for McpInjector {
         // Runs after `mcp::wiring` has already minted `MCP_GATEWAY_TOKEN` into
         // the spec env (`McpInjector` is the outermost `InstrumentedRuntime`
         // layer, applied during `deploy()`), so the token is present here.
-        let connect_url = env_vars
+        let connect = env_vars
             .get("MCP_GATEWAY_TOKEN")
-            .map(|token| format!("{}/s/{}", url.trim_end_matches('/'), token));
-        if let Some(connect_url) = connect_url {
-            env_vars.insert("MCP_GATEWAY_CONNECT_URL".into(), connect_url);
+            .map(|token| connect_url(url, token));
+        if let Some(connect) = connect {
+            env_vars.insert("MCP_GATEWAY_CONNECT_URL".into(), connect);
         }
     }
 }

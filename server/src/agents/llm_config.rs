@@ -41,6 +41,10 @@ pub fn router() -> Router<AppState> {
                 .delete(delete_llm_config),
         )
         .route("/{id}/llm-token", post(issue_llm_token))
+        .route(
+            "/{id}/mcp-token",
+            post(issue_mcp_token).delete(revoke_mcp_token),
+        )
 }
 
 /// Resolve the agent's owner, enforcing owner-only (superuser override) access for
@@ -66,6 +70,25 @@ async fn agent_owner_or_reject(
         }
         Some(o) => Ok(o),
     }
+}
+
+/// Same resolution as [`agent_owner_or_reject`], but rejects every non-owner
+/// outright — including a superuser, who that function alone would let
+/// through. Credential-issuing endpoints (LLM routing token, MCP gateway
+/// token) are strictly owner-only: a superuser can administer the agent but
+/// must not be able to mint a credential that impersonates it.
+#[allow(clippy::result_large_err)]
+async fn strictly_owner_or_reject(
+    db: &sqlx::PgPool,
+    agent_id: Uuid,
+    user_id: Uuid,
+    is_superuser: bool,
+) -> Result<Uuid, axum::response::Response> {
+    let owner = agent_owner_or_reject(db, agent_id, user_id, is_superuser).await?;
+    if owner != user_id {
+        return Err((StatusCode::FORBIDDEN, "not the agent owner").into_response());
+    }
+    Ok(owner)
 }
 
 #[derive(Serialize, ToSchema)]
@@ -105,14 +128,11 @@ pub(crate) async fn issue_llm_token(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    let owner = match agent_owner_or_reject(&state.db, agent_id, user_id, claims.is_superuser).await
-    {
-        Ok(owner) => owner,
-        Err(resp) => return resp,
-    };
-    if owner != user_id {
-        return (StatusCode::FORBIDDEN, "not the agent owner").into_response();
-    }
+    let owner =
+        match strictly_owner_or_reject(&state.db, agent_id, user_id, claims.is_superuser).await {
+            Ok(owner) => owner,
+            Err(resp) => return resp,
+        };
 
     let cfg = GatewayConfig::from_env();
     if cfg.agent_jwt_secret.is_empty() {
@@ -149,6 +169,129 @@ pub(crate) async fn issue_llm_token(
         .headers_mut()
         .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     response
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct McpTokenResponse {
+    token: String,
+    /// The platform's configured public gateway URL, or `null` when unset.
+    gateway_url: Option<String>,
+    /// `{gateway_url}/s/{token}` — the credential-bearing URL form for MCP
+    /// clients that accept only a `url`, or `null` when `gateway_url` is unset.
+    connect_url: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct McpTokenEnvelope {
+    data: McpTokenResponse,
+    status_code: u16,
+    message: String,
+}
+
+/// Mint (rotate) the agent's MCP gateway credential for a local process — the
+/// same credential a deployed container receives as `MCP_GATEWAY_TOKEN` at
+/// deploy time (`mcp::wiring::inject_agent_gateway_token`). Lets a local
+/// coding agent (Claude Code / Codex / OpenCode, bound via `nasiko connect`),
+/// which is never deployed and so never receives one automatically, reach
+/// `/api/mcp`. Owner-only.
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/mcp-token",
+    tag = "agents",
+    params(("id" = Uuid, Path, description = "Agent id")),
+    responses(
+        (status = 200, description = "MCP gateway credential (plaintext, shown once)", body = McpTokenEnvelope),
+        (status = 403, description = "Caller is not the agent owner"),
+        (status = 404, description = "No such agent"),
+    ),
+)]
+pub(crate) async fn issue_mcp_token(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(agent_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let user_id = match claims.user_uuid() {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(resp) =
+        strictly_owner_or_reject(&state.db, agent_id, user_id, claims.is_superuser).await
+    {
+        return resp;
+    }
+
+    let token = match nasiko_mcp_gateway::agent_tokens::mint(&state.db, agent_id).await {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::error!(%error, %agent_id, "failed to mint MCP gateway token");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to issue MCP gateway token",
+            )
+                .into_response();
+        }
+    };
+    let gateway_url = state.config.mcp_gateway_public_url.clone();
+    let connect_url = gateway_url
+        .as_deref()
+        .map(|url| nasiko_mcp_gateway::injector::connect_url(url, &token));
+    let mut response = ApiResponse::ok(
+        json!(McpTokenResponse {
+            token,
+            gateway_url,
+            connect_url,
+        }),
+        "MCP gateway token issued successfully",
+    )
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
+}
+
+/// Revoke every gateway credential of the agent — the live one and any
+/// grace-window predecessor (`nasiko_mcp_gateway::agent_tokens::revoke`).
+/// Owner-only. Idempotent: revoking an agent with no live credential still
+/// answers 204.
+#[utoipa::path(
+    delete,
+    path = "/api/agents/{id}/mcp-token",
+    tag = "agents",
+    params(("id" = Uuid, Path, description = "Agent id")),
+    responses(
+        (status = 204, description = "Credential revoked"),
+        (status = 403, description = "Caller is not the agent owner"),
+        (status = 404, description = "No such agent"),
+    ),
+)]
+pub(crate) async fn revoke_mcp_token(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(agent_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let user_id = match claims.user_uuid() {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(resp) =
+        strictly_owner_or_reject(&state.db, agent_id, user_id, claims.is_superuser).await
+    {
+        return resp;
+    }
+
+    match nasiko_mcp_gateway::agent_tokens::revoke(&state.db, agent_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::error!(%error, %agent_id, "failed to revoke MCP gateway token");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to revoke MCP gateway token",
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Resolve the config an agent routes through: attached (`agents.llm_config_id`) → the owner's
