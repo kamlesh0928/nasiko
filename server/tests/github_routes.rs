@@ -1,7 +1,3 @@
-//! `github_clone`'s coding-agent guard (`reject_if_coding_agent_by_owner_and_name` in
-//! `oss/server/src/github.rs`) has no coverage here: every test below never configures
-//! `github_svc`, so `github_clone` 503s before reaching the guard.
-
 mod common;
 
 use serial_test::serial;

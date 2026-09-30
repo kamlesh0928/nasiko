@@ -14,7 +14,6 @@ use uuid::Uuid;
 
 use std::collections::HashMap;
 
-use crate::agents::coding_agent::reject_if_coding_agent_by_owner_and_name;
 use crate::agents::upload::BuildJobPayload;
 use crate::agents::utils::set_upload_status;
 use nasiko_secrets::SecretsCrypto;
@@ -749,13 +748,6 @@ async fn github_clone(
         &agent_name,
         &version_tag,
     );
-
-    // A coding-agent row must never be deployed onto — checked against this upsert's own key,
-    // `(owner_id, name)`, before it runs.
-    if let Err(r) = reject_if_coding_agent_by_owner_and_name(&state.db, user_id, &agent_name).await
-    {
-        return r;
-    }
 
     // ── DB transaction: upsert agent + build record + job ────────────────────
     let mut tx = match state.db.begin().await {

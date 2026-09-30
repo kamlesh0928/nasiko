@@ -817,66 +817,6 @@ async fn restart_starting_agent_returns_409() {
     server.cleanup().await;
 }
 
-/// A coding-agent row must never be (re)deployed onto, even through the deployment-id-keyed
-/// restart endpoint — a `stopped` status alone must not let the Docker destroy+recreate path in
-/// `restart_deployment` run against it.
-#[tokio::test]
-#[serial]
-async fn restart_coding_agent_row_returns_409() {
-    let server = common::TestServer::start().await;
-    let admin = init_admin(&server).await;
-    let uid = admin["user_id"].as_str().unwrap();
-    let owner_id: Uuid = uid.parse().unwrap();
-
-    let (agent_id, dep_id) = seed_deployment(
-        &server.db,
-        owner_id,
-        "coding-agent-restart-ng",
-        "stopped",
-        None,
-        None,
-        None,
-    )
-    .await;
-    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
-        .bind(agent_id)
-        .execute(&server.db)
-        .await
-        .unwrap();
-
-    let res = call_restart(&server, uid, dep_id).await;
-    assert_eq!(
-        res.status(),
-        409,
-        "a coding-agent row must not be restarted"
-    );
-    let text = res.text().await.unwrap();
-    assert!(
-        text.contains("coding_agent_not_deployable"),
-        "expected coding_agent_not_deployable, got: {text}"
-    );
-
-    // Control: an ordinary (non-coding) deployment in the same test still restarts as today.
-    let (_, normal_dep_id) = seed_deployment(
-        &server.db,
-        owner_id,
-        "coding-agent-restart-ng-normal",
-        "stopped",
-        None,
-        None,
-        None,
-    )
-    .await;
-    let normal_res = call_restart(&server, uid, normal_dep_id).await;
-    let normal_status = normal_res.status().as_u16();
-    assert_ne!(
-        normal_status, 409,
-        "a normal deployment's restart must be unaffected"
-    );
-
-    server.cleanup().await;
-}
-
 #[tokio::test]
 #[serial]
 async fn restart_spec_ports_stored_and_read() {

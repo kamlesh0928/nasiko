@@ -35,14 +35,9 @@ struct ReconcilableAgent {
 /// already pays the same per-agent cost for the (usually much smaller) seed
 /// list on every boot.
 pub async fn reconcile_agents_on_startup(state: &AppState) {
-    // `AND coding_agent_integration_id IS NULL` — a CLI-bound coding-agent row must never be
-    // deployed onto. This is the last line of defense: it fires on every boot, with no
-    // request/response cycle to check a guard against, against any row that somehow got
-    // `status = 'running'` and a non-NULL `image` despite the write-side guards elsewhere.
     let agents = match sqlx::query_as::<_, ReconcilableAgent>(
         "SELECT id, name, image, owner_id, writable, writable_path FROM agents \
-         WHERE status = 'running' AND deleted_at IS NULL AND image IS NOT NULL \
-           AND coding_agent_integration_id IS NULL",
+         WHERE status = 'running' AND deleted_at IS NULL AND image IS NOT NULL",
     )
     .fetch_all(&state.db)
     .await

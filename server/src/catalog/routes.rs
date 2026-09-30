@@ -13,7 +13,6 @@ use uuid::Uuid;
 
 use nasiko_runtime::ContainerId;
 
-use crate::agents::coding_agent::{CodingAgentGuard, reject_if_coding_agent};
 use crate::auth::Claims;
 use crate::state::AppState;
 
@@ -338,8 +337,6 @@ pub(crate) async fn by_skill(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    // Real caller id regardless of role — see `list`'s identical `caller_id` comment.
-    let caller_id = claims.user_uuid().ok();
 
     // Normalise to lowercase before the GIN containment check.  Tags are
     // stored lowercase after migration 014, so this ensures the query matches
@@ -352,7 +349,6 @@ pub(crate) async fn by_skill(
            FROM agents a
            WHERE ({access})
              AND NOT a.is_internal
-             AND (a.coding_agent_integration_id IS NULL OR a.owner_id = $6)
              AND EXISTS (
                  SELECT 1 FROM agent_skills s
                  WHERE s.agent_id = a.id AND s.tags @> ARRAY[$1]::text[]
@@ -368,7 +364,6 @@ pub(crate) async fn by_skill(
         .bind(offset)
         .bind(scope.user)
         .bind(&scope.org_granted)
-        .bind(caller_id)
         .fetch_all(&state.db)
         .await;
 
@@ -556,16 +551,11 @@ pub(crate) async fn list(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    // The real caller id, regardless of role — `scope.user` is `None` for a superuser (the
-    // general access bypass), but a coding-agent row's visibility must never widen for
-    // superusers (see the `coding_agent_integration_id` clause below).
-    let caller_id = claims.user_uuid().ok();
 
     let sql = format!(
         r#"SELECT * FROM agents
            WHERE deleted_at IS NULL
              AND NOT is_internal
-             AND (coding_agent_integration_id IS NULL OR owner_id = $7)
              AND ($1::uuid IS NULL OR owner_id = $1)
              AND ({access})
              AND ($2::text IS NULL OR status = $2)
@@ -581,7 +571,6 @@ pub(crate) async fn list(
         .bind(limit)
         .bind(offset)
         .bind(&scope.org_granted)
-        .bind(caller_id)
         .fetch_all(&state.db)
         .await;
 
@@ -910,7 +899,6 @@ async fn record_version_change_if_needed(
         (status = 200, description = "Updated agent", body = Agent),
         (status = 403, description = "Caller cannot manage this agent"),
         (status = 404, description = "No agent with this id"),
-        (status = 409, description = "Agent is a local coding agent and the body would deploy onto it — coding_agent_not_deployable"),
     ),
 )]
 pub(crate) async fn update(
@@ -922,18 +910,6 @@ pub(crate) async fn update(
     // Mutation → owner-or-superuser only (an invoke/public grant must not confer edit).
     if !crate::acl::can_manage_agent(&state, &claims, id).await {
         return StatusCode::FORBIDDEN.into_response();
-    }
-
-    // A coding-agent row must never be deployed onto, but plain metadata edits (name,
-    // description, tags, ...) are legitimate even for a coding agent — reject only when the
-    // body actually carries a deploy signal.
-    let would_deploy = body.image.is_some()
-        || body.status.is_some()
-        || (body.activate_version && body.version.is_some());
-    if would_deploy
-        && let Err(r) = reject_if_coding_agent(&state.db, id, CodingAgentGuard::NotDeployable).await
-    {
-        return r;
     }
 
     let mut tx = match state.db.begin().await {
@@ -1455,8 +1431,6 @@ pub(crate) async fn search(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    // Real caller id regardless of role — see `list`'s identical `caller_id` comment.
-    let caller_id = claims.user_uuid().ok();
 
     // `COUNT(*) OVER()` yields the total match count (post-filter, pre-LIMIT) so
     // the envelope reports `total` without a second query.
@@ -1467,7 +1441,6 @@ pub(crate) async fn search(
                SELECT *, ({AGENT_SCORE_SQL})::double precision AS _score
                FROM agents
                WHERE ({access})
-                 AND (coding_agent_integration_id IS NULL OR owner_id = $5)
            ) _s
            WHERE _score > 0
            ORDER BY _score DESC, name ASC
@@ -1480,7 +1453,6 @@ pub(crate) async fn search(
         .bind(sq.limit.clamp(1, 50))
         .bind(scope.user)
         .bind(&scope.org_granted)
-        .bind(caller_id)
         .fetch_all(&state.db)
         .await;
 
@@ -1682,7 +1654,6 @@ pub(crate) async fn registry_user_agents(
     let agents = sqlx::query_as::<_, Agent>(
         r#"SELECT * FROM agents
            WHERE deleted_at IS NULL
-             AND (coding_agent_integration_id IS NULL OR owner_id = $1)
              AND (
                owner_id = $1
                OR is_public = true

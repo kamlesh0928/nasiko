@@ -100,14 +100,14 @@ pub async fn mcp_gateway(
 /// owner can access (their own, plus anything shared to them) that are also
 /// enabled for this specific agent row, never another user's. This is the
 /// same attribution the LLM router already applies to these rows with no flow
-/// at all (`oss/llm-router/src/handlers/chat.rs:312-323`). That scope can
-/// never widen to another user: sharing a coding-agent row is rejected with a
-/// 409 (`agents::coding_agent::reject_if_coding_agent`, checked before every
-/// `agent_grants` insert), so the row stays single-owner for as long as it
-/// exists. The credential itself has no TTL of its own — it rotates only on
-/// re-mint (`nasiko_mcp_gateway::agent_tokens::mint`, same primitive every
-/// gateway token uses); until this row gets its own CLI-triggered re-mint
-/// path, a leaked coding-agent connect URL is live for as long as the row is.
+/// at all (`oss/llm-router/src/handlers/chat.rs:312-323`). Nothing prevents
+/// such a row from being shared out or having its owner changed; whoever else
+/// can see the row, a flow-less call is attributed to its *current*
+/// `owner_id`, so an ownership transfer moves this attribution with it. The
+/// credential itself has no TTL of its own — it rotates only on re-mint
+/// (`nasiko_mcp_gateway::agent_tokens::mint`, same primitive every gateway
+/// token uses); until this row gets its own CLI-triggered re-mint path, a
+/// leaked coding-agent connect URL is live for as long as the row is.
 #[utoipa::path(
     post,
     path = "/api/mcp/s/{token}",

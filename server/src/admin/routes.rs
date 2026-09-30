@@ -8,7 +8,6 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::agents::coding_agent::{CodingAgentGuard, reject_if_coding_agent};
 use crate::auth::Claims;
 use crate::catalog::agent_secrets;
 use crate::state::AppState;
@@ -87,15 +86,6 @@ async fn deploy(
         && !crate::acl::can_manage_agent(&state, &claims, agent_id).await
     {
         return StatusCode::FORBIDDEN.into_response();
-    }
-
-    // A coding-agent row must never be deployed onto — this ad-hoc `nasiko deploy` path resolves
-    // straight to `state.runtime.deploy` below.
-    if let Some(agent_id) = resolved_agent_id
-        && let Err(r) =
-            reject_if_coding_agent(&state.db, agent_id, CodingAgentGuard::NotDeployable).await
-    {
-        return r;
     }
 
     // Resolve vault + agent secrets (vault = base, agent = override, request = highest)
@@ -464,13 +454,11 @@ async fn restart(
         image: Option<String>,
         writable: bool,
         writable_path: Option<String>,
-        coding_agent_integration_id: Option<String>,
     }
 
     let agent: Option<RestartAgentRow> = if let Ok(id) = name.parse::<Uuid>() {
         sqlx::query_as(
-            "SELECT id, owner_id, image, writable, writable_path, coding_agent_integration_id \
-             FROM agents WHERE id = $1",
+            "SELECT id, owner_id, image, writable, writable_path FROM agents WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&state.db)
@@ -479,8 +467,7 @@ async fn restart(
         .flatten()
     } else {
         sqlx::query_as(
-            "SELECT id, owner_id, image, writable, writable_path, coding_agent_integration_id \
-             FROM agents WHERE name = $1",
+            "SELECT id, owner_id, image, writable, writable_path FROM agents WHERE name = $1",
         )
         .bind(&name)
         .fetch_optional(&state.db)
@@ -495,7 +482,6 @@ async fn restart(
         image,
         writable,
         writable_path,
-        coding_agent_integration_id,
     }) = agent
     else {
         return (StatusCode::NOT_FOUND, "agent not found").into_response();
@@ -503,13 +489,6 @@ async fn restart(
 
     if !crate::acl::can_manage_agent(&state, &claims, agent_id).await {
         return StatusCode::FORBIDDEN.into_response();
-    }
-
-    // A coding-agent row must never be (re)deployed onto — restart reads `agents.image` and
-    // redeploys with no requirement that a live container already exist.
-    if let Err(r) = CodingAgentGuard::NotDeployable.reject_if(coding_agent_integration_id.is_some())
-    {
-        return r;
     }
 
     let image = match image {

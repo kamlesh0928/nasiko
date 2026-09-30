@@ -19,7 +19,6 @@ use uuid::Uuid;
 
 use nasiko_runtime::DeploymentStatus;
 
-use crate::agents::coding_agent::reject_if_coding_agent_by_owner_and_name;
 use crate::auth::Claims;
 use crate::build::routes::extract_zip_from_file;
 use crate::build::{self, BuildStatus};
@@ -312,7 +311,6 @@ const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
     responses(
         (status = 202, description = "Build queued", body = UploadAndDeployResponse),
         (status = 400, description = "Missing/invalid name, version_tag, or source zip"),
-        (status = 409, description = "(owner, name) names a local coding agent — coding_agent_not_deployable"),
         (status = 413, description = "Upload exceeds 100 MiB limit"),
     ),
 )]
@@ -426,13 +424,6 @@ pub(crate) async fn upload_and_deploy(
         Some(n) if !n.is_empty() => n,
         _ => return (StatusCode::BAD_REQUEST, "name is required").into_response(),
     };
-
-    // A coding-agent row must never be deployed onto — checked against the upsert's own key,
-    // `(owner_id, name)`, before the `ON CONFLICT` upsert below runs. No `id` exists yet to check
-    // by, hence the by-name lookup rather than `reject_if_coding_agent`.
-    if let Err(r) = reject_if_coding_agent_by_owner_and_name(&state.db, owner_id, &name).await {
-        return r;
-    }
     // `version_tag` isn't resolved here — it may still come from the zip's
     // AgentCard.json/pyproject.toml/Cargo.toml, discovered during validation
     // below. Resolved and validated as a plain x.y.z once that's known (no

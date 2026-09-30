@@ -11,7 +11,6 @@ use uuid::Uuid;
 
 use nasiko_runtime::DeploymentStatus;
 
-use crate::agents::coding_agent::CodingAgentGuard;
 use crate::agents::upload::BuildJobPayload;
 use crate::auth::Claims;
 use crate::build::{self, BuildStatus, download_repo_tarball, routes::extract_zip_to_dir};
@@ -94,7 +93,6 @@ pub(crate) struct UpdateAgentForm {
         (status = 403, description = "Caller cannot manage this agent"),
         (status = 404, description = "No such agent"),
         (status = 409, description = "Version already exists or is not greater than current"),
-        (status = 409, description = "Agent is a local coding agent — coding_agent_not_deployable"),
     ),
 )]
 pub(crate) async fn update_agent(
@@ -121,12 +119,10 @@ pub(crate) async fn update_agent(
         owner_id: Uuid,
         writable: bool,
         writable_path: Option<String>,
-        coding_agent_integration_id: Option<String>,
     }
 
     let agent: Option<UpdateAgentRow> = match sqlx::query_as(
-        "SELECT name, version, image, owner_id, writable, writable_path, coding_agent_integration_id \
-         FROM agents WHERE id = $1",
+        "SELECT name, version, image, owner_id, writable, writable_path FROM agents WHERE id = $1",
     )
     .bind(agent_id)
     .fetch_optional(&state.db)
@@ -146,7 +142,6 @@ pub(crate) async fn update_agent(
         owner_id: agent_owner_id,
         writable,
         writable_path,
-        coding_agent_integration_id,
     }) = agent
     else {
         return StatusCode::NOT_FOUND.into_response();
@@ -155,13 +150,6 @@ pub(crate) async fn update_agent(
     // Superusers bypass ACL; everyone else needs owner or explicit ACL grant.
     if !crate::acl::can_manage_agent(&state, &claims, agent_id).await {
         return StatusCode::FORBIDDEN.into_response();
-    }
-
-    // A coding-agent row must never be deployed onto. Checked against the row already fetched
-    // above, not a fresh query — `reject_if_coding_agent` would just re-read the same column.
-    if let Err(r) = CodingAgentGuard::NotDeployable.reject_if(coding_agent_integration_id.is_some())
-    {
-        return r;
     }
 
     // Parse multipart fields.
@@ -720,7 +708,6 @@ pub async fn execute_agent_update(
         (status = 403, description = "Caller cannot manage this agent"),
         (status = 404, description = "No such agent, or no such target version"),
         (status = 409, description = "No eligible rollback version"),
-        (status = 409, description = "Agent is a local coding agent — coding_agent_not_deployable"),
         (status = 422, description = "Invalid JSON body"),
     ),
 )]
@@ -751,19 +738,8 @@ pub(crate) async fn rollback_agent(
 
     // Fetch agent — verify exists. Include `writable` so a rollback carries forward
     // the agent's persistent-storage mount (same reasoning as update_agent above).
-    #[derive(sqlx::FromRow)]
-    struct RollbackAgentRow {
-        name: String,
-        version: String,
-        owner_id: Uuid,
-        writable: bool,
-        writable_path: Option<String>,
-        coding_agent_integration_id: Option<String>,
-    }
-
-    let agent: Option<RollbackAgentRow> = match sqlx::query_as(
-        "SELECT name, version, owner_id, writable, writable_path, coding_agent_integration_id \
-         FROM agents WHERE id = $1",
+    let agent: Option<(String, String, Uuid, bool, Option<String>)> = match sqlx::query_as(
+        "SELECT name, version, owner_id, writable, writable_path FROM agents WHERE id = $1",
     )
     .bind(agent_id)
     .fetch_optional(&state.db)
@@ -776,28 +752,14 @@ pub(crate) async fn rollback_agent(
         }
     };
 
-    let Some(RollbackAgentRow {
-        name: agent_name,
-        version: current_version,
-        owner_id: agent_owner_id,
-        writable,
-        writable_path,
-        coding_agent_integration_id,
-    }) = agent
-    else {
-        return StatusCode::NOT_FOUND.into_response();
+    let (agent_name, current_version, agent_owner_id, writable, writable_path) = match agent {
+        Some(r) => r,
+        None => return StatusCode::NOT_FOUND.into_response(),
     };
 
     // Superusers bypass ACL; everyone else needs owner or explicit ACL grant.
     if !crate::acl::can_manage_agent(&state, &claims, agent_id).await {
         return StatusCode::FORBIDDEN.into_response();
-    }
-
-    // Same guard as `update_agent`: a coding-agent row must never be (re)deployed onto, including
-    // via rollback.
-    if let Err(r) = CodingAgentGuard::NotDeployable.reject_if(coding_agent_integration_id.is_some())
-    {
-        return r;
     }
 
     let reason = req.as_ref().and_then(|b| b.reason.clone());

@@ -12,7 +12,6 @@ use uuid::Uuid;
 
 use nasiko_runtime::{ContainerId, DeploymentSpec};
 
-use crate::agents::coding_agent::CodingAgentGuard;
 use crate::auth::Claims;
 use crate::state::AppState;
 
@@ -100,8 +99,6 @@ struct AgentDeployInfo {
     writable: bool,
     /// `agents.writable_path` — same carry-forward reasoning as `writable`.
     writable_path: Option<String>,
-    /// `agents.coding_agent_integration_id` — see `CodingAgentGuard::NotDeployable` below.
-    coding_agent_integration_id: Option<String>,
 }
 
 // ─── GET /deployments ────────────────────────────────────────────────────────
@@ -264,7 +261,7 @@ pub(crate) struct RestartDeploymentResponse {
         (status = 200, description = "Restarted", body = RestartDeploymentResponse),
         (status = 403, description = "Caller does not own this deployment"),
         (status = 404, description = "No such deployment"),
-        (status = 409, description = "Deployment is already running or starting, or the agent is a local coding agent — coding_agent_not_deployable"),
+        (status = 409, description = "Deployment is already running or starting"),
     ),
 )]
 pub(crate) async fn restart_deployment(
@@ -280,7 +277,6 @@ pub(crate) async fn restart_deployment(
     // Fetch deployment and agent info together, including stored spec columns.
     let info = match sqlx::query_as::<_, AgentDeployInfo>(
         "SELECT a.name, a.image, a.id as agent_id, a.writable, a.writable_path, a.owner_id,
-                a.coding_agent_integration_id,
                 d.build_id, d.status::text as status,
                 d.spec_ports, d.spec_image, d.k8s_deployment_name
          FROM agent_deployments d
@@ -305,16 +301,6 @@ pub(crate) async fn restart_deployment(
     // is a denial-of-service if granted too broadly.
     if !claims.is_superuser && info.owner_id != user_id {
         return StatusCode::FORBIDDEN.into_response();
-    }
-
-    // A coding-agent row must never be (re)deployed onto — the Docker path below destroys and
-    // recreates the container with no requirement that a live one already exist. A coding-agent
-    // row is otherwise never inserted into `agent_deployments` at all, so this only guards a row
-    // that somehow got one anyway.
-    if let Err(r) =
-        CodingAgentGuard::NotDeployable.reject_if(info.coding_agent_integration_id.is_some())
-    {
-        return r;
     }
 
     // Atomic mark-starting BEFORE touching the runtime: two concurrent restart

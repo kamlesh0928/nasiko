@@ -9,9 +9,6 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::agents::coding_agent::{
-    reject_if_coding_agent_by_owner_and_name, reject_if_coding_agent_by_owner_and_name_tupled,
-};
 use crate::auth::Claims;
 use crate::build::{download_repo_tarball, extract_tar_gzip, is_valid_repo_name};
 use crate::state::AppState;
@@ -208,11 +205,6 @@ pub(crate) async fn build_and_deploy(
     owner_id: Uuid,
     state: &AppState,
 ) -> Result<ImportResult, (StatusCode, String)> {
-    // A coding-agent row must never be deployed onto — checked against this function's own
-    // upsert key, `(owner_id, name)`, before `find_owned_agent` below resolves an `id`. Tupled
-    // error, not `Response`: this function isn't an axum handler itself.
-    reject_if_coding_agent_by_owner_and_name_tupled(&state.db, owner_id, &meta.name).await?;
-
     let image_tag = crate::agents::build_image_tag(
         &state.config.agent_image_registry,
         &meta.name,
@@ -506,7 +498,6 @@ pub(crate) async fn build_and_deploy(
     responses(
         (status = 201, description = "Agent registered, built, and deployed", body = ImportResult),
         (status = 400, description = "Missing package file or invalid archive"),
-        (status = 409, description = "(owner, name) names a local coding agent — coding_agent_not_deployable"),
         (status = 413, description = "Upload exceeds 200 MB limit"),
     ),
 )]
@@ -592,7 +583,6 @@ pub(crate) struct GithubImportRequest {
         (status = 201, description = "Agent registered, built, and deployed", body = ImportResult),
         (status = 400, description = "Invalid repository format or archive"),
         (status = 403, description = "GitHub not connected"),
-        (status = 409, description = "(owner, name) names a local coding agent — coding_agent_not_deployable"),
         (status = 502, description = "Failed to download the repository archive"),
     ),
 )]
@@ -820,7 +810,6 @@ fn validate_registry_host(host: &str, allowed: &[String]) -> Result<(), (StatusC
         (status = 201, description = "Agent registered and deployed", body = ImportResult),
         (status = 400, description = "Invalid reference or oversized blob"),
         (status = 403, description = "Registry import disabled or host not allowed"),
-        (status = 409, description = "(owner, name) names a local coding agent — coding_agent_not_deployable"),
         (status = 422, description = "Registry host not in the allowed list"),
         (status = 502, description = "Registry unreachable or returned an error"),
         (status = 504, description = "docker pull timed out"),
@@ -1022,18 +1011,6 @@ pub(crate) async fn import_registry(
         );
         let image_with_tag = format!("{}:{}", image_ref, tag);
 
-        // Derive agent name from repo
-        let agent_name = repo.rsplit('/').next().unwrap_or("agent").to_string();
-
-        // A coding-agent row must never be deployed onto — checked against this upsert's own
-        // key, `(owner_id, name)`, before the docker pull below, so a rejected import does no
-        // pull work at all.
-        if let Err(r) =
-            reject_if_coding_agent_by_owner_and_name(&state.db, owner_id, &agent_name).await
-        {
-            return r;
-        }
-
         // Use docker pull to fetch the image, bounded by a timeout so a hung/slow
         // registry can't block the handler indefinitely (CAT-5; mirrors the
         // git-clone path which already wraps in tokio::time::timeout).
@@ -1057,6 +1034,9 @@ pub(crate) async fn import_registry(
             }
             Ok(Ok(_)) => {}
         }
+
+        // Derive agent name from repo
+        let agent_name = repo.rsplit('/').next().unwrap_or("agent").to_string();
 
         // Describe the agent from the card the publisher embedded in the
         // manifest. Without this an image import registered a bare name and
