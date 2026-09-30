@@ -469,11 +469,13 @@ async fn restart(
         image: Option<String>,
         writable: bool,
         writable_path: Option<String>,
+        coding_agent_integration_id: Option<String>,
     }
 
     let agent: Option<RestartAgentRow> = if let Ok(id) = name.parse::<Uuid>() {
         sqlx::query_as(
-            "SELECT id, owner_id, image, writable, writable_path FROM agents WHERE id = $1",
+            "SELECT id, owner_id, image, writable, writable_path, coding_agent_integration_id \
+             FROM agents WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&state.db)
@@ -482,7 +484,8 @@ async fn restart(
         .flatten()
     } else {
         sqlx::query_as(
-            "SELECT id, owner_id, image, writable, writable_path FROM agents WHERE name = $1",
+            "SELECT id, owner_id, image, writable, writable_path, coding_agent_integration_id \
+             FROM agents WHERE name = $1",
         )
         .bind(&name)
         .fetch_optional(&state.db)
@@ -497,6 +500,7 @@ async fn restart(
         image,
         writable,
         writable_path,
+        coding_agent_integration_id,
     }) = agent
     else {
         return (StatusCode::NOT_FOUND, "agent not found").into_response();
@@ -504,6 +508,16 @@ async fn restart(
 
     if !crate::acl::can_manage_agent(&state, &claims, agent_id).await {
         return StatusCode::FORBIDDEN.into_response();
+    }
+
+    // A coding-agent row must never be (re)deployed onto (Task 1.6, spec §16 A4) — restart reads
+    // `agents.image` and calls `state.runtime.deploy` below with no requirement that a live
+    // container already exist, so without this check it's a second, image-agnostic way to put a
+    // real container behind a row the MCP gateway still resolves to its owner with no flow.
+    if let Err(r) = crate::agents::coding_agent::CodingAgentGuard::NotDeployable
+        .reject_if(coding_agent_integration_id.is_some())
+    {
+        return r;
     }
 
     let image = match image {

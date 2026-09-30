@@ -1,9 +1,10 @@
 //! Startup reconciliation: redeploys any agent whose DB row says
 //! `status = 'running'` but has no live runtime resource — e.g. after a
 //! tenant cluster restore recreates the database and rustfs/registry data
-//! but not the Kubernetes Deployments/Services (the restore path only restarts
-//! `nasiko-server` itself; it never touches individual agent workloads — this
-//! closes that gap from the side that actually has the runtime handle).
+//! but not the Kubernetes Deployments/Services (`ee/multi-tenant`'s
+//! `BackupOrchestrator::do_start` only restarts `nasiko-server` itself; it
+//! never touches individual agent workloads — this closes that gap from the
+//! side that actually has the runtime handle).
 //!
 //! General-purpose, not restore-specific: this also repairs any cluster
 //! whose deployments were wiped by drift outside a restore. Mirrors
@@ -34,9 +35,16 @@ struct ReconcilableAgent {
 /// already pays the same per-agent cost for the (usually much smaller) seed
 /// list on every boot.
 pub async fn reconcile_agents_on_startup(state: &AppState) {
+    // `AND coding_agent_integration_id IS NULL` — a CLI-bound coding-agent row must never be
+    // deployed onto (Task 1.6, spec §16 A4). Without this, a row that somehow ended up with
+    // `status = 'running'` and a non-NULL `image` (the write-side guards elsewhere in this task
+    // close every route that could set that combination, but this SELECT is the last line of
+    // defense against any that don't) would get a real container behind it on every boot, no
+    // request/response cycle involved to check against at all.
     let agents = match sqlx::query_as::<_, ReconcilableAgent>(
         "SELECT id, name, image, owner_id, writable, writable_path FROM agents \
-         WHERE status = 'running' AND deleted_at IS NULL AND image IS NOT NULL",
+         WHERE status = 'running' AND deleted_at IS NULL AND image IS NOT NULL \
+           AND coding_agent_integration_id IS NULL",
     )
     .fetch_all(&state.db)
     .await

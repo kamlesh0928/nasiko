@@ -265,6 +265,57 @@ async fn restart_allows_superuser() {
     s.server.cleanup().await;
 }
 
+/// Task 1.6 (spec §16 A4): restart reads `agents.image` and redeploys with no requirement that a
+/// live container already exist — a second, image-agnostic way to put a real container behind a
+/// coding-agent row (the first being `PUT /api/agents/{id}/update`'s upsert). Must 409 even for
+/// the row's own owner.
+#[tokio::test]
+#[serial]
+async fn restart_rejects_coding_agent_row_but_not_a_normal_one() {
+    let (s, agent_id) = Scenario::setup("restart-coding-agent").await;
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(agent_id)
+        .execute(&s.server.db)
+        .await
+        .unwrap();
+    let path = s.server.url("/api/containers/restart-coding-agent/restart");
+
+    let res = s
+        .as_owner(s.server.client.post(&path))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        409,
+        "the owner must not be able to restart-redeploy their own coding-agent row"
+    );
+    let text = res.text().await.unwrap();
+    assert!(
+        text.contains("coding_agent_not_deployable"),
+        "expected coding_agent_not_deployable, got: {text}"
+    );
+
+    // Control: an ordinary agent in the same test still restarts as today.
+    let normal_name = "restart-coding-agent-normal-sibling";
+    seed_agent(&s.server, s.owner_id, normal_name).await;
+    let normal_path = s
+        .server
+        .url(&format!("/api/containers/{normal_name}/restart"));
+    let normal_res = s
+        .as_owner(s.server.client.post(&normal_path))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        normal_res.status(),
+        200,
+        "a normal (non-coding) agent must be unaffected"
+    );
+
+    s.server.cleanup().await;
+}
+
 /// A name with no catalog entry has no owner to check an ACL against — see
 /// `25abcbf fix: remove ACL-bypassing raw-ID fallback from container
 /// restart`, which removed the old raw-container-ID fallback (any deployer

@@ -909,6 +909,7 @@ async fn record_version_change_if_needed(
         (status = 200, description = "Updated agent", body = Agent),
         (status = 403, description = "Caller cannot manage this agent"),
         (status = 404, description = "No agent with this id"),
+        (status = 409, description = "Agent is a local coding agent and the body would deploy onto it — coding_agent_not_deployable"),
     ),
 )]
 pub(crate) async fn update(
@@ -920,6 +921,29 @@ pub(crate) async fn update(
     // Mutation → owner-or-superuser only (an invoke/public grant must not confer edit).
     if !crate::acl::can_manage_agent(&state, &claims, id).await {
         return StatusCode::FORBIDDEN.into_response();
+    }
+
+    // A coding-agent row must never be deployed onto (Task 1.6, spec §16 A4) — but plain
+    // metadata edits (name, description, tags, ...) are legitimate even for a coding agent, so
+    // this only rejects when the body actually carries a deploy signal: a new `image`, a raw
+    // `status` write (which could otherwise plant `status = 'running'` for
+    // `reconcile_agents_on_startup` to redeploy on the next boot), or an `activate_version` this
+    // agent's version history would actually record (meaningless without `version` — see
+    // `record_version_change_if_needed`'s own early return). `body.activate_version` defaults to
+    // `true` when omitted, so it's gated on `body.version.is_some()` too, or every metadata-only
+    // update would trip this.
+    let would_deploy = body.image.is_some()
+        || body.status.is_some()
+        || (body.activate_version && body.version.is_some());
+    if would_deploy
+        && let Err(r) = crate::agents::coding_agent::reject_if_coding_agent(
+            &state.db,
+            id,
+            crate::agents::coding_agent::CodingAgentGuard::NotDeployable,
+        )
+        .await
+    {
+        return r;
     }
 
     let mut tx = match state.db.begin().await {

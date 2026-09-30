@@ -990,3 +990,118 @@ async fn coding_agent_registration_is_server_managed_idempotent_and_conflict_saf
 
     server.cleanup().await;
 }
+
+/// Task 1.6 (spec §16 A4): `PUT /api/agents/{id}` must keep ordinary metadata edits working for
+/// a coding agent's owner (name/description/tags/... are legitimate — the row is still a real
+/// catalog entry, just not a deployable one) while rejecting any body that would actually deploy
+/// onto it: a new `image`, a raw `status` write (which could otherwise plant `status = 'running'`
+/// for `reconcile_agents_on_startup` to pick up and redeploy on the next boot), or an
+/// `activate_version` paired with a `version`.
+#[tokio::test]
+#[serial]
+async fn update_rejects_deploy_fields_on_coding_agent_row_but_allows_metadata() {
+    let server = common::TestServer::start().await;
+    let admin = init_admin(&server).await;
+    let uid = admin["user_id"].as_str().unwrap();
+
+    let coding_agent = create_agent(
+        &server,
+        uid,
+        json!({"name": "update-coding-agent", "version": "1.0.0"}),
+    )
+    .await;
+    let coding_id = coding_agent["id"].as_str().unwrap();
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(coding_id).unwrap())
+        .execute(&server.db)
+        .await
+        .unwrap();
+
+    // Metadata-only edit must still succeed for the owner.
+    let metadata_res = common::as_superuser(
+        server
+            .client
+            .put(server.url(&format!("/api/agents/{coding_id}"))),
+        uid,
+        "admin",
+    )
+    .json(&json!({"description": "a local coding agent"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        metadata_res.status(),
+        200,
+        "a metadata-only edit must still work for the coding agent's owner"
+    );
+
+    // An `image` write must be rejected, and the row's image must stay untouched.
+    let image_res = common::as_superuser(
+        server
+            .client
+            .put(server.url(&format!("/api/agents/{coding_id}"))),
+        uid,
+        "admin",
+    )
+    .json(&json!({"image": "attacker/image:evil"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(image_res.status(), 409);
+    let text = image_res.text().await.unwrap();
+    assert!(
+        text.contains("coding_agent_not_deployable"),
+        "expected coding_agent_not_deployable, got: {text}"
+    );
+    let image_after: Option<String> = sqlx::query_scalar("SELECT image FROM agents WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(coding_id).unwrap())
+        .fetch_one(&server.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        image_after, None,
+        "image must be unchanged by the rejected update"
+    );
+
+    // A raw `status` write must be rejected too (it could otherwise plant `status = 'running'`
+    // for reconcile to pick up on the next boot).
+    let status_res = common::as_superuser(
+        server
+            .client
+            .put(server.url(&format!("/api/agents/{coding_id}"))),
+        uid,
+        "admin",
+    )
+    .json(&json!({"status": "running"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(status_res.status(), 409);
+
+    // Control: an ordinary agent's `image`/`status` update in the same test still gets through.
+    let normal_agent = create_agent(
+        &server,
+        uid,
+        json!({"name": "update-normal-agent", "version": "1.0.0"}),
+    )
+    .await;
+    let normal_id = normal_agent["id"].as_str().unwrap();
+    let normal_res = common::as_superuser(
+        server
+            .client
+            .put(server.url(&format!("/api/agents/{normal_id}"))),
+        uid,
+        "admin",
+    )
+    .json(&json!({"image": "owner/image:1.0.0", "status": "running"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        normal_res.status(),
+        200,
+        "a normal agent's update must be unaffected"
+    );
+
+    server.cleanup().await;
+}
