@@ -84,9 +84,10 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
     let body = plugin_body(&nasiko, &state.binding.cluster_url, mcp_credential);
     if let Err(error) = install_artifacts(&state_path(), &plugin_path, &state, body.as_bytes()) {
         // A failed install rolls back to whatever plugin/state existed before this call. When
-        // that's this *same* agent's own previous connection and it had an MCP credential, the
-        // mint above already replaced that credential's row server-side (mint upserts, replacing
-        // the stored hash) even though nothing here ends up using the freshly minted token —
+        // that's this *same* agent's own previous connection and it had an MCP credential, and a
+        // credential was minted this time, the mint above already replaced that credential's row
+        // server-side (mint upserts, replacing the stored hash) even though nothing here ends up
+        // using the freshly minted token —
         // revoking it as "unused" would finish the job and kill the *old* token the restored
         // plugin still embeds, before its rotation grace window would otherwise have let it keep
         // working. So: warn instead of revoke in that one case. Every other case (a fresh
@@ -105,7 +106,7 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
                 &prepared.binding.agent_id,
             );
         }
-        if reconnect_shares_the_restored_credential {
+        if mcp_credential.is_some() && reconnect_shares_the_restored_credential {
             eprintln!(
                 "warning: OpenCode reconnect failed; the previous MCP gateway credential may need a fresh `nasiko connect opencode` before its rotation grace window lapses"
             );
@@ -183,8 +184,9 @@ fn previous_mcp_credential_is_orphaned(
 /// agent's previous connection had a credential installed. Used to decide whether the freshly
 /// minted (but now unused, since the install failed) credential for that agent is safe to revoke
 /// — it is not: the mint already replaced the row's stored hash, so revoking on top of that would
-/// delete the row the still-embedded old token needs in order to keep authenticating during its
-/// rotation grace window.
+/// tombstone the row (set `revoked_at`, clear the previous hash) that the still-embedded old token
+/// needs in order to keep authenticating during its rotation grace window. Without a mint there
+/// is nothing to revoke and nothing to warn about.
 fn failed_reconnect_shares_the_restored_credential(
     previous: &ConnectionState,
     new_agent_id: &str,
