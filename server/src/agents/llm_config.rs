@@ -49,7 +49,9 @@ pub fn router() -> Router<AppState> {
 
 /// Resolve the agent's owner, enforcing owner-only (superuser override) access for
 /// llm-config read/write. `Err` is a ready-to-return response (404 unknown / 403 not owner).
-#[allow(clippy::result_large_err)]
+///
+/// A lookup failure is a 500, not a 404: a DB blip must not tell the caller
+/// "no such agent" when the real answer is "couldn't check".
 async fn agent_owner_or_reject(
     db: &sqlx::PgPool,
     agent_id: Uuid,
@@ -61,8 +63,14 @@ async fn agent_owner_or_reject(
             .bind(agent_id)
             .fetch_optional(db)
             .await
-            .ok()
-            .flatten();
+            .map_err(|error| {
+                tracing::error!(%error, %agent_id, "agent owner lookup failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to resolve agent owner",
+                )
+                    .into_response()
+            })?;
     match owner {
         None => Err((StatusCode::NOT_FOUND, "agent not found").into_response()),
         Some(o) if o != user_id && !is_superuser => {
@@ -72,23 +80,18 @@ async fn agent_owner_or_reject(
     }
 }
 
-/// Same resolution as [`agent_owner_or_reject`], but rejects every non-owner
-/// outright — including a superuser, who that function alone would let
-/// through. Credential-issuing endpoints (LLM routing token, MCP gateway
-/// token) are strictly owner-only: a superuser can administer the agent but
-/// must not be able to mint a credential that impersonates it.
-#[allow(clippy::result_large_err)]
-async fn strictly_owner_or_reject(
+/// Owner-only, no superuser override: rejects every non-owner outright,
+/// including a superuser, who [`agent_owner_or_reject`] alone would let
+/// through. Credential-issuing endpoints (LLM routing token, on-demand MCP
+/// gateway token) need this: a superuser can administer the agent but must
+/// not be able to mint a credential that impersonates it.
+async fn require_owner(
     db: &sqlx::PgPool,
     agent_id: Uuid,
     user_id: Uuid,
-    is_superuser: bool,
-) -> Result<Uuid, axum::response::Response> {
-    let owner = agent_owner_or_reject(db, agent_id, user_id, is_superuser).await?;
-    if owner != user_id {
-        return Err((StatusCode::FORBIDDEN, "not the agent owner").into_response());
-    }
-    Ok(owner)
+) -> Result<(), axum::response::Response> {
+    agent_owner_or_reject(db, agent_id, user_id, false).await?;
+    Ok(())
 }
 
 #[derive(Serialize, ToSchema)]
@@ -128,11 +131,9 @@ pub(crate) async fn issue_llm_token(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    let owner =
-        match strictly_owner_or_reject(&state.db, agent_id, user_id, claims.is_superuser).await {
-            Ok(owner) => owner,
-            Err(resp) => return resp,
-        };
+    if let Err(resp) = require_owner(&state.db, agent_id, user_id).await {
+        return resp;
+    }
 
     let cfg = GatewayConfig::from_env();
     if cfg.agent_jwt_secret.is_empty() {
@@ -144,7 +145,7 @@ pub(crate) async fn issue_llm_token(
     }
     let token = match mint_agent_token(
         &agent_id.to_string(),
-        &owner.to_string(),
+        &user_id.to_string(),
         &cfg.agent_jwt_secret,
         LOCAL_ROUTING_TOKEN_TTL_SECONDS,
         parse_algorithm(&cfg.agent_jwt_algorithm),
@@ -160,24 +161,26 @@ pub(crate) async fn issue_llm_token(
         }
     };
     let expires_at = Utc::now() + Duration::seconds(LOCAL_ROUTING_TOKEN_TTL_SECONDS as i64);
-    let mut response = ApiResponse::ok(
-        json!(LlmTokenResponse { token, expires_at }),
-        "LLM routing token issued successfully",
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        ApiResponse::ok(
+            json!(LlmTokenResponse { token, expires_at }),
+            "LLM routing token issued successfully",
+        ),
     )
-    .into_response();
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
-    response
+        .into_response()
 }
 
 #[derive(Serialize, ToSchema)]
 pub(crate) struct McpTokenResponse {
+    /// The plaintext gateway credential, returned exactly once — store it,
+    /// the control plane keeps only its hash.
     token: String,
     /// The platform's configured public gateway URL, or `null` when unset.
     gateway_url: Option<String>,
     /// `{gateway_url}/s/{token}` — the credential-bearing URL form for MCP
-    /// clients that accept only a `url`, or `null` when `gateway_url` is unset.
+    /// clients that accept only a `url`, or `null` when `gateway_url` is
+    /// unset. This URL is itself a secret: handle it exactly like `token`.
     connect_url: Option<String>,
 }
 
@@ -189,12 +192,20 @@ pub(crate) struct McpTokenEnvelope {
     message: String,
 }
 
-/// Mint (rotate) the agent's MCP gateway credential for a local process — the
-/// same credential a deployed container receives as `MCP_GATEWAY_TOKEN` at
-/// deploy time (`mcp::wiring::inject_agent_gateway_token`). Lets a local
-/// coding agent (Claude Code / Codex / OpenCode, bound via `nasiko connect`),
-/// which is never deployed and so never receives one automatically, reach
-/// `/api/mcp`. Owner-only.
+/// Mint (rotate) a local process's MCP gateway credential.
+///
+/// The same credential a deployed container receives as `MCP_GATEWAY_TOKEN`
+/// at deploy time (`mcp::wiring::inject_agent_gateway_token`), minted here on
+/// demand for a local coding agent (Claude Code / Codex / OpenCode, bound via
+/// `nasiko connect`), which is never deployed and so never receives one
+/// automatically. Owner-only, and restricted to CLI-bound rows
+/// (`coding_agent_integration_id` set): minting for a deployed agent would
+/// leave its running container(s) holding a token the row stops recognizing
+/// once the rotation grace window lapses, with no way to hand them the new
+/// one short of a redeploy. Rotation keeps that same grace window
+/// (`nasiko_mcp_gateway::agent_tokens::ROTATION_GRACE_SECS`): the previous
+/// token keeps authenticating for a while after a re-mint, so POST alone does
+/// not immediately cut off a leaked credential — use `DELETE` for that.
 #[utoipa::path(
     post,
     path = "/api/agents/{id}/mcp-token",
@@ -204,6 +215,7 @@ pub(crate) struct McpTokenEnvelope {
         (status = 200, description = "MCP gateway credential (plaintext, shown once)", body = McpTokenEnvelope),
         (status = 403, description = "Caller is not the agent owner"),
         (status = 404, description = "No such agent"),
+        (status = 409, description = "Not a CLI-bound coding-agent row — a deployed agent's credential rotates on redeploy instead"),
     ),
 )]
 pub(crate) async fn issue_mcp_token(
@@ -215,10 +227,20 @@ pub(crate) async fn issue_mcp_token(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    if let Err(resp) =
-        strictly_owner_or_reject(&state.db, agent_id, user_id, claims.is_superuser).await
-    {
+    if let Err(resp) = require_owner(&state.db, agent_id, user_id).await {
         return resp;
+    }
+
+    match is_coding_agent(&state.db, agent_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::CONFLICT,
+                "not a local coding agent: a deployed agent's credential rotates on redeploy",
+            )
+                .into_response();
+        }
+        Err(resp) => return resp,
     }
 
     let token = match nasiko_mcp_gateway::agent_tokens::mint(&state.db, agent_id).await {
@@ -232,29 +254,65 @@ pub(crate) async fn issue_mcp_token(
                 .into_response();
         }
     };
-    let gateway_url = state.config.mcp_gateway_public_url.clone();
+    let gateway_url = state
+        .config
+        .mcp_gateway_public_url
+        .as_deref()
+        .map(|url| url.trim_end_matches('/').to_string());
     let connect_url = gateway_url
         .as_deref()
         .map(|url| nasiko_mcp_gateway::injector::connect_url(url, &token));
-    let mut response = ApiResponse::ok(
-        json!(McpTokenResponse {
-            token,
-            gateway_url,
-            connect_url,
-        }),
-        "MCP gateway token issued successfully",
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        ApiResponse::ok(
+            json!(McpTokenResponse {
+                token,
+                gateway_url,
+                connect_url,
+            }),
+            "MCP gateway token issued successfully",
+        ),
     )
-    .into_response();
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
-    response
+        .into_response()
 }
 
-/// Revoke every gateway credential of the agent — the live one and any
-/// grace-window predecessor (`nasiko_mcp_gateway::agent_tokens::revoke`).
-/// Owner-only. Idempotent: revoking an agent with no live credential still
-/// answers 204.
+/// `Ok(true)`/`Ok(false)` for whether the (already ownership-checked) agent
+/// is a CLI-bound coding-agent row; `Err` is a ready-to-return 500 on a
+/// lookup failure. Deliberately keyed on `coding_agent_integration_id IS NOT
+/// NULL` — the same column `oss/llm-router/src/resolver/mod.rs` and the MCP
+/// gateway's own rule 3b (`oss/server/src/mcp/handlers/gateway.rs`) read —
+/// never agent metadata or name, so all three agree on which rows this
+/// policy covers.
+async fn is_coding_agent(
+    db: &sqlx::PgPool,
+    agent_id: Uuid,
+) -> Result<bool, axum::response::Response> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT coding_agent_integration_id IS NOT NULL FROM agents WHERE id = $1",
+    )
+    .bind(agent_id)
+    .fetch_one(db)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %agent_id, "coding-agent lookup failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to check agent type",
+        )
+            .into_response()
+    })
+}
+
+/// Revoke a local process's MCP gateway credential.
+///
+/// Kills every gateway credential of the agent — the live one and any
+/// grace-window predecessor (`nasiko_mcp_gateway::agent_tokens::revoke`) —
+/// immediately, with none of POST's rotation grace. A superuser may call this
+/// on any agent: revoking grants nothing, so unlike minting it cannot
+/// impersonate the agent. Idempotent: revoking an agent with no live
+/// credential still answers 204. For a deployed agent this leaves it 401ing
+/// at `/api/mcp` until its next redeploy re-mints a credential — the
+/// documented recovery.
 #[utoipa::path(
     delete,
     path = "/api/agents/{id}/mcp-token",
@@ -262,7 +320,7 @@ pub(crate) async fn issue_mcp_token(
     params(("id" = Uuid, Path, description = "Agent id")),
     responses(
         (status = 204, description = "Credential revoked"),
-        (status = 403, description = "Caller is not the agent owner"),
+        (status = 403, description = "Caller is neither the agent owner nor a superuser"),
         (status = 404, description = "No such agent"),
     ),
 )]
@@ -276,7 +334,7 @@ pub(crate) async fn revoke_mcp_token(
         Err(e) => return e.into_response(),
     };
     if let Err(resp) =
-        strictly_owner_or_reject(&state.db, agent_id, user_id, claims.is_superuser).await
+        agent_owner_or_reject(&state.db, agent_id, user_id, claims.is_superuser).await
     {
         return resp;
     }

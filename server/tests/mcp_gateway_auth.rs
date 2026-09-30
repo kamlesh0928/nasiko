@@ -841,12 +841,17 @@ async fn a_body_over_the_raised_limit_is_413() {
 //
 // A local coding agent (Claude Code / Codex / OpenCode, bound via `nasiko
 // connect`) is never deployed, so it never receives a credential through
-// deploy-time wiring (`mcp::wiring::inject_agent_gateway_token`). These two
-// verbs mint (rotate) and revoke that same `agent_gateway_tokens` credential
-// on demand, owner-only, so a local process can authenticate at `/api/mcp`
-// exactly like a deployed container does.
+// deploy-time wiring (`mcp::wiring::inject_agent_gateway_token`). `POST`
+// mints (rotates) that same `agent_gateway_tokens` credential on demand, but
+// only for a CLI-bound row (`coding_agent_integration_id` set): minting for a
+// deployed agent would leave its running container(s) holding a token the
+// row stops recognizing once the rotation grace window elapses, with no way
+// to hand them the new one short of a redeploy. Rotation keeps that same
+// grace window, so `POST` alone does not cut off a leaked credential —
+// that's what `DELETE` is for: a general kill switch, superuser included
+// (revoking grants nothing, unlike minting), effective immediately.
 
-async fn mint_mcp_token(server: &TestServer, jwt: &str, agent_id: Uuid) -> reqwest::Response {
+async fn post_mcp_token(server: &TestServer, jwt: &str, agent_id: Uuid) -> reqwest::Response {
     server
         .client
         .post(server.url(&format!("/api/agents/{agent_id}/mcp-token")))
@@ -857,11 +862,7 @@ async fn mint_mcp_token(server: &TestServer, jwt: &str, agent_id: Uuid) -> reqwe
         .unwrap()
 }
 
-async fn revoke_mcp_token_http(
-    server: &TestServer,
-    jwt: &str,
-    agent_id: Uuid,
-) -> reqwest::Response {
+async fn delete_mcp_token(server: &TestServer, jwt: &str, agent_id: Uuid) -> reqwest::Response {
     server
         .client
         .delete(server.url(&format!("/api/agents/{agent_id}/mcp-token")))
@@ -871,15 +872,40 @@ async fn revoke_mcp_token_http(
         .unwrap()
 }
 
+/// `post_mcp_token`, asserting the mint succeeded, then extracting just the
+/// plaintext token — for tests that only need to use the token afterward,
+/// not inspect the rest of the response.
+async fn mint_token(server: &TestServer, jwt: &str, agent_id: Uuid) -> String {
+    let res = post_mcp_token(server, jwt, agent_id).await;
+    assert_eq!(res.status(), 200, "mint must succeed");
+    let body: serde_json::Value = res.json().await.unwrap();
+    body["data"]["token"]
+        .as_str()
+        .expect("token present")
+        .to_owned()
+}
+
+/// Stamp the row as CLI-bound — the predicate `POST /mcp-token` requires
+/// before it will mint (`coding_agent_integration_id IS NOT NULL`, the same
+/// column `oss/llm-router/src/resolver/mod.rs` and the gateway's rule 3b read).
+async fn mark_coding_agent(server: &TestServer, agent_id: Uuid) {
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(agent_id)
+        .execute(&server.db)
+        .await
+        .expect("mark coding agent");
+}
+
 #[tokio::test]
 #[serial]
 async fn owner_can_mint_mcp_token_and_it_authenticates_at_the_gateway() {
-    let server = TestServer::start().await;
+    let server = TestServer::start_with(|cfg| cfg.mcp_gateway_public_url = None).await;
     let owner = seed_user(&server, "mcpt-owner-1").await;
     let agent = seed_agent(&server, owner, "mcpt-agent-1").await;
+    mark_coding_agent(&server, agent).await;
     let jwt = common::sign_token(&owner.to_string(), "mcpt-owner-1", false, "member");
 
-    let res = mint_mcp_token(&server, &jwt, agent).await;
+    let res = post_mcp_token(&server, &jwt, agent).await;
     assert_eq!(res.status(), 200);
     assert_eq!(
         res.headers()
@@ -893,8 +919,6 @@ async fn owner_can_mint_mcp_token_and_it_authenticates_at_the_gateway() {
         .expect("token present")
         .to_owned();
     assert!(token.starts_with("ngt_"), "unexpected token shape: {token}");
-    // `TestServer` leaves `mcp_gateway_public_url` unset unless
-    // `TEST_MCP_GATEWAY_PUBLIC_URL` is set, so both derived fields are null.
     assert!(body["data"]["gateway_url"].is_null(), "body: {body}");
     assert!(body["data"]["connect_url"].is_null(), "body: {body}");
 
@@ -912,20 +936,23 @@ async fn mint_returns_connect_url_when_gateway_public_url_is_configured() {
     .await;
     let owner = seed_user(&server, "mcpt-owner-url").await;
     let agent = seed_agent(&server, owner, "mcpt-agent-url").await;
+    mark_coding_agent(&server, agent).await;
     let jwt = common::sign_token(&owner.to_string(), "mcpt-owner-url", false, "member");
 
-    let res = mint_mcp_token(&server, &jwt, agent).await;
+    let res = post_mcp_token(&server, &jwt, agent).await;
     assert_eq!(res.status(), 200);
     let body: serde_json::Value = res.json().await.unwrap();
     let token = body["data"]["token"]
         .as_str()
         .expect("token present")
         .to_owned();
+    // `trim_end_matches` strips every trailing slash, so the configured value
+    // (with one) comes back trimmed — the route itself is `/api/mcp`, not
+    // `/api/mcp/`, which would 404.
     assert_eq!(
-        body["data"]["gateway_url"], "http://gateway.test/api/mcp/",
+        body["data"]["gateway_url"], "http://gateway.test/api/mcp",
         "body: {body}"
     );
-    // The trailing slash is trimmed exactly once before `/s/{token}` is appended.
     assert_eq!(
         body["data"]["connect_url"],
         format!("http://gateway.test/api/mcp/s/{token}"),
@@ -940,23 +967,14 @@ async fn minting_again_rotates_and_the_new_token_works() {
     let server = TestServer::start().await;
     let owner = seed_user(&server, "mcpt-owner-rot").await;
     let agent = seed_agent(&server, owner, "mcpt-agent-rot").await;
+    mark_coding_agent(&server, agent).await;
     let jwt = common::sign_token(&owner.to_string(), "mcpt-owner-rot", false, "member");
 
-    let first: serde_json::Value = mint_mcp_token(&server, &jwt, agent)
-        .await
-        .json()
-        .await
-        .unwrap();
-    let second: serde_json::Value = mint_mcp_token(&server, &jwt, agent)
-        .await
-        .json()
-        .await
-        .unwrap();
-    let first_token = first["data"]["token"].as_str().expect("token present");
-    let second_token = second["data"]["token"].as_str().expect("token present");
+    let first_token = mint_token(&server, &jwt, agent).await;
+    let second_token = mint_token(&server, &jwt, agent).await;
     assert_ne!(first_token, second_token, "minting again must rotate");
 
-    let res = post_mcp(&server, Some(second_token), None, &rpc("initialize")).await;
+    let res = post_mcp(&server, Some(&second_token), None, &rpc("initialize")).await;
     assert_eq!(
         res.status(),
         200,
@@ -967,30 +985,95 @@ async fn minting_again_rotates_and_the_new_token_works() {
 
 #[tokio::test]
 #[serial]
+async fn post_on_a_non_coding_agent_is_409() {
+    // Minting for a deployed agent would leave its running container (or,
+    // under KubeRuntime, every replica) holding a token the row stops
+    // recognizing once the rotation grace window lapses, with no way to hand
+    // it the new one short of a redeploy — POST is for CLI-bound rows only.
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "mcpt-owner-deployed").await;
+    let agent = seed_agent(&server, owner, "mcpt-agent-deployed").await;
+    let deploy_time_token = common::mint_gateway_token(&server.db, agent).await;
+    let jwt = common::sign_token(&owner.to_string(), "mcpt-owner-deployed", false, "member");
+
+    let res = post_mcp_token(&server, &jwt, agent).await;
+    assert_eq!(res.status(), 409);
+    let body = res.text().await.unwrap();
+    assert!(
+        body.contains("not a local coding agent"),
+        "unexpected body: {body}"
+    );
+
+    // The rejected mint must not have touched the row's existing credential.
+    let mcp_res = post_mcp(&server, Some(&deploy_time_token), None, &rpc("initialize")).await;
+    assert_eq!(
+        mcp_res.status(),
+        200,
+        "the existing deploy-time token must still authenticate"
+    );
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
 async fn non_owner_cannot_mint_or_revoke_mcp_token() {
     let server = TestServer::start().await;
     let owner = seed_user(&server, "mcpt-owner-no").await;
     let agent = seed_agent(&server, owner, "mcpt-agent-no").await;
+    mark_coding_agent(&server, agent).await;
+    let owner_jwt = common::sign_token(&owner.to_string(), "mcpt-owner-no", false, "member");
+    let owner_token = mint_token(&server, &owner_jwt, agent).await;
+
     let other = seed_user(&server, "mcpt-other-no").await;
     let other_jwt = common::sign_token(&other.to_string(), "mcpt-other-no", false, "member");
 
-    let res = mint_mcp_token(&server, &other_jwt, agent).await;
+    let res = post_mcp_token(&server, &other_jwt, agent).await;
     assert_eq!(res.status(), 403);
-    let res = revoke_mcp_token_http(&server, &other_jwt, agent).await;
+    let res = delete_mcp_token(&server, &other_jwt, agent).await;
     assert_eq!(res.status(), 403);
 
-    // Owner-only excludes even a superuser who isn't the owner — mirrors
-    // `issue_llm_token`'s policy exactly (see `strictly_owner_or_reject`).
+    // Neither rejected call touched the owner's real credential.
+    let mcp_res = post_mcp(&server, Some(&owner_token), None, &rpc("initialize")).await;
+    assert_eq!(mcp_res.status(), 200, "owner's token must still work");
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn non_owning_superuser_cannot_mint_but_can_revoke_mcp_token() {
+    // Decision: POST stays strictly owner-only (minting would let a
+    // superuser impersonate the agent); DELETE is a kill switch a superuser
+    // may also pull (revoking grants nothing).
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "mcpt-owner-su").await;
+    let agent = seed_agent(&server, owner, "mcpt-agent-su").await;
+    mark_coding_agent(&server, agent).await;
+    let owner_jwt = common::sign_token(&owner.to_string(), "mcpt-owner-su", false, "member");
+    let owner_token = mint_token(&server, &owner_jwt, agent).await;
+
     // Must be a seeded row, not a bare UUID: `validate_session_token` (auth
     // middleware) rejects any session naming a user absent from `users` with
     // 401 before RBAC ever sees the `is_superuser` claim.
-    let superuser = seed_user(&server, "mcpt-super-no").await;
-    let super_jwt = common::sign_token(&superuser.to_string(), "mcpt-super-no", true, "admin");
-    let res = mint_mcp_token(&server, &super_jwt, agent).await;
-    assert_eq!(res.status(), 403);
-    let res = revoke_mcp_token_http(&server, &super_jwt, agent).await;
-    assert_eq!(res.status(), 403);
+    let superuser = seed_user(&server, "mcpt-super-su").await;
+    let super_jwt = common::sign_token(&superuser.to_string(), "mcpt-super-su", true, "admin");
 
+    let res = post_mcp_token(&server, &super_jwt, agent).await;
+    assert_eq!(
+        res.status(),
+        403,
+        "minting stays owner-only even for a superuser"
+    );
+    let mcp_res = post_mcp(&server, Some(&owner_token), None, &rpc("initialize")).await;
+    assert_eq!(
+        mcp_res.status(),
+        200,
+        "the rejected mint must not have touched the owner's real credential"
+    );
+
+    let res = delete_mcp_token(&server, &super_jwt, agent).await;
+    assert_eq!(res.status(), 204, "a superuser may revoke");
+    let mcp_res = post_mcp(&server, Some(&owner_token), None, &rpc("initialize")).await;
+    assert_eq!(mcp_res.status(), 401, "the credential is now revoked");
     server.cleanup().await;
 }
 
@@ -1002,9 +1085,30 @@ async fn unknown_agent_mcp_token_is_404() {
     let jwt = common::sign_token(&user.to_string(), "mcpt-unknown-caller", false, "member");
     let missing = Uuid::new_v4();
 
-    let res = mint_mcp_token(&server, &jwt, missing).await;
+    let res = post_mcp_token(&server, &jwt, missing).await;
     assert_eq!(res.status(), 404);
-    let res = revoke_mcp_token_http(&server, &jwt, missing).await;
+    let res = delete_mcp_token(&server, &jwt, missing).await;
+    assert_eq!(res.status(), 404);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn soft_deleted_agent_mcp_token_is_404() {
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "mcpt-owner-del").await;
+    let agent = seed_agent(&server, owner, "mcpt-agent-del").await;
+    let jwt = common::sign_token(&owner.to_string(), "mcpt-owner-del", false, "member");
+
+    sqlx::query("UPDATE agents SET deleted_at = now() WHERE id = $1")
+        .bind(agent)
+        .execute(&server.db)
+        .await
+        .expect("soft delete");
+
+    let res = post_mcp_token(&server, &jwt, agent).await;
+    assert_eq!(res.status(), 404);
+    let res = delete_mcp_token(&server, &jwt, agent).await;
     assert_eq!(res.status(), 404);
     server.cleanup().await;
 }
@@ -1015,17 +1119,10 @@ async fn owner_can_revoke_mcp_token_and_the_gateway_rejects_it() {
     let server = TestServer::start().await;
     let owner = seed_user(&server, "mcpt-owner-rev").await;
     let agent = seed_agent(&server, owner, "mcpt-agent-rev").await;
+    mark_coding_agent(&server, agent).await;
     let jwt = common::sign_token(&owner.to_string(), "mcpt-owner-rev", false, "member");
 
-    let minted: serde_json::Value = mint_mcp_token(&server, &jwt, agent)
-        .await
-        .json()
-        .await
-        .unwrap();
-    let token = minted["data"]["token"]
-        .as_str()
-        .expect("token present")
-        .to_owned();
+    let token = mint_token(&server, &jwt, agent).await;
     let res = post_mcp(&server, Some(&token), None, &rpc("initialize")).await;
     assert_eq!(
         res.status(),
@@ -1033,14 +1130,41 @@ async fn owner_can_revoke_mcp_token_and_the_gateway_rejects_it() {
         "sanity: freshly minted token authenticates"
     );
 
-    let res = revoke_mcp_token_http(&server, &jwt, agent).await;
+    let res = delete_mcp_token(&server, &jwt, agent).await;
     assert_eq!(res.status(), 204);
 
     let res = post_mcp(&server, Some(&token), None, &rpc("initialize")).await;
     assert_eq!(res.status(), 401, "revoked token must stop authenticating");
 
     // Idempotent: revoking again is still a clean 204, not a 404/500.
-    let res = revoke_mcp_token_http(&server, &jwt, agent).await;
+    let res = delete_mcp_token(&server, &jwt, agent).await;
     assert_eq!(res.status(), 204);
+    server.cleanup().await;
+}
+
+// ─── POST /api/agents/{id}/llm-token — shared owner-gate guard ──────────────
+//
+// `issue_llm_token` shares `require_owner` with `issue_mcp_token`; this one
+// test guards that shared gate stays owner-only even for a superuser, since
+// no other suite in the tree exercises this route.
+
+#[tokio::test]
+#[serial]
+async fn issue_llm_token_rejects_non_owning_superuser() {
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "llmt-owner-su").await;
+    let agent = seed_agent(&server, owner, "llmt-agent-su").await;
+    let superuser = seed_user(&server, "llmt-super-su").await;
+    let super_jwt = common::sign_token(&superuser.to_string(), "llmt-super-su", true, "admin");
+
+    let res = server
+        .client
+        .post(server.url(&format!("/api/agents/{agent}/llm-token")))
+        .bearer_auth(&super_jwt)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403);
     server.cleanup().await;
 }

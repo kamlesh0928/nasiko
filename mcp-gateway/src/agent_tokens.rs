@@ -1,12 +1,18 @@
 //! Per-agent gateway credentials (`MCP_GATEWAY_TOKEN`) — the agent-identity
 //! half of the gateway's two-factor auth (docs/MCP_GATEWAY_AGENT_AUTH.md §2.2).
 //!
-//! Minted at deploy time and injected into the container env; the agent
-//! presents it as `Authorization: Bearer <token>` on every `/api/mcp` call.
-//! Only the SHA-256 hex hash is stored (`agent_gateway_tokens`, mirroring
-//! `oci_pull_credentials`); the plaintext exists solely in the container env.
-//! Every deploy/restart rotates the credential — env vars can't be recovered,
-//! so re-minting on redeploy doubles as free rotation. Destroy tombstones it.
+//! Minted either at deploy time (injected into the container env) or, for a
+//! CLI-bound coding-agent row that is never deployed, on demand by its owner
+//! via `POST /api/agents/{id}/mcp-token` (`oss/server/src/agents/llm_config.rs`).
+//! Either way the agent presents it as `Authorization: Bearer <token>` on
+//! every `/api/mcp` call. Only the SHA-256 hex hash is stored
+//! (`agent_gateway_tokens`, mirroring `oci_pull_credentials`); the plaintext
+//! itself travels once — into the container env at deploy time, or in the
+//! mint response body (and from there into a local MCP client's own config)
+//! for the on-demand path — and is never persisted anywhere else. Every
+//! deploy/restart re-mints and rotates a deployed agent's credential; `DELETE
+//! /api/agents/{id}/mcp-token` is the on-demand row's equivalent kill switch.
+//! Destroy tombstones it either way.
 
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -30,10 +36,14 @@ pub fn hash_token(token: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Mint a fresh gateway token for `agent_id`, superseding any previous one
-/// (rotate-on-deploy: the old plaintext lives only in the container env being
-/// replaced, so there is nothing worth keeping long-term). Returns the plaintext
-/// exactly once — the caller must inject it into the deployment env immediately.
+/// Mint a fresh gateway token for `agent_id`, superseding any previous one —
+/// on redeploy for a deployed agent (the old plaintext lived only in the
+/// container env being replaced, so there is nothing worth keeping
+/// long-term), or on an owner's on-demand `POST /api/agents/{id}/mcp-token`
+/// for a CLI-bound row. Returns the plaintext exactly once: a deploy-time
+/// caller injects it into the deployment env immediately; the on-demand
+/// route instead returns it in the response body, for the caller to drop
+/// into a local MCP client's config.
 ///
 /// The superseded hash is retained as `prev_token_hash` and stays accepted for
 /// [`ROTATION_GRACE_SECS`], because this runs *before* the new workload is known
