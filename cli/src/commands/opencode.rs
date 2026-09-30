@@ -8,8 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::api::Client;
-use crate::commands::coding_agent_router::{self, AgentSpec, ConnectionBinding};
-use crate::config;
+use crate::commands::coding_agent_router::{self, AgentSpec, ConnectionBinding, McpMint};
 
 const ROUTER_VERSION: u32 = 1;
 const ROUTER_PLUGIN: &str = "nasiko-llm-router.js";
@@ -33,7 +32,8 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
         .context("OpenCode is not installed or 'opencode' is not on PATH")?;
     let nasiko = std::env::current_exe().context("cannot locate the nasiko executable")?;
     let plugin_path = config_path().join("plugins").join(ROUTER_PLUGIN);
-    if let Some(previous) = load_state()?
+    let previous_state = load_state()?;
+    if let Some(previous) = &previous_state
         && previous.plugin_path != plugin_path
     {
         bail!(
@@ -57,31 +57,47 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
         nasiko.clone(),
     )?;
     // Minting is a network call layered onto an otherwise local-file install; a failure here
-    // (or an older control plane with no gateway configured) only softens to a status line —
+    // (or an older control plane with no gateway configured) only softens to a warning —
     // OpenCode routing must still connect. The credential is folded into the same generated
     // plugin `install_artifacts` already writes, so a write failure is already the existing
     // full-rollback path below — it also needs to revoke the freshly minted credential, since
     // nothing was left registered to use it.
     let mcp_client = Client::from_cluster_entry_with_timeout(
         &prepared.entry,
-        Some(std::time::Duration::from_secs(10)),
+        Some(coding_agent_router::CP_CALL_TIMEOUT),
     );
-    let mcp_credential = coding_agent_router::mint_mcp_credential_for_connect(
+    let mcp_mint = coding_agent_router::mint_mcp_credential(
         &mcp_client,
         &prepared.binding.agent_id,
+        &prepared.entry.url,
     );
+    let mcp_credential = match &mcp_mint {
+        McpMint::Minted(credential) => Some(credential),
+        McpMint::Unavailable(_) => None,
+    };
     let state = ConnectionState {
         binding: prepared.binding.clone(),
         plugin_path: plugin_path.clone(),
         plugin_version: ROUTER_VERSION,
         mcp_installed: mcp_credential.is_some(),
     };
-    let body = plugin_body(&nasiko, &state.binding.cluster_url, mcp_credential.as_ref());
+    let body = plugin_body(&nasiko, &state.binding.cluster_url, mcp_credential);
     if let Err(error) = install_artifacts(&state_path(), &plugin_path, &state, body.as_bytes()) {
         if mcp_credential.is_some() {
             coding_agent_router::revoke_mcp_credential_best_effort(
                 &mcp_client,
                 &prepared.binding.agent_id,
+            );
+        }
+        // A failed install rolls back to whatever plugin/state existed before this call (the
+        // previous connection's, credential included), so that credential is still in active
+        // use — warn rather than revoke it out from under the restored config.
+        if previous_state
+            .as_ref()
+            .is_some_and(|previous| previous.mcp_installed)
+        {
+            eprintln!(
+                "warning: OpenCode reconnect failed; the previous MCP gateway credential may need a fresh `nasiko connect opencode` before its rotation grace window lapses"
             );
         }
         return match coding_agent_router::rollback_config(&prepared) {
@@ -90,6 +106,19 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
                 "local install failed and the prior Nasiko LLM config could not be restored: {rollback:#}"
             ))),
         };
+    }
+
+    // The new plugin is now live. If this was a reconnect and the previous binding's credential
+    // is no longer referenced by anything local (a different agent, or no MCP block installed
+    // this time), it's orphaned — revoke it rather than leave it live forever.
+    if let Some(previous) = &previous_state
+        && previous_mcp_credential_is_orphaned(
+            previous,
+            &prepared.binding.agent_id,
+            state.mcp_installed,
+        )
+    {
+        coding_agent_router::revoke_bound_mcp_credential_best_effort(&previous.binding);
     }
 
     let provider = prepared
@@ -108,12 +137,35 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
     );
     println!("Routing:          nasiko/router");
     println!("Installed plugin: {}", plugin_path.display());
-    if mcp_credential.is_some() {
-        println!("{}", coding_agent_router::mcp_connected_line());
+    match &mcp_mint {
+        McpMint::Minted(_) => {
+            println!("{}", coding_agent_router::mcp_connected_line());
+            println!("{}", coding_agent_router::mcp_multi_machine_note());
+        }
+        McpMint::Unavailable(message) => {
+            eprintln!(
+                "warning: MCP gateway unavailable ({message}); LLM routing is connected, MCP tools are not"
+            );
+        }
     }
     println!("Restart OpenCode so it loads the new router plugin.");
     println!("Session reporting is separate: nasiko agents install opencode");
     Ok(())
+}
+
+/// Whether reconnecting over an existing OpenCode binding leaves the *previous* connection's MCP
+/// credential referenced by nothing local any more, and so should be revoked: the agent changed
+/// (the new plugin talks to an entirely different row's credential) or the new connect installed
+/// no MCP block at all (mint failed, or the control plane is unreachable) while the old one had
+/// one. Never fires when there was no previous credential to worry about. The caller only asks
+/// this after a successful install — a failed reconnect restores the previous plugin body,
+/// credential included, so revoking here would kill a token still in active use.
+fn previous_mcp_credential_is_orphaned(
+    previous: &ConnectionState,
+    new_agent_id: &str,
+    new_mcp_installed: bool,
+) -> bool {
+    previous.mcp_installed && (previous.binding.agent_id != new_agent_id || !new_mcp_installed)
 }
 
 pub fn disconnect(force: bool) -> Result<()> {
@@ -123,15 +175,7 @@ pub fn disconnect(force: bool) -> Result<()> {
     };
     coding_agent_router::disconnect_preflight("OpenCode", &["opencode"], force)?;
     if state.mcp_installed {
-        match client_for_bound_cluster(&state.binding.cluster) {
-            Ok(client) => coding_agent_router::revoke_mcp_credential_best_effort(
-                &client,
-                &state.binding.agent_id,
-            ),
-            Err(error) => {
-                eprintln!("warning: failed to revoke the MCP gateway credential: {error}")
-            }
-        }
+        coding_agent_router::revoke_bound_mcp_credential_best_effort(&state.binding);
     }
     remove_managed_plugin_or_preserve(&state.plugin_path)?;
     let path = state_path();
@@ -166,6 +210,14 @@ pub fn status() -> Result<()> {
     );
     println!("Router plugin:             {}", plugin_status(&state));
     println!("Provider/model:            nasiko/router");
+    println!(
+        "MCP gateway:               {}",
+        if state.mcp_installed {
+            "configured"
+        } else {
+            "not configured"
+        }
+    );
     println!(
         "OpenCode session reporting: {}",
         crate::commands::integration::reporting_status_for("opencode")?
@@ -263,21 +315,6 @@ fn restore_file(path: &Path, content: Option<&[u8]>) {
     }
 }
 
-/// Resolves a `Client` for a bound cluster from `~/.nasiko/config.json`, independent of whichever
-/// cluster is currently active — the lookup a follow-up call (revoke) needs when all that is on
-/// hand is the connection's own `ConnectionBinding`.
-fn client_for_bound_cluster(cluster: &str) -> Result<Client> {
-    let cfg = config::load()?;
-    let entry = cfg
-        .clusters
-        .get(cluster)
-        .ok_or_else(|| anyhow::anyhow!("Nasiko cluster '{cluster}' no longer exists"))?;
-    Ok(Client::from_cluster_entry_with_timeout(
-        entry,
-        Some(std::time::Duration::from_secs(10)),
-    ))
-}
-
 #[cfg(test)]
 fn remove_managed_plugin(path: &Path) -> Result<()> {
     if !path.exists() {
@@ -364,16 +401,19 @@ fn plugin_body(
     // Emitted only when a credential was minted, so an unconfigured/unreachable control plane
     // produces a plugin with no MCP block at all.
     let mcp_config_block = if mcp_credential.is_some() {
-        r#"      config.mcp ??= {}
-      config.mcp["nasiko"] = {
+        format!(
+            r#"      config.mcp ??= {{}}
+      config.mcp["{name}"] = {{
         type: "remote",
         url: MCP_URL,
-        headers: { Authorization: `Bearer ${MCP_TOKEN}` },
+        headers: {{ Authorization: `Bearer ${{MCP_TOKEN}}` }},
         enabled: true,
-      }
-"#
+      }}
+"#,
+            name = coding_agent_router::MCP_SERVER_NAME
+        )
     } else {
-        ""
+        String::new()
     };
     format!(
         r#"// Managed by nasiko - do not edit. nasiko-router-version: {ROUTER_VERSION}
@@ -469,6 +509,50 @@ mod tests {
             agent_name: "opencode-owner".into(),
             executable: Some(PathBuf::from("/tmp/nasiko")),
         }
+    }
+
+    fn state_with_mcp(agent_id: &str, mcp_installed: bool) -> ConnectionState {
+        ConnectionState {
+            binding: ConnectionBinding {
+                agent_id: agent_id.into(),
+                ..binding()
+            },
+            plugin_path: PathBuf::from("/tmp/plugins/nasiko-llm-router.js"),
+            plugin_version: ROUTER_VERSION,
+            mcp_installed,
+        }
+    }
+
+    #[test]
+    fn reconnect_orphans_the_previous_credential_when_the_agent_changes() {
+        let previous = state_with_mcp("agent-a", true);
+        assert!(previous_mcp_credential_is_orphaned(
+            &previous, "agent-b", true
+        ));
+    }
+
+    #[test]
+    fn reconnect_orphans_the_previous_credential_when_the_new_mint_failed() {
+        let previous = state_with_mcp("agent-a", true);
+        assert!(previous_mcp_credential_is_orphaned(
+            &previous, "agent-a", false
+        ));
+    }
+
+    #[test]
+    fn reconnect_keeps_the_previous_credential_when_nothing_changed() {
+        let previous = state_with_mcp("agent-a", true);
+        assert!(!previous_mcp_credential_is_orphaned(
+            &previous, "agent-a", true
+        ));
+    }
+
+    #[test]
+    fn reconnect_has_nothing_to_orphan_when_the_previous_connection_had_no_credential() {
+        let previous = state_with_mcp("agent-a", false);
+        assert!(!previous_mcp_credential_is_orphaned(
+            &previous, "agent-b", true
+        ));
     }
 
     #[test]

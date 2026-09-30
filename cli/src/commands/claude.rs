@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::api::Client;
-use crate::commands::coding_agent_router::{self, AgentSpec, ConnectionBinding};
-use crate::config;
+use crate::commands::coding_agent_router::{self, AgentSpec, ConnectionBinding, McpMint};
 
 const DEFAULT_AGENT_NAME: &str = "claude-code";
 
@@ -77,16 +76,33 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
     );
     settings.insert("apiKeyHelper".into(), Value::String(helper_command.clone()));
 
-    // Minted before the atomic write below, so `mcp_installed` reflects the real outcome in that
-    // one write rather than needing a second write once client-side registration succeeds.
     let mcp_client = Client::from_cluster_entry_with_timeout(
         &prepared.entry,
-        Some(std::time::Duration::from_secs(10)),
+        Some(coding_agent_router::CP_CALL_TIMEOUT),
     );
-    let mcp_credential = coding_agent_router::mint_mcp_credential_for_connect(
+    let mcp_mint = coding_agent_router::mint_mcp_credential(
         &mcp_client,
         &prepared.binding.agent_id,
+        &prepared.entry.url,
     );
+    // Registered with Claude Code's own `claude mcp` store before the atomic write below, so
+    // `mcp_installed` reflects the real outcome in that one write rather than needing a second
+    // write once client-side registration succeeds. A registration failure (a stale "nasiko"
+    // entry, an enterprise policy block, ...) is treated exactly like a mint failure: best-effort
+    // revoke, record not installed, warn — LLM routing must still connect either way.
+    let (mcp_installed, mcp_warning) = match &mcp_mint {
+        McpMint::Minted(credential) => match run_mcp_add(&claude, credential) {
+            Ok(()) => (true, None),
+            Err(error) => {
+                coding_agent_router::revoke_mcp_credential_best_effort(
+                    &mcp_client,
+                    &prepared.binding.agent_id,
+                );
+                (false, Some(coding_agent_router::one_line_warning(&error)))
+            }
+        },
+        McpMint::Unavailable(message) => (false, Some(message.clone())),
+    };
 
     let state = ConnectionState {
         binding: prepared.binding.clone(),
@@ -95,7 +111,7 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
         original_env_present,
         original_helper,
         original_base_url,
-        mcp_installed: mcp_credential.is_some(),
+        mcp_installed,
     };
     let install_result = (|| -> Result<()> {
         coding_agent_router::atomic_write_json(&state_path(), &state)?;
@@ -106,7 +122,18 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
         Ok(())
     })();
     if let Err(error) = install_result {
-        if mcp_credential.is_some() {
+        if mcp_installed {
+            // The client-side registration above succeeded, but persisting the result did not;
+            // undo the registration too so nothing local is left pointing at the credential the
+            // revoke below is about to kill. Every step here is attempted regardless of whether
+            // an earlier one failed — the caller ends up with LLM routing rolled back either way,
+            // so any partial cleanup miss is worth surfacing rather than swallowing silently.
+            if let Err(error) = run_mcp_remove(&claude) {
+                eprintln!(
+                    "warning: failed to remove the Nasiko MCP server from Claude Code: {}",
+                    coding_agent_router::one_line_warning(&error)
+                );
+            }
             coding_agent_router::revoke_mcp_credential_best_effort(
                 &mcp_client,
                 &prepared.binding.agent_id,
@@ -116,25 +143,6 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
             Ok(()) => Err(error),
             Err(rollback) => Err(error.context(format!(
                 "local install failed and the prior Nasiko LLM config could not be restored: {rollback:#}"
-            ))),
-        };
-    }
-
-    // LLM routing (and, if minted, the state marking MCP installed) are now persisted. Claude
-    // Code's own CLI is the one registration step left, and it is an external process — unwind
-    // everything above if it fails, so a failed connect never leaves LLM routing half up or a
-    // live credential nothing points at.
-    if let Some(credential) = &mcp_credential
-        && let Err(error) = run_mcp_add(&claude, credential)
-    {
-        coding_agent_router::revoke_mcp_credential_best_effort(
-            &mcp_client,
-            &prepared.binding.agent_id,
-        );
-        return match unwind_failed_install(&state, &prepared) {
-            Ok(()) => Err(error),
-            Err(unwind) => Err(error.context(format!(
-                "Claude Code MCP registration failed and the prior install could not be fully unwound: {unwind:#}"
             ))),
         };
     }
@@ -153,25 +161,16 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
         "Connected Claude Code to Nasiko ({}, {provider}/{model}).",
         state.binding.cluster
     );
-    if mcp_credential.is_some() {
+    if mcp_installed {
         println!("{}", coding_agent_router::mcp_connected_line());
+        println!("{}", coding_agent_router::mcp_multi_machine_note());
+    } else if let Some(reason) = &mcp_warning {
+        eprintln!(
+            "warning: MCP gateway unavailable ({reason}); LLM routing is connected, MCP tools are not"
+        );
     }
     println!("Run `claude` normally. Disconnect with: nasiko disconnect claude");
     Ok(())
-}
-
-/// Undoes a fully-persisted install when a step after the atomic write still fails (Claude Code
-/// MCP registration is the only one): restores `settings.json` to what it was before `connect`
-/// touched it, removes the connection state, and rolls back the LLM config on the control plane
-/// — the same three things `disconnect` does, minus the "is Claude Code running" preflight,
-/// since nothing here was ever handed to a live process.
-fn unwind_failed_install(
-    state: &ConnectionState,
-    prepared: &coding_agent_router::PreparedConnection,
-) -> Result<()> {
-    restore_settings(state)?;
-    fs::remove_file(state_path()).context("failed to remove Claude connection state")?;
-    coding_agent_router::rollback_config(prepared)
 }
 
 /// `claude mcp add-json --scope user <name> '<json>'` args: a single JSON argument carries
@@ -215,7 +214,7 @@ fn run_mcp_add(claude: &Path, credential: &coding_agent_router::McpCredential) -
     if !output.status.success() {
         bail!(
             "claude mcp add-json failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            command_error_detail(&output)
         );
     }
     Ok(())
@@ -232,11 +231,33 @@ fn run_mcp_remove(claude: &Path) -> Result<()> {
     if output.status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("No MCP server named") {
+    if is_not_found_output(&String::from_utf8_lossy(&output.stderr))
+        || is_not_found_output(&String::from_utf8_lossy(&output.stdout))
+    {
         return Ok(());
     }
-    bail!("claude mcp remove failed: {}", stderr.trim());
+    bail!(
+        "claude mcp remove failed: {}",
+        command_error_detail(&output)
+    );
+}
+
+/// A `claude mcp` subprocess's error text: stderr when it said anything, else stdout — Claude
+/// Code isn't consistent about which stream carries a given failure.
+fn command_error_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        return stderr.to_string();
+    }
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// True when a `claude mcp remove` failure just means the target was already absent — the
+/// specific message Claude Code exits non-zero with in that case. Checked against both streams
+/// since which one carries it isn't stable across Claude Code versions.
+fn is_not_found_output(output: &str) -> bool {
+    output.contains("No MCP server named")
 }
 
 /// Best-effort MCP gateway teardown for disconnect: removes the client-side registration, then
@@ -251,28 +272,7 @@ fn teardown_mcp_gateway(binding: &ConnectionBinding) {
     if let Err(error) = removal {
         eprintln!("warning: failed to remove the Nasiko MCP server from Claude Code: {error}");
     }
-
-    match client_for_bound_cluster(&binding.cluster) {
-        Ok(client) => {
-            coding_agent_router::revoke_mcp_credential_best_effort(&client, &binding.agent_id);
-        }
-        Err(error) => eprintln!("warning: failed to revoke the MCP gateway credential: {error}"),
-    }
-}
-
-/// Resolves a `Client` for a bound cluster from `~/.nasiko/config.json`, independent of whichever
-/// cluster is currently active — the lookup a follow-up call (revoke) needs when all that is on
-/// hand is the connection's own `ConnectionBinding`, not a freshly `prepare()`d `ClusterEntry`.
-fn client_for_bound_cluster(cluster: &str) -> Result<Client> {
-    let cfg = config::load()?;
-    let entry = cfg
-        .clusters
-        .get(cluster)
-        .ok_or_else(|| anyhow::anyhow!("Nasiko cluster '{cluster}' no longer exists"))?;
-    Ok(Client::from_cluster_entry_with_timeout(
-        entry,
-        Some(std::time::Duration::from_secs(10)),
-    ))
+    coding_agent_router::revoke_bound_mcp_credential_best_effort(binding);
 }
 
 pub fn disconnect(force: bool) -> Result<()> {
@@ -300,8 +300,8 @@ fn disconnect_internal(print: bool, force: bool) -> Result<()> {
 }
 
 /// Restores `settings.json`'s `apiKeyHelper`/`env.ANTHROPIC_BASE_URL` to what `connect` captured
-/// before it touched them, warning instead of clobbering if either changed since connect. Shared
-/// by `disconnect` and `unwind_failed_install`.
+/// before it touched them, warning instead of clobbering if either changed since connect. Used by
+/// `disconnect`.
 fn restore_settings(state: &ConnectionState) -> Result<()> {
     let mut settings = read_json_object(&state.settings_path)?;
     restore_top_level(
@@ -658,9 +658,9 @@ mod tests {
         }
     }
 
-    /// Covers the pure piece of `unwind_failed_install` (used both there and by `disconnect`):
-    /// the shell-out to `claude mcp remove`/`add-json` itself stays untested, since it would
-    /// touch the real Claude Code installation.
+    /// Covers `restore_settings`, used by `disconnect`: the shell-out to `claude mcp
+    /// remove`/`add-json` itself stays untested, since it would touch the real Claude Code
+    /// installation.
     #[test]
     fn restore_settings_writes_back_the_captured_values() {
         let dir = tempfile::tempdir().unwrap();
@@ -724,5 +724,16 @@ mod tests {
             mcp_remove_command(),
             vec!["mcp", "remove", "--scope", "user", "nasiko"]
         );
+    }
+
+    #[test]
+    fn is_not_found_output_recognizes_the_idempotent_case() {
+        assert!(is_not_found_output(
+            "Error: No MCP server named \"nasiko\" in user scope\n"
+        ));
+        assert!(!is_not_found_output(
+            "Error: Cannot remove MCP server: not allowed by enterprise policy\n"
+        ));
+        assert!(!is_not_found_output(""));
     }
 }

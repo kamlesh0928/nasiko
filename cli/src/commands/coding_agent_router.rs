@@ -55,49 +55,55 @@ pub struct RoutingCredential {
 /// The MCP server name each client registers the gateway under.
 pub const MCP_SERVER_NAME: &str = "nasiko";
 
-/// A minted MCP gateway credential. `gateway_url`/`connect_url` are never empty here —
-/// `mcp_credential` turns the wire response's nullable pair into `Ok(None)` up front, so every
-/// caller past that point can rely on both being present without re-checking.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Shared timeout for the short-lived, one-off control-plane calls `connect`/`disconnect` make
+/// outside the main `prepare()` flow (MCP mint/revoke, LLM config rollback): long enough for a
+/// normal request, short enough that a hung server doesn't stall a local install indefinitely.
+pub(crate) const CP_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A minted MCP gateway credential. `token` and `connect_url` are both secrets (the URL embeds
+/// the token), so `Debug` redacts them rather than deriving it.
+#[derive(Clone)]
 pub struct McpCredential {
     pub token: String,
     pub gateway_url: String,
     pub connect_url: String,
 }
 
-/// The wire shape of `POST /api/agents/{id}/mcp-token`'s `data`
-/// (`McpTokenResponse`, `oss/server/src/agents/llm_config.rs`): `gateway_url`/`connect_url` are
-/// null together when the control plane has no public gateway URL configured.
-#[derive(Debug, Deserialize)]
-struct RawMcpCredential {
-    token: String,
-    gateway_url: Option<String>,
-    connect_url: Option<String>,
+impl std::fmt::Debug for McpCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpCredential")
+            .field("token", &"ngt_…<redacted>")
+            .field("gateway_url", &self.gateway_url)
+            .field("connect_url", &"<redacted>")
+            .finish()
+    }
 }
 
-/// Mint the bound agent's MCP gateway credential. `Ok(None)` when the control plane has no
-/// public gateway URL (`gateway_url: null`) — the caller then registers nothing rather than a
-/// dead server entry, and the just-minted, now-unusable credential is revoked here rather than
-/// left live. Errors are the caller's to soften: an older control plane without this route (404)
-/// must not break LLM-routing connect.
-pub fn mcp_credential(client: &Client, agent_id: &str) -> Result<Option<McpCredential>> {
-    let response: Envelope<RawMcpCredential> =
+/// The wire shape of `POST /api/agents/{id}/mcp-token`'s `data` (`McpTokenResponse`,
+/// `oss/server/src/agents/llm_config.rs`) that the CLI actually uses. The response also carries
+/// `gateway_url`/`connect_url`, but those are the URLs told to agent *containers*
+/// (`MCP_GATEWAY_PUBLIC_URL`, e.g. `http://server:8080/api/mcp` or a Docker-internal host — see
+/// `oss/config/src/lib.rs`), unreachable from the developer's own host. `mcp_credential` derives
+/// host-facing URLs from the cluster URL it already used to reach this endpoint instead.
+#[derive(Deserialize)]
+struct RawMcpToken {
+    token: String,
+}
+
+/// Mint the bound agent's MCP gateway credential, using `cluster_url` (the same control-plane URL
+/// this call itself reached) to build `gateway_url`/`connect_url` rather than the response's own
+/// container-facing pair — see `RawMcpToken`. Errors are the caller's to soften: an older control
+/// plane without this route, or any other transport failure, must not break LLM-routing connect.
+pub fn mcp_credential(client: &Client, agent_id: &str, cluster_url: &str) -> Result<McpCredential> {
+    let response: Envelope<RawMcpToken> =
         client.post_json_quiet(&format!("/agents/{agent_id}/mcp-token"), &json!({}))?;
-    let RawMcpCredential {
-        token,
+    let gateway_url = format!("{}/api/mcp", cluster_url.trim_end_matches('/'));
+    let connect_url = compose_connect_url(&gateway_url, &response.data.token);
+    Ok(McpCredential {
+        token: response.data.token,
         gateway_url,
         connect_url,
-    } = response.data;
-    let Some(gateway_url) = gateway_url else {
-        revoke_mcp_credential_best_effort(client, agent_id);
-        return Ok(None);
-    };
-    let connect_url = connect_url.unwrap_or_else(|| compose_connect_url(&gateway_url, &token));
-    Ok(Some(McpCredential {
-        token,
-        gateway_url,
-        connect_url,
-    }))
+    })
 }
 
 /// `{gateway_url}/s/{token}` — mirrors `nasiko_mcp_gateway::injector::connect_url`. Duplicated
@@ -107,48 +113,46 @@ fn compose_connect_url(gateway_url: &str, token: &str) -> String {
     format!("{}/s/{token}", gateway_url.trim_end_matches('/'))
 }
 
-/// Mints the bound agent's MCP gateway credential for `connect`, printing the outcome for every
-/// case the caller does not act on further: `None` back to the caller means print nothing more
-/// and register nothing with the client — either the control plane has no gateway configured (a
-/// status line on stdout) or minting failed (a warning on stderr, matching disconnect's
-/// warnings); LLM routing must still connect either way. `Some` means the caller must still
-/// attempt client-side registration and, on failure, revoke the credential and unwind its own
-/// install.
-pub fn mint_mcp_credential_for_connect(client: &Client, agent_id: &str) -> Option<McpCredential> {
-    match mcp_credential(client, agent_id) {
-        Ok(Some(credential)) => Some(credential),
-        Ok(None) => {
-            println!(
-                "MCP gateway: not configured on this control plane (MCP_GATEWAY_PUBLIC_URL unset); skipping"
-            );
-            None
-        }
-        Err(error) => {
-            eprintln!(
-                "warning: MCP gateway unavailable ({}); LLM routing is connected, MCP tools are not",
-                mcp_mint_error_message(&error)
-            );
-            None
-        }
+/// The outcome of attempting to mint an MCP gateway credential for `connect`: never an error the
+/// caller must propagate, since MCP is optional and LLM-routing connect must proceed either way.
+pub enum McpMint {
+    Minted(McpCredential),
+    Unavailable(String),
+}
+
+/// Mints the bound agent's MCP gateway credential for `connect` without printing anything: each
+/// caller only learns the final, reportable outcome (LLM routing succeeded, and separately
+/// whether MCP client-side registration also succeeded) once its own install has actually
+/// completed, so the status lines belong there — see each `connect`'s final printing.
+pub fn mint_mcp_credential(client: &Client, agent_id: &str, cluster_url: &str) -> McpMint {
+    match mcp_credential(client, agent_id, cluster_url) {
+        Ok(credential) => McpMint::Minted(credential),
+        Err(error) => McpMint::Unavailable(one_line_warning(&error)),
     }
 }
 
-/// A single clean line for `mint_mcp_credential_for_connect`'s warning: a 404 (an older control
-/// plane without this route) gets a purpose-built message; any other error is reduced to its own
-/// top-level line, dropping `check_status`'s per-status-code hint — worded for a direct API
-/// caller, not this best-effort background mint.
-fn mcp_mint_error_message(error: &anyhow::Error) -> String {
-    let message = error.to_string();
-    if message.starts_with("HTTP 404 ") {
-        return "this control plane has no MCP gateway credential endpoint; upgrade it to use MCP tools"
-            .to_string();
-    }
+/// A single line for a `warning:` print: the outermost line of `format!("{error:#}")` — anyhow's
+/// alternate `Display` appends the full cause chain on one line, so a wrapped transport failure
+/// (e.g. `.context("failed to run ...")`) keeps its root cause — with everything after the first
+/// line dropped. In practice the only multi-line message this drops anything from is
+/// `check_status`'s trailing `\nhint: ...`, worded for a direct API caller rather than this
+/// best-effort warning.
+pub fn one_line_warning(error: &anyhow::Error) -> String {
+    let message = format!("{error:#}");
     message.lines().next().unwrap_or(&message).to_string()
 }
 
 /// The line to print once a minted credential has been registered client-side successfully.
 pub fn mcp_connected_line() -> String {
     format!("MCP gateway: connected (server \"{MCP_SERVER_NAME}\")")
+}
+
+/// Printed right after `mcp_connected_line()`: the control plane keeps one MCP gateway credential
+/// per agent row (`nasiko_mcp_gateway::agent_tokens::mint` upserts), so connecting the same agent
+/// from a second machine replaces this one, and disconnecting from either machine revokes it for
+/// both.
+pub fn mcp_multi_machine_note() -> &'static str {
+    "Note: one MCP credential per agent; connecting from another machine replaces it."
 }
 
 /// Revoke the bound agent's MCP gateway credential. The caller softens a failure into a warning.
@@ -162,7 +166,46 @@ pub fn revoke_mcp_credential(client: &Client, agent_id: &str) -> Result<()> {
 /// control plane is reachable.
 pub fn revoke_mcp_credential_best_effort(client: &Client, agent_id: &str) {
     if let Err(error) = revoke_mcp_credential(client, agent_id) {
-        eprintln!("warning: failed to revoke the MCP gateway credential: {error}");
+        eprintln!(
+            "warning: failed to revoke the MCP gateway credential: {}",
+            one_line_warning(&error)
+        );
+    }
+}
+
+/// Resolves a `Client` for `binding`'s cluster from `~/.nasiko/config.json`, independent of
+/// whichever cluster is currently active. Refuses if the alias has since been re-pointed at a
+/// different URL — the same check `credential_from_config` makes — so a stale binding's DELETE
+/// never reaches a server other than the one that issued the credential.
+fn client_for_binding(binding: &ConnectionBinding) -> Result<Client> {
+    let cfg = config::load()?;
+    let entry = cfg
+        .clusters
+        .get(&binding.cluster)
+        .ok_or_else(|| anyhow::anyhow!("Nasiko cluster '{}' no longer exists", binding.cluster))?;
+    if normalize_url(&entry.url) != normalize_url(&binding.cluster_url) {
+        bail!(
+            "Nasiko cluster '{}' URL changed since connect; skipping MCP gateway credential revoke",
+            binding.cluster
+        );
+    }
+    Ok(Client::from_cluster_entry_with_timeout(
+        entry,
+        Some(CP_CALL_TIMEOUT),
+    ))
+}
+
+/// Revokes `binding`'s MCP gateway credential, turning any failure — an unreachable control
+/// plane, a re-pointed cluster alias, ... — into a printed warning rather than propagating it.
+/// Shared by every `disconnect` (Claude, Codex, OpenCode): local cleanup must proceed regardless
+/// of whether the control plane is reachable.
+pub fn revoke_bound_mcp_credential_best_effort(binding: &ConnectionBinding) {
+    match client_for_binding(binding) {
+        Ok(client) => revoke_mcp_credential_best_effort(&client, &binding.agent_id),
+        Err(error) => eprintln!(
+            "warning: failed to revoke the MCP gateway credential: {}",
+            one_line_warning(&error)
+        ),
     }
 }
 
@@ -469,10 +512,7 @@ pub fn rollback_config(prepared: &PreparedConnection) -> Result<()> {
     let Some(previous) = &prepared.previous_llm_config_id else {
         return Ok(());
     };
-    let client = Client::from_cluster_entry_with_timeout(
-        &prepared.entry,
-        Some(std::time::Duration::from_secs(10)),
-    );
+    let client = Client::from_cluster_entry_with_timeout(&prepared.entry, Some(CP_CALL_TIMEOUT));
     let path = format!("/agents/{}/llm-config", prepared.binding.agent_id);
     let _: Value = client.patch_json(&path, &json!({"llm_config_id": previous}))?;
     Ok(())
@@ -503,8 +543,7 @@ fn credential_from_config(binding: &ConnectionBinding, cfg: &Config) -> Result<R
     {
         bail!("Nasiko login changed since connect; reconnect this coding agent");
     }
-    let client =
-        Client::from_cluster_entry_with_timeout(entry, Some(std::time::Duration::from_secs(10)));
+    let client = Client::from_cluster_entry_with_timeout(entry, Some(CP_CALL_TIMEOUT));
     let response: Envelope<RoutingCredential> = client.post_json_quiet(
         &format!("/agents/{}/llm-token", binding.agent_id),
         &json!({}),
@@ -804,7 +843,10 @@ mod tests {
     }
 
     #[test]
-    fn mcp_credential_mints_when_the_gateway_is_configured() {
+    fn mcp_credential_derives_host_facing_urls_from_the_cluster_url_not_the_response() {
+        // The response's own `gateway_url`/`connect_url` are container-facing (told to agent
+        // *containers* via `MCP_GATEWAY_PUBLIC_URL`) and unreachable from this host, so they must
+        // never leak into what the CLI installs — only `token` is trusted from the wire.
         let mut server = mockito::Server::new();
         let request = server
             .mock("POST", "/api/agents/agent/mcp-token")
@@ -812,60 +854,83 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                r#"{"data":{"token":"ngt_abc","gateway_url":"https://cp/api/mcp","connect_url":"https://cp/api/mcp/s/ngt_abc"},"status_code":200,"message":"ok"}"#,
+                r#"{"data":{"token":"ngt_abc","gateway_url":"http://server:8080/api/mcp","connect_url":"http://server:8080/api/mcp/s/ngt_abc"},"status_code":200,"message":"ok"}"#,
             )
             .create();
         let client = Client::for_test(&server.url(), None);
-        let credential = mcp_credential(&client, "agent").unwrap().unwrap();
+        let credential = mcp_credential(&client, "agent", "https://cp.example.com/").unwrap();
         assert_eq!(credential.token, "ngt_abc");
-        assert_eq!(credential.gateway_url, "https://cp/api/mcp");
-        assert_eq!(credential.connect_url, "https://cp/api/mcp/s/ngt_abc");
+        assert_eq!(credential.gateway_url, "https://cp.example.com/api/mcp");
+        assert_eq!(
+            credential.connect_url,
+            "https://cp.example.com/api/mcp/s/ngt_abc"
+        );
         request.assert();
     }
 
     #[test]
-    fn mcp_credential_composes_connect_url_when_the_server_omits_it() {
+    fn mcp_credential_trims_a_trailing_slash_from_the_cluster_url() {
         let mut server = mockito::Server::new();
         server
             .mock("POST", "/api/agents/agent/mcp-token")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                r#"{"data":{"token":"ngt_abc","gateway_url":"https://cp/api/mcp/","connect_url":null}}"#,
-            )
+            .with_body(r#"{"data":{"token":"ngt_abc"}}"#)
             .create();
         let client = Client::for_test(&server.url(), None);
-        let credential = mcp_credential(&client, "agent").unwrap().unwrap();
-        assert_eq!(credential.connect_url, "https://cp/api/mcp/s/ngt_abc");
+        let credential = mcp_credential(&client, "agent", &format!("{}/", server.url())).unwrap();
+        assert_eq!(credential.gateway_url, format!("{}/api/mcp", server.url()));
     }
 
     #[test]
-    fn mcp_credential_revokes_and_returns_none_when_the_gateway_has_no_public_url() {
-        let mut server = mockito::Server::new();
-        server
-            .mock("POST", "/api/agents/agent/mcp-token")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"data":{"token":"ngt_abc","gateway_url":null,"connect_url":null}}"#)
-            .create();
-        let delete = server
-            .mock("DELETE", "/api/agents/agent/mcp-token")
-            .with_status(204)
-            .create();
-        let client = Client::for_test(&server.url(), None);
-        assert!(mcp_credential(&client, "agent").unwrap().is_none());
-        delete.assert();
-    }
-
-    #[test]
-    fn mcp_credential_surfaces_an_older_control_planes_404_as_an_error() {
+    fn mint_reports_the_servers_own_message_on_a_404_with_no_special_casing() {
+        // A modern control plane's only 404 here is "agent not found" — there is no
+        // purpose-built "upgrade" message to special-case. An older control plane without this
+        // route doesn't 404 at all; it falls through into the generic A2A proxy instead (see the
+        // 503 test below), so a bare 404 never needs a translated message.
         let mut server = mockito::Server::new();
         server
             .mock("POST", "/api/agents/agent/mcp-token")
             .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"agent not found"}"#)
             .create();
         let client = Client::for_test(&server.url(), None);
-        assert!(mcp_credential(&client, "agent").is_err());
+        match mint_mcp_credential(&client, "agent", &server.url()) {
+            McpMint::Unavailable(message) => assert_eq!(
+                message,
+                format!(
+                    "HTTP 404 from {}/api/agents/agent/mcp-token: agent not found",
+                    server.url()
+                )
+            ),
+            McpMint::Minted(_) => panic!("expected Unavailable"),
+        }
+    }
+
+    #[test]
+    fn mint_surfaces_a_503_from_an_older_control_planes_a2a_proxy_fallthrough() {
+        // An older control plane without `POST /agents/{id}/mcp-token` doesn't 404: the request
+        // falls into the generic `/api/agents/{id}/*` A2A proxy instead, which answers with its
+        // own error — a 503 here, standing in for "no agent container to proxy this POST to".
+        let mut server = mockito::Server::new();
+        server
+            .mock("POST", "/api/agents/agent/mcp-token")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"agent container unreachable"}"#)
+            .create();
+        let client = Client::for_test(&server.url(), None);
+        match mint_mcp_credential(&client, "agent", &server.url()) {
+            McpMint::Unavailable(message) => assert_eq!(
+                message,
+                format!(
+                    "HTTP 503 from {}/api/agents/agent/mcp-token: agent container unreachable",
+                    server.url()
+                )
+            ),
+            McpMint::Minted(_) => panic!("expected Unavailable"),
+        }
     }
 
     #[test]
@@ -881,31 +946,30 @@ mod tests {
     }
 
     #[test]
-    fn mint_error_message_gives_a_purpose_built_line_for_an_older_control_plane() {
-        let error = anyhow::anyhow!(
-            "HTTP 404 from http://cp/api/agents/a/mcp-token: not found\nhint: resource not found — check the ID or name"
-        );
-        assert_eq!(
-            mcp_mint_error_message(&error),
-            "this control plane has no MCP gateway credential endpoint; upgrade it to use MCP tools"
-        );
-    }
-
-    #[test]
-    fn mint_error_message_drops_the_hint_for_other_status_codes() {
+    fn one_line_warning_drops_the_hint_for_any_status_code() {
         let error = anyhow::anyhow!(
             "HTTP 500 from http://cp/api/agents/a/mcp-token: boom\nhint: server error — check server logs or try again"
         );
         assert_eq!(
-            mcp_mint_error_message(&error),
+            one_line_warning(&error),
             "HTTP 500 from http://cp/api/agents/a/mcp-token: boom"
         );
     }
 
     #[test]
-    fn mint_error_message_passes_through_a_plain_network_failure() {
+    fn one_line_warning_passes_through_a_plain_message() {
         let error = anyhow::anyhow!("cannot reach control plane");
-        assert_eq!(mcp_mint_error_message(&error), "cannot reach control plane");
+        assert_eq!(one_line_warning(&error), "cannot reach control plane");
+    }
+
+    #[test]
+    fn one_line_warning_keeps_the_chained_cause_for_a_wrapped_transport_failure() {
+        let error =
+            anyhow::anyhow!("connection refused").context("failed to run `claude mcp add-json`");
+        assert_eq!(
+            one_line_warning(&error),
+            "failed to run `claude mcp add-json`: connection refused"
+        );
     }
 
     #[test]
