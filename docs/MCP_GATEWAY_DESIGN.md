@@ -738,8 +738,9 @@ No new authentication scheme is introduced for management routes — they reuse 
 | Permission cache TTL | How long a permission context is cached before re-checking | Short — any write-path event invalidates it immediately regardless |
 | Manifest cache TTL | How long a merged tool list is cached | Moderate — bounded by the permission/connector hash changing anyway |
 
-A CLI-bound coding-agent row, which is never deployed, gets this same credential minted on demand
-instead — by its owner, via `POST`/`DELETE /api/agents/{id}/mcp-token`.
+A CLI-bound coding-agent row, which is never deployed, gets the agent gateway token above minted
+on demand instead — minted by its owner via `POST /api/agents/{id}/mcp-token`, revoked by the
+owner or a superuser via `DELETE`.
 
 ---
 

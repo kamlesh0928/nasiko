@@ -1004,6 +1004,14 @@ async fn post_on_a_non_coding_agent_is_409() {
         "unexpected body: {body}"
     );
 
+    // The owner gate runs before the row-type check: a non-owner gets 403, not 409.
+    let other = seed_user(&server, "mcpt-other-deployed").await;
+    let other_jwt = common::sign_token(&other.to_string(), "mcpt-other-deployed", false, "member");
+    assert_eq!(
+        post_mcp_token(&server, &other_jwt, agent).await.status(),
+        403
+    );
+
     // The rejected mint must not have touched the row's existing credential.
     let mcp_res = post_mcp(&server, Some(&deploy_time_token), None, &rpc("initialize")).await;
     assert_eq!(
@@ -1041,9 +1049,9 @@ async fn non_owner_cannot_mint_or_revoke_mcp_token() {
 #[tokio::test]
 #[serial]
 async fn non_owning_superuser_cannot_mint_but_can_revoke_mcp_token() {
-    // Decision: POST stays strictly owner-only (minting would let a
-    // superuser impersonate the agent); DELETE is a kill switch a superuser
-    // may also pull (revoking grants nothing).
+    // POST stays strictly owner-only (minting would let a superuser
+    // impersonate the agent); DELETE is a kill switch a superuser may also
+    // pull (revoking grants nothing).
     let server = TestServer::start().await;
     let owner = seed_user(&server, "mcpt-owner-su").await;
     let agent = seed_agent(&server, owner, "mcpt-agent-su").await;

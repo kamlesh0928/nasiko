@@ -48,7 +48,8 @@ pub fn router() -> Router<AppState> {
 }
 
 /// Resolve the agent's owner, enforcing owner-only (superuser override) access for
-/// llm-config read/write. `Err` is a ready-to-return response (404 unknown / 403 not owner).
+/// llm-config read/write and the mcp-token DELETE. `Err` is a ready-to-return response
+/// (404 unknown / 403 not owner).
 ///
 /// A lookup failure is a 500, not a 404: a DB blip must not tell the caller
 /// "no such agent" when the real answer is "couldn't check".
@@ -303,7 +304,7 @@ async fn is_coding_agent(
     })
 }
 
-/// Revoke a local process's MCP gateway credential.
+/// Revoke the agent's MCP gateway credential.
 ///
 /// Kills every gateway credential of the agent — the live one and any
 /// grace-window predecessor (`nasiko_mcp_gateway::agent_tokens::revoke`) —
