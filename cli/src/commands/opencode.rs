@@ -21,8 +21,9 @@ struct ConnectionState {
     binding: ConnectionBinding,
     plugin_path: PathBuf,
     plugin_version: u32,
-    /// Whether the generated plugin embeds an MCP gateway credential. `false` for connections
-    /// made before this field existed, and for a control plane with no public gateway URL.
+    /// Whether the generated plugin embeds an MCP gateway credential. Older state files omit
+    /// this field; absent means not installed, matching a control plane with no public gateway
+    /// URL.
     #[serde(default)]
     mcp_installed: bool,
 }
@@ -61,7 +62,14 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
     // plugin `install_artifacts` already writes, so a write failure is already the existing
     // full-rollback path below — it also needs to revoke the freshly minted credential, since
     // nothing was left registered to use it.
-    let (mcp_credential, mcp_line) = mint_mcp_credential(&prepared);
+    let mcp_client = Client::from_cluster_entry_with_timeout(
+        &prepared.entry,
+        Some(std::time::Duration::from_secs(10)),
+    );
+    let mcp_credential = coding_agent_router::mint_mcp_credential_for_connect(
+        &mcp_client,
+        &prepared.binding.agent_id,
+    );
     let state = ConnectionState {
         binding: prepared.binding.clone(),
         plugin_path: plugin_path.clone(),
@@ -71,11 +79,10 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
     let body = plugin_body(&nasiko, &state.binding.cluster_url, mcp_credential.as_ref());
     if let Err(error) = install_artifacts(&state_path(), &plugin_path, &state, body.as_bytes()) {
         if mcp_credential.is_some() {
-            let client = Client::from_cluster_entry_with_timeout(
-                &prepared.entry,
-                Some(std::time::Duration::from_secs(10)),
+            coding_agent_router::revoke_mcp_credential_best_effort(
+                &mcp_client,
+                &prepared.binding.agent_id,
             );
-            let _ = coding_agent_router::revoke_mcp_credential(&client, &prepared.binding.agent_id);
         }
         return match coding_agent_router::rollback_config(&prepared) {
             Ok(()) => Err(error),
@@ -101,42 +108,12 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
     );
     println!("Routing:          nasiko/router");
     println!("Installed plugin: {}", plugin_path.display());
-    println!("{mcp_line}");
+    if mcp_credential.is_some() {
+        println!("{}", coding_agent_router::mcp_connected_line());
+    }
     println!("Restart OpenCode so it loads the new router plugin.");
     println!("Session reporting is separate: nasiko agents install opencode");
     Ok(())
-}
-
-/// Mints the MCP gateway credential for this connection. Returns the status line the caller
-/// prints alongside the LLM-routing success message; `Some` means the caller must fold the
-/// credential into the plugin template it is about to generate.
-fn mint_mcp_credential(
-    prepared: &coding_agent_router::PreparedConnection,
-) -> (Option<coding_agent_router::McpCredential>, String) {
-    let client = Client::from_cluster_entry_with_timeout(
-        &prepared.entry,
-        Some(std::time::Duration::from_secs(10)),
-    );
-    match coding_agent_router::mcp_credential(&client, &prepared.binding.agent_id) {
-        Ok(Some(credential)) => {
-            let line = format!(
-                "MCP gateway: connected (server \"{}\")",
-                coding_agent_router::MCP_SERVER_NAME
-            );
-            (Some(credential), line)
-        }
-        Ok(None) => (
-            None,
-            "MCP gateway: not configured on this control plane (MCP_GATEWAY_PUBLIC_URL unset); skipping"
-                .to_string(),
-        ),
-        Err(error) => (
-            None,
-            format!(
-                "MCP gateway: unavailable ({error:#}); LLM routing is connected, MCP tools are not"
-            ),
-        ),
-    }
 }
 
 pub fn disconnect(force: bool) -> Result<()> {
@@ -146,7 +123,15 @@ pub fn disconnect(force: bool) -> Result<()> {
     };
     coding_agent_router::disconnect_preflight("OpenCode", &["opencode"], force)?;
     if state.mcp_installed {
-        revoke_mcp_credential_best_effort(&state.binding);
+        match client_for_bound_cluster(&state.binding.cluster) {
+            Ok(client) => coding_agent_router::revoke_mcp_credential_best_effort(
+                &client,
+                &state.binding.agent_id,
+            ),
+            Err(error) => {
+                eprintln!("warning: failed to revoke the MCP gateway credential: {error}")
+            }
+        }
     }
     remove_managed_plugin_or_preserve(&state.plugin_path)?;
     let path = state_path();
@@ -278,24 +263,19 @@ fn restore_file(path: &Path, content: Option<&[u8]>) {
     }
 }
 
-/// Best-effort server-side revoke during disconnect: resolves the bound cluster from config and
-/// warns rather than fails, since disconnect must still remove the local plugin even when the
-/// control plane is unreachable.
-fn revoke_mcp_credential_best_effort(binding: &ConnectionBinding) {
-    let result = (|| -> Result<()> {
-        let cfg = config::load()?;
-        let entry = cfg.clusters.get(&binding.cluster).ok_or_else(|| {
-            anyhow::anyhow!("Nasiko cluster '{}' no longer exists", binding.cluster)
-        })?;
-        let client = Client::from_cluster_entry_with_timeout(
-            entry,
-            Some(std::time::Duration::from_secs(10)),
-        );
-        coding_agent_router::revoke_mcp_credential(&client, &binding.agent_id)
-    })();
-    if let Err(error) = result {
-        eprintln!("warning: failed to revoke the MCP gateway credential: {error:#}");
-    }
+/// Resolves a `Client` for a bound cluster from `~/.nasiko/config.json`, independent of whichever
+/// cluster is currently active — the lookup a follow-up call (revoke) needs when all that is on
+/// hand is the connection's own `ConnectionBinding`.
+fn client_for_bound_cluster(cluster: &str) -> Result<Client> {
+    let cfg = config::load()?;
+    let entry = cfg
+        .clusters
+        .get(cluster)
+        .ok_or_else(|| anyhow::anyhow!("Nasiko cluster '{cluster}' no longer exists"))?;
+    Ok(Client::from_cluster_entry_with_timeout(
+        entry,
+        Some(std::time::Duration::from_secs(10)),
+    ))
 }
 
 #[cfg(test)]
@@ -374,21 +354,15 @@ fn plugin_body(
     let base_url = serde_json::to_string(&format!("{}/v1", cluster_url.trim_end_matches('/')))
         .expect("serializable URL");
     let mcp_constants = match mcp_credential {
-        Some(credential) => {
-            let url = credential
-                .gateway_url
-                .as_deref()
-                .expect("plugin_body is only called with a minted gateway_url");
-            format!(
-                "const MCP_URL = {}\nconst MCP_TOKEN = {}\n",
-                serde_json::to_string(url).expect("serializable URL"),
-                serde_json::to_string(&credential.token).expect("serializable token"),
-            )
-        }
+        Some(credential) => format!(
+            "const MCP_URL = {}\nconst MCP_TOKEN = {}\n",
+            serde_json::to_string(&credential.gateway_url).expect("serializable URL"),
+            serde_json::to_string(&credential.token).expect("serializable token"),
+        ),
         None => String::new(),
     };
     // Emitted only when a credential was minted, so an unconfigured/unreachable control plane
-    // produces a plugin identical to one from before MCP registration existed.
+    // produces a plugin with no MCP block at all.
     let mcp_config_block = if mcp_credential.is_some() {
         r#"      config.mcp ??= {}
       config.mcp["nasiko"] = {
@@ -560,8 +534,8 @@ mod tests {
     fn mcp_credential() -> coding_agent_router::McpCredential {
         coding_agent_router::McpCredential {
             token: "ngt_secret".into(),
-            gateway_url: Some("https://cp.example/api/mcp".into()),
-            connect_url: Some("https://cp.example/api/mcp/s/ngt_secret".into()),
+            gateway_url: "https://cp.example/api/mcp".into(),
+            connect_url: "https://cp.example/api/mcp/s/ngt_secret".into(),
         }
     }
 

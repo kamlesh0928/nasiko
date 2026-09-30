@@ -31,9 +31,9 @@ struct ConnectionState {
     original_helper: SavedValue,
     original_base_url: SavedValue,
     /// Whether the Nasiko MCP gateway was registered with Claude Code's own `claude mcp` store
-    /// (settings.json carries no `mcpServers`, so this is the only record of it). `false` for
-    /// connections made before this field existed, and for a control plane with no public
-    /// gateway URL to register.
+    /// (settings.json carries no `mcpServers`, so this is the only record of it). Older state
+    /// files omit this field; absent means not installed, matching a control plane with no
+    /// public gateway URL to register.
     #[serde(default)]
     mcp_installed: bool,
 }
@@ -77,14 +77,25 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
     );
     settings.insert("apiKeyHelper".into(), Value::String(helper_command.clone()));
 
-    let mut state = ConnectionState {
+    // Minted before the atomic write below, so `mcp_installed` reflects the real outcome in that
+    // one write rather than needing a second write once client-side registration succeeds.
+    let mcp_client = Client::from_cluster_entry_with_timeout(
+        &prepared.entry,
+        Some(std::time::Duration::from_secs(10)),
+    );
+    let mcp_credential = coding_agent_router::mint_mcp_credential_for_connect(
+        &mcp_client,
+        &prepared.binding.agent_id,
+    );
+
+    let state = ConnectionState {
         binding: prepared.binding.clone(),
         settings_path: settings_path.clone(),
         helper_command,
         original_env_present,
         original_helper,
         original_base_url,
-        mcp_installed: false,
+        mcp_installed: mcp_credential.is_some(),
     };
     let install_result = (|| -> Result<()> {
         coding_agent_router::atomic_write_json(&state_path(), &state)?;
@@ -95,6 +106,12 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
         Ok(())
     })();
     if let Err(error) = install_result {
+        if mcp_credential.is_some() {
+            coding_agent_router::revoke_mcp_credential_best_effort(
+                &mcp_client,
+                &prepared.binding.agent_id,
+            );
+        }
         return match coding_agent_router::rollback_config(&prepared) {
             Ok(()) => Err(error),
             Err(rollback) => Err(error.context(format!(
@@ -103,12 +120,24 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
         };
     }
 
-    // LLM routing is now fully installed and persisted. Layering the MCP gateway on top must
-    // not undo that: a mint failure (e.g. an older control plane without this route) only
-    // downgrades to a warning. A client-side registration failure after a successful mint is
-    // different — it leaves a live credential nothing points at, so that credential is revoked
-    // and the error is returned instead of being swallowed.
-    let mcp_line = install_mcp_gateway(&claude, &prepared, &mut state)?;
+    // LLM routing (and, if minted, the state marking MCP installed) are now persisted. Claude
+    // Code's own CLI is the one registration step left, and it is an external process — unwind
+    // everything above if it fails, so a failed connect never leaves LLM routing half up or a
+    // live credential nothing points at.
+    if let Some(credential) = &mcp_credential
+        && let Err(error) = run_mcp_add(&claude, credential)
+    {
+        coding_agent_router::revoke_mcp_credential_best_effort(
+            &mcp_client,
+            &prepared.binding.agent_id,
+        );
+        return match unwind_failed_install(&state, &prepared) {
+            Ok(()) => Err(error),
+            Err(unwind) => Err(error.context(format!(
+                "Claude Code MCP registration failed and the prior install could not be fully unwound: {unwind:#}"
+            ))),
+        };
+    }
 
     let provider = prepared
         .resolved_config
@@ -124,63 +153,36 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
         "Connected Claude Code to Nasiko ({}, {provider}/{model}).",
         state.binding.cluster
     );
-    println!("{mcp_line}");
+    if mcp_credential.is_some() {
+        println!("{}", coding_agent_router::mcp_connected_line());
+    }
     println!("Run `claude` normally. Disconnect with: nasiko disconnect claude");
     Ok(())
 }
 
-/// Mints the MCP gateway credential and, when one is minted, registers it as an HTTP MCP server
-/// through Claude Code's own CLI (`claude mcp add-json`) — Claude Code does not read `mcpServers`
-/// from `settings.json`, so its own store is the only way to add a user-scope server. Returns the
-/// status line the caller prints alongside the LLM-routing success message.
-fn install_mcp_gateway(
-    claude: &Path,
+/// Undoes a fully-persisted install when a step after the atomic write still fails (Claude Code
+/// MCP registration is the only one): restores `settings.json` to what it was before `connect`
+/// touched it, removes the connection state, and rolls back the LLM config on the control plane
+/// — the same three things `disconnect` does, minus the "is Claude Code running" preflight,
+/// since nothing here was ever handed to a live process.
+fn unwind_failed_install(
+    state: &ConnectionState,
     prepared: &coding_agent_router::PreparedConnection,
-    state: &mut ConnectionState,
-) -> Result<String> {
-    let client = Client::from_cluster_entry_with_timeout(
-        &prepared.entry,
-        Some(std::time::Duration::from_secs(10)),
-    );
-    let agent_id = &prepared.binding.agent_id;
-    let credential = match coding_agent_router::mcp_credential(&client, agent_id) {
-        Ok(Some(credential)) => credential,
-        Ok(None) => {
-            return Ok(
-                "MCP gateway: not configured on this control plane (MCP_GATEWAY_PUBLIC_URL unset); skipping"
-                    .to_string(),
-            );
-        }
-        Err(error) => {
-            return Ok(format!(
-                "MCP gateway: unavailable ({error:#}); LLM routing is connected, MCP tools are not"
-            ));
-        }
-    };
-    if let Err(error) = run_mcp_add(claude, &credential) {
-        let _ = coding_agent_router::revoke_mcp_credential(&client, agent_id);
-        return Err(error);
-    }
-    state.mcp_installed = true;
-    coding_agent_router::atomic_write_json(&state_path(), &*state)?;
-    Ok(format!(
-        "MCP gateway: connected (server \"{}\")",
-        coding_agent_router::MCP_SERVER_NAME
-    ))
+) -> Result<()> {
+    restore_settings(state)?;
+    fs::remove_file(state_path()).context("failed to remove Claude connection state")?;
+    coding_agent_router::rollback_config(prepared)
 }
 
-/// `claude mcp add-json --scope user <name> '<json>'` args. The credential token is embedded in
-/// the JSON blob rather than passed via `--header`, so it appears in the process argument list
-/// only for the duration of this call; `add-json` is used over `add --transport http --header`
-/// so there is no per-flag surface that can drift out of sync with what the server issues.
+/// `claude mcp add-json --scope user <name> '<json>'` args: a single JSON argument carries
+/// `type`/`url`/`headers` together, so there is no per-flag surface (`--transport`, `--header`,
+/// ...) that can drift out of sync with what the server issues. Like any process argument, the
+/// credential is visible in the process argument list for the life of this `claude` invocation
+/// (e.g. via `ps`) regardless of which flags carry it.
 fn mcp_add_command(credential: &coding_agent_router::McpCredential) -> Vec<String> {
-    let url = credential
-        .gateway_url
-        .as_deref()
-        .expect("mcp_add_command is only called with a minted gateway_url");
     let payload = json!({
         "type": "http",
-        "url": url,
+        "url": credential.gateway_url,
         "headers": {"Authorization": format!("Bearer {}", credential.token)},
     })
     .to_string();
@@ -247,23 +249,30 @@ fn teardown_mcp_gateway(binding: &ConnectionBinding) {
         run_mcp_remove(&claude)
     })();
     if let Err(error) = removal {
-        eprintln!("warning: failed to remove the Nasiko MCP server from Claude Code: {error:#}");
+        eprintln!("warning: failed to remove the Nasiko MCP server from Claude Code: {error}");
     }
 
-    let revoke = (|| -> Result<()> {
-        let cfg = config::load()?;
-        let entry = cfg.clusters.get(&binding.cluster).ok_or_else(|| {
-            anyhow::anyhow!("Nasiko cluster '{}' no longer exists", binding.cluster)
-        })?;
-        let client = Client::from_cluster_entry_with_timeout(
-            entry,
-            Some(std::time::Duration::from_secs(10)),
-        );
-        coding_agent_router::revoke_mcp_credential(&client, &binding.agent_id)
-    })();
-    if let Err(error) = revoke {
-        eprintln!("warning: failed to revoke the MCP gateway credential: {error:#}");
+    match client_for_bound_cluster(&binding.cluster) {
+        Ok(client) => {
+            coding_agent_router::revoke_mcp_credential_best_effort(&client, &binding.agent_id);
+        }
+        Err(error) => eprintln!("warning: failed to revoke the MCP gateway credential: {error}"),
     }
+}
+
+/// Resolves a `Client` for a bound cluster from `~/.nasiko/config.json`, independent of whichever
+/// cluster is currently active — the lookup a follow-up call (revoke) needs when all that is on
+/// hand is the connection's own `ConnectionBinding`, not a freshly `prepare()`d `ClusterEntry`.
+fn client_for_bound_cluster(cluster: &str) -> Result<Client> {
+    let cfg = config::load()?;
+    let entry = cfg
+        .clusters
+        .get(cluster)
+        .ok_or_else(|| anyhow::anyhow!("Nasiko cluster '{cluster}' no longer exists"))?;
+    Ok(Client::from_cluster_entry_with_timeout(
+        entry,
+        Some(std::time::Duration::from_secs(10)),
+    ))
 }
 
 pub fn disconnect(force: bool) -> Result<()> {
@@ -281,6 +290,19 @@ fn disconnect_internal(print: bool, force: bool) -> Result<()> {
     if state.mcp_installed {
         teardown_mcp_gateway(&state.binding);
     }
+    restore_settings(&state)?;
+    fs::remove_file(state_path()).context("failed to remove Claude connection state")?;
+    if print {
+        println!("Disconnected Claude Code from Nasiko.");
+        println!("Restart Claude Code so the restored API settings take effect.");
+    }
+    Ok(())
+}
+
+/// Restores `settings.json`'s `apiKeyHelper`/`env.ANTHROPIC_BASE_URL` to what `connect` captured
+/// before it touched them, warning instead of clobbering if either changed since connect. Shared
+/// by `disconnect` and `unwind_failed_install`.
+fn restore_settings(state: &ConnectionState) -> Result<()> {
     let mut settings = read_json_object(&state.settings_path)?;
     restore_top_level(
         &mut settings,
@@ -295,13 +317,7 @@ fn disconnect_internal(print: bool, force: bool) -> Result<()> {
         &state.original_base_url,
         state.original_env_present,
     )?;
-    write_json_atomic(&state.settings_path, &Value::Object(settings))?;
-    fs::remove_file(state_path()).context("failed to remove Claude connection state")?;
-    if print {
-        println!("Disconnected Claude Code from Nasiko.");
-        println!("Restart Claude Code so the restored API settings take effect.");
-    }
-    Ok(())
+    write_json_atomic(&state.settings_path, &Value::Object(settings))
 }
 
 pub fn status() -> Result<()> {
@@ -615,11 +631,61 @@ mod tests {
         assert_eq!(shell_quote(Path::new("/tmp/a'b")), "'/tmp/a'\\''b'");
     }
 
+    fn state_for(settings_path: PathBuf) -> ConnectionState {
+        ConnectionState {
+            binding: ConnectionBinding {
+                version: coding_agent_router::STATE_VERSION,
+                integration_id: Some("claude".into()),
+                cluster: "local".into(),
+                cluster_url: "https://nasiko".into(),
+                principal_id: None,
+                agent_id: "agent".into(),
+                agent_name: "claude-code".into(),
+                executable: None,
+            },
+            settings_path,
+            helper_command: "nasiko helper".into(),
+            original_env_present: true,
+            original_helper: SavedValue {
+                present: false,
+                value: Value::Null,
+            },
+            original_base_url: SavedValue {
+                present: false,
+                value: Value::Null,
+            },
+            mcp_installed: true,
+        }
+    }
+
+    /// Covers the pure piece of `unwind_failed_install` (used both there and by `disconnect`):
+    /// the shell-out to `claude mcp remove`/`add-json` itself stays untested, since it would
+    /// touch the real Claude Code installation.
+    #[test]
+    fn restore_settings_writes_back_the_captured_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        fs::write(
+            &settings_path,
+            serde_json::to_vec(&json!({
+                "apiKeyHelper": "nasiko helper",
+                "env": {"ANTHROPIC_BASE_URL": "https://nasiko", "OTHER": "keep"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        restore_settings(&state_for(settings_path.clone())).unwrap();
+        let restored: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+        assert!(!restored.as_object().unwrap().contains_key("apiKeyHelper"));
+        assert_eq!(restored["env"]["OTHER"], "keep");
+        assert!(restored["env"].get("ANTHROPIC_BASE_URL").is_none());
+    }
+
     fn mcp_credential() -> coding_agent_router::McpCredential {
         coding_agent_router::McpCredential {
             token: "ngt_secret".into(),
-            gateway_url: Some("https://cp.example/api/mcp".into()),
-            connect_url: Some("https://cp.example/api/mcp/s/ngt_secret".into()),
+            gateway_url: "https://cp.example/api/mcp".into(),
+            connect_url: "https://cp.example/api/mcp/s/ngt_secret".into(),
         }
     }
 
@@ -636,6 +702,20 @@ mod tests {
         assert_eq!(payload["url"], "https://cp.example/api/mcp");
         assert_eq!(payload["headers"]["Authorization"], "Bearer ngt_secret");
         assert_eq!(args.len(), 6);
+    }
+
+    #[test]
+    fn mcp_add_command_carries_shell_metacharacters_in_the_token_verbatim() {
+        let mut credential = mcp_credential();
+        credential.token = "tok'; $(rm -rf /) `echo hi`".to_string();
+        let args = mcp_add_command(&credential);
+        // A `Vec<String>` passed to `Command::args` reaches the child process as literal argv
+        // entries — no shell ever parses this string, so metacharacters must survive untouched.
+        let payload: Value = serde_json::from_str(&args[5]).unwrap();
+        assert_eq!(
+            payload["headers"]["Authorization"],
+            "Bearer tok'; $(rm -rf /) `echo hi`"
+        );
     }
 
     #[test]
