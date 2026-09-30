@@ -106,8 +106,11 @@ pub async fn mcp_gateway(
 /// `owner_id`, so an ownership transfer moves this attribution with it. The
 /// credential itself has no TTL of its own — it rotates only on re-mint
 /// (`nasiko_mcp_gateway::agent_tokens::mint`, same primitive every gateway
-/// token uses); until this row gets its own CLI-triggered re-mint path, a
-/// leaked coding-agent connect URL is live for as long as the row is.
+/// token uses): the agent's owner rotates it with `POST
+/// /api/agents/{id}/mcp-token`, or kills it outright with `DELETE
+/// /api/agents/{id}/mcp-token` (both owner-only); a deployed agent instead
+/// gets a fresh one on its next redeploy. Absent one of those, a leaked
+/// coding-agent connect URL is live for as long as the row is.
 #[utoipa::path(
     post,
     path = "/api/mcp/s/{token}",

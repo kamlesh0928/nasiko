@@ -905,6 +905,37 @@ async fn owner_can_mint_mcp_token_and_it_authenticates_at_the_gateway() {
 
 #[tokio::test]
 #[serial]
+async fn mint_returns_connect_url_when_gateway_public_url_is_configured() {
+    let server = TestServer::start_with(|cfg| {
+        cfg.mcp_gateway_public_url = Some("http://gateway.test/api/mcp/".to_string());
+    })
+    .await;
+    let owner = seed_user(&server, "mcpt-owner-url").await;
+    let agent = seed_agent(&server, owner, "mcpt-agent-url").await;
+    let jwt = common::sign_token(&owner.to_string(), "mcpt-owner-url", false, "member");
+
+    let res = mint_mcp_token(&server, &jwt, agent).await;
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let token = body["data"]["token"]
+        .as_str()
+        .expect("token present")
+        .to_owned();
+    assert_eq!(
+        body["data"]["gateway_url"], "http://gateway.test/api/mcp/",
+        "body: {body}"
+    );
+    // The trailing slash is trimmed exactly once before `/s/{token}` is appended.
+    assert_eq!(
+        body["data"]["connect_url"],
+        format!("http://gateway.test/api/mcp/s/{token}"),
+        "body: {body}"
+    );
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
 async fn minting_again_rotates_and_the_new_token_works() {
     let server = TestServer::start().await;
     let owner = seed_user(&server, "mcpt-owner-rot").await;
