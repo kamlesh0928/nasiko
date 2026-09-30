@@ -173,22 +173,35 @@ pub fn revoke_mcp_credential_best_effort(client: &Client, agent_id: &str) {
     }
 }
 
-/// Resolves a `Client` for `binding`'s cluster from `~/.nasiko/config.json`, independent of
-/// whichever cluster is currently active. Refuses if the alias has since been re-pointed at a
-/// different URL — the same check `credential_from_config` makes — so a stale binding's DELETE
-/// never reaches a server other than the one that issued the credential.
-fn client_for_binding(binding: &ConnectionBinding) -> Result<Client> {
-    let cfg = config::load()?;
-    let entry = cfg
-        .clusters
-        .get(&binding.cluster)
-        .ok_or_else(|| anyhow::anyhow!("Nasiko cluster '{}' no longer exists", binding.cluster))?;
+/// Looks up `binding.cluster` in `cfg`, refusing if the alias no longer exists or has since been
+/// re-pointed at a different URL — shared by `client_for_binding` and `credential_from_config`,
+/// which append their own `remedy` to whichever of the two problems is found.
+fn bound_cluster_entry<'a>(
+    binding: &ConnectionBinding,
+    cfg: &'a Config,
+    remedy: &str,
+) -> Result<&'a ClusterEntry> {
+    let entry = cfg.clusters.get(&binding.cluster).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Nasiko cluster '{}' no longer exists; {remedy}",
+            binding.cluster
+        )
+    })?;
     if normalize_url(&entry.url) != normalize_url(&binding.cluster_url) {
         bail!(
-            "Nasiko cluster '{}' URL changed since connect; skipping MCP gateway credential revoke",
+            "Nasiko cluster '{}' URL changed since connect; {remedy}",
             binding.cluster
         );
     }
+    Ok(entry)
+}
+
+/// Resolves a `Client` for `binding`'s cluster from `~/.nasiko/config.json`, independent of
+/// whichever cluster is currently active — so a stale binding's DELETE never reaches a server
+/// other than the one that issued the credential.
+fn client_for_binding(binding: &ConnectionBinding) -> Result<Client> {
+    let cfg = config::load()?;
+    let entry = bound_cluster_entry(binding, &cfg, "skipping MCP gateway credential revoke")?;
     Ok(Client::from_cluster_entry_with_timeout(
         entry,
         Some(CP_CALL_TIMEOUT),
@@ -523,16 +536,14 @@ pub fn credential(binding: &ConnectionBinding) -> Result<RoutingCredential> {
 }
 
 fn credential_from_config(binding: &ConnectionBinding, cfg: &Config) -> Result<RoutingCredential> {
-    let entry = cfg
-        .clusters
-        .get(&binding.cluster)
-        .ok_or_else(|| anyhow::anyhow!("Nasiko cluster '{}' no longer exists", binding.cluster))?;
-    if normalize_url(&entry.url) != normalize_url(&binding.cluster_url) {
-        bail!(
-            "connected Nasiko cluster URL changed; run: nasiko connect {}",
+    let entry = bound_cluster_entry(
+        binding,
+        cfg,
+        &format!(
+            "run: nasiko connect {}",
             binding.integration_id.as_deref().unwrap_or("claude")
-        );
-    }
+        ),
+    )?;
     let token = usable_login_token(entry)?;
     let principal = config::token_subject(token)
         .ok_or_else(|| anyhow::anyhow!("invalid Nasiko login; run: nasiko auth login"))?;

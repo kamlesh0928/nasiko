@@ -83,19 +83,29 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
     };
     let body = plugin_body(&nasiko, &state.binding.cluster_url, mcp_credential);
     if let Err(error) = install_artifacts(&state_path(), &plugin_path, &state, body.as_bytes()) {
-        if mcp_credential.is_some() {
+        // A failed install rolls back to whatever plugin/state existed before this call. When
+        // that's this *same* agent's own previous connection and it had an MCP credential, the
+        // mint above already replaced that credential's row server-side (mint upserts, replacing
+        // the stored hash) even though nothing here ends up using the freshly minted token —
+        // revoking it as "unused" would finish the job and kill the *old* token the restored
+        // plugin still embeds, before its rotation grace window would otherwise have let it keep
+        // working. So: warn instead of revoke in that one case. Every other case (a fresh
+        // connect, or a reconnect to a *different* agent) revokes the unused new credential
+        // normally, since nothing restored depends on it.
+        let reconnect_shares_the_restored_credential =
+            previous_state.as_ref().is_some_and(|previous| {
+                failed_reconnect_shares_the_restored_credential(
+                    previous,
+                    &prepared.binding.agent_id,
+                )
+            });
+        if mcp_credential.is_some() && !reconnect_shares_the_restored_credential {
             coding_agent_router::revoke_mcp_credential_best_effort(
                 &mcp_client,
                 &prepared.binding.agent_id,
             );
         }
-        // A failed install rolls back to whatever plugin/state existed before this call (the
-        // previous connection's, credential included), so that credential is still in active
-        // use — warn rather than revoke it out from under the restored config.
-        if previous_state
-            .as_ref()
-            .is_some_and(|previous| previous.mcp_installed)
-        {
+        if reconnect_shares_the_restored_credential {
             eprintln!(
                 "warning: OpenCode reconnect failed; the previous MCP gateway credential may need a fresh `nasiko connect opencode` before its rotation grace window lapses"
             );
@@ -166,6 +176,20 @@ fn previous_mcp_credential_is_orphaned(
     new_mcp_installed: bool,
 ) -> bool {
     previous.mcp_installed && (previous.binding.agent_id != new_agent_id || !new_mcp_installed)
+}
+
+/// Whether a failed reconnect's rollback restores a plugin that still depends on the previous
+/// binding's MCP credential: true only when the reconnect targeted the *same* agent and that
+/// agent's previous connection had a credential installed. Used to decide whether the freshly
+/// minted (but now unused, since the install failed) credential for that agent is safe to revoke
+/// — it is not: the mint already replaced the row's stored hash, so revoking on top of that would
+/// delete the row the still-embedded old token needs in order to keep authenticating during its
+/// rotation grace window.
+fn failed_reconnect_shares_the_restored_credential(
+    previous: &ConnectionState,
+    new_agent_id: &str,
+) -> bool {
+    previous.mcp_installed && previous.binding.agent_id == new_agent_id
 }
 
 pub fn disconnect(force: bool) -> Result<()> {
@@ -552,6 +576,30 @@ mod tests {
         let previous = state_with_mcp("agent-a", false);
         assert!(!previous_mcp_credential_is_orphaned(
             &previous, "agent-b", true
+        ));
+    }
+
+    #[test]
+    fn failed_reconnect_shares_the_restored_credential_when_the_agent_is_unchanged() {
+        let previous = state_with_mcp("agent-a", true);
+        assert!(failed_reconnect_shares_the_restored_credential(
+            &previous, "agent-a"
+        ));
+    }
+
+    #[test]
+    fn failed_reconnect_does_not_share_the_credential_when_the_agent_changed() {
+        let previous = state_with_mcp("agent-a", true);
+        assert!(!failed_reconnect_shares_the_restored_credential(
+            &previous, "agent-b"
+        ));
+    }
+
+    #[test]
+    fn failed_reconnect_has_nothing_to_share_when_the_previous_connection_had_no_credential() {
+        let previous = state_with_mcp("agent-a", false);
+        assert!(!failed_reconnect_shares_the_restored_credential(
+            &previous, "agent-a"
         ));
     }
 

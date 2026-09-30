@@ -37,6 +37,16 @@ struct ConnectionState {
     mcp_installed: bool,
 }
 
+/// The end state of this connect's MCP gateway attempt, for the final status print — kept
+/// distinct from a plain `Option<String>` so a registration failure (Claude Code rejected the
+/// client-side `claude mcp add-json`) gets its own remedy, separate from a mint failure (the
+/// control plane itself couldn't issue a credential).
+enum McpOutcome {
+    Connected,
+    MintUnavailable(String),
+    RegistrationFailed(String),
+}
+
 /// One-time setup. Claude subsequently invokes the hidden credential helper itself.
 pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
     let claude = which::which("claude")
@@ -90,18 +100,21 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
     // write once client-side registration succeeds. A registration failure (a stale "nasiko"
     // entry, an enterprise policy block, ...) is treated exactly like a mint failure: best-effort
     // revoke, record not installed, warn — LLM routing must still connect either way.
-    let (mcp_installed, mcp_warning) = match &mcp_mint {
+    let (mcp_installed, mcp_outcome) = match &mcp_mint {
         McpMint::Minted(credential) => match run_mcp_add(&claude, credential) {
-            Ok(()) => (true, None),
+            Ok(()) => (true, McpOutcome::Connected),
             Err(error) => {
                 coding_agent_router::revoke_mcp_credential_best_effort(
                     &mcp_client,
                     &prepared.binding.agent_id,
                 );
-                (false, Some(coding_agent_router::one_line_warning(&error)))
+                (
+                    false,
+                    McpOutcome::RegistrationFailed(coding_agent_router::one_line_warning(&error)),
+                )
             }
         },
-        McpMint::Unavailable(message) => (false, Some(message.clone())),
+        McpMint::Unavailable(message) => (false, McpOutcome::MintUnavailable(message.clone())),
     };
 
     let state = ConnectionState {
@@ -161,13 +174,21 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
         "Connected Claude Code to Nasiko ({}, {provider}/{model}).",
         state.binding.cluster
     );
-    if mcp_installed {
-        println!("{}", coding_agent_router::mcp_connected_line());
-        println!("{}", coding_agent_router::mcp_multi_machine_note());
-    } else if let Some(reason) = &mcp_warning {
-        eprintln!(
-            "warning: MCP gateway unavailable ({reason}); LLM routing is connected, MCP tools are not"
-        );
+    match mcp_outcome {
+        McpOutcome::Connected => {
+            println!("{}", coding_agent_router::mcp_connected_line());
+            println!("{}", coding_agent_router::mcp_multi_machine_note());
+        }
+        McpOutcome::MintUnavailable(reason) => {
+            eprintln!(
+                "warning: MCP gateway unavailable ({reason}); LLM routing is connected, MCP tools are not"
+            );
+        }
+        McpOutcome::RegistrationFailed(reason) => {
+            eprintln!(
+                "warning: could not register the Nasiko MCP server with Claude Code ({reason}); LLM routing is connected, MCP tools are not. To retry: claude mcp remove --scope user nasiko && nasiko disconnect claude && nasiko connect claude"
+            );
+        }
     }
     println!("Run `claude` normally. Disconnect with: nasiko disconnect claude");
     Ok(())
@@ -270,7 +291,10 @@ fn teardown_mcp_gateway(binding: &ConnectionBinding) {
         run_mcp_remove(&claude)
     })();
     if let Err(error) = removal {
-        eprintln!("warning: failed to remove the Nasiko MCP server from Claude Code: {error}");
+        eprintln!(
+            "warning: failed to remove the Nasiko MCP server from Claude Code: {}",
+            coding_agent_router::one_line_warning(&error)
+        );
     }
     coding_agent_router::revoke_bound_mcp_credential_best_effort(binding);
 }

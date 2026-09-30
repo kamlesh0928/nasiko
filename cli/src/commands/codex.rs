@@ -139,13 +139,17 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
 }
 
 /// Whether `mcp_servers` (if present) can hold a new sub-table: absent (a `[mcp_servers]` header
-/// will be created) or already table-like — either the `[mcp_servers]` header form or the inline
-/// `mcp_servers = { ... }` form some tools generate. Anything else (a scalar, an array, ...) can't
-/// hold `mcp_servers.nasiko` and is left alone rather than corrupted.
+/// will be created) or already the `[mcp_servers]` header form. The inline `mcp_servers = { ... }`
+/// form some tools generate is deliberately excluded even though `TableLike::insert` can write
+/// into it: `installed_mcp_server` is snapshotted (`build_state`) as a freshly built header-style
+/// item, but reading an entry back out of an inline table always renders it inline
+/// (`nasiko = { url = ... }`), so `restore_mcp_server`'s "did this change since connect"
+/// comparison would never match and the entry would linger forever, un-restorable, after every
+/// disconnect. Anything else (a scalar, an array, ...) can't hold `mcp_servers.nasiko` either way.
 fn mcp_servers_are_writable(document: &DocumentMut) -> bool {
     document
         .get("mcp_servers")
-        .map(|item| item.as_table_like().is_some())
+        .map(|item| item.as_table().is_some())
         .unwrap_or(true)
 }
 
@@ -407,8 +411,10 @@ fn build_state(
     })
 }
 
-/// Codex's MCP client is header-less, so the credential travels in the URL
-/// (`connect_url`, `/api/mcp/s/{token}`) rather than an `Authorization` header.
+/// Nasiko installs the credential-in-URL form here (`connect_url`, `/api/mcp/s/{token}`) rather
+/// than an `Authorization` header — a deliberate choice, not a Codex limitation this CLI has
+/// verified either way (Codex isn't installed on every machine that builds this crate); the
+/// header form is untested against a real Codex MCP client.
 fn mcp_server_item(credential: &coding_agent_router::McpCredential) -> Item {
     let mut server = Table::new();
     server["url"] = value(credential.connect_url.as_str());
@@ -453,16 +459,13 @@ fn apply_installed(document: &mut DocumentMut, state: &ConnectionState) -> Resul
             servers_table.set_implicit(true);
             document["mcp_servers"] = Item::Table(servers_table);
         }
-        // `as_table_like_mut` (rather than `as_table_mut`) also accepts the inline
-        // `mcp_servers = { ... }` form some tools generate; `install_prepared` only reaches here
-        // once `mcp_servers_are_writable` has already confirmed one of the two forms.
+        // `mcp_servers_are_writable` only lets `installed_mcp_server` be `Some` when this key is
+        // absent (just created above) or already the header form, so a plain `as_table_mut`
+        // suffices — see that function for why the inline form is excluded entirely.
         let servers = document["mcp_servers"]
-            .as_table_like_mut()
+            .as_table_mut()
             .context("Codex setting 'mcp_servers' must be a table")?;
-        servers.insert(
-            coding_agent_router::MCP_SERVER_NAME,
-            decode(installed_mcp_server)?,
-        );
+        servers[coding_agent_router::MCP_SERVER_NAME] = decode(installed_mcp_server)?;
     }
     Ok(())
 }
@@ -556,17 +559,12 @@ fn restore_mcp_server(document: &mut DocumentMut, state: &ConnectionState) -> Re
         );
         return Ok(());
     }
-    let Some(servers) = document
-        .get_mut("mcp_servers")
-        .and_then(Item::as_table_like_mut)
-    else {
+    let Some(servers) = document.get_mut("mcp_servers").and_then(Item::as_table_mut) else {
         return Ok(());
     };
     if state.original_mcp_server.present {
-        servers.insert(
-            coding_agent_router::MCP_SERVER_NAME,
-            decode(&state.original_mcp_server.snapshot)?,
-        );
+        servers[coding_agent_router::MCP_SERVER_NAME] =
+            decode(&state.original_mcp_server.snapshot)?;
     } else {
         servers.remove(coding_agent_router::MCP_SERVER_NAME);
     }
@@ -622,12 +620,10 @@ fn provider_snapshot(document: &DocumentMut) -> Option<String> {
     provider_item_ref(document).map(snapshot)
 }
 
-/// `as_table_like` (rather than `as_table`) so this also finds an entry inside the inline
-/// `mcp_servers = { ... }` form some tools generate, matching `apply_installed`/`restore_mcp_server`.
 fn mcp_server_item_ref(document: &DocumentMut) -> Option<&Item> {
     document
         .get("mcp_servers")
-        .and_then(Item::as_table_like)
+        .and_then(Item::as_table)
         .and_then(|servers| servers.get(coding_agent_router::MCP_SERVER_NAME))
 }
 
@@ -824,17 +820,21 @@ base_url = "https://user.example"
     }
 
     #[test]
-    fn mcp_servers_are_writable_accepts_absent_header_and_inline_table_forms() {
+    fn mcp_servers_are_writable_accepts_absent_and_header_forms_but_rejects_inline_tables() {
         assert!(mcp_servers_are_writable(
             &"other = 1\n".parse::<DocumentMut>().unwrap()
         ));
         assert!(mcp_servers_are_writable(
-            &"mcp_servers = { other = { url = \"https://other.example\" } }\n"
+            &"[mcp_servers.other]\nurl = \"https://other.example\"\n"
                 .parse::<DocumentMut>()
                 .unwrap()
         ));
-        assert!(mcp_servers_are_writable(
-            &"[mcp_servers.other]\nurl = \"https://other.example\"\n"
+        // Rejected, not merely tolerated: writing into this shape would leave a `nasiko` entry
+        // `restore_mcp_server` can never recognize as installed on a later read-back (it always
+        // renders inline-read entries as `nasiko = { ... }`, never matching the header-style
+        // snapshot `build_state` captured at install time) — see the round-trip test below.
+        assert!(!mcp_servers_are_writable(
+            &"mcp_servers = { other = { url = \"https://other.example\" } }\n"
                 .parse::<DocumentMut>()
                 .unwrap()
         ));
@@ -846,18 +846,40 @@ base_url = "https://user.example"
     }
 
     #[test]
-    fn install_writes_into_a_pre_existing_inline_mcp_servers_table() {
-        let credential = mcp_credential();
-        let original = "mcp_servers = { other = { url = \"https://other.example\" } }\n";
-        let (document, _) = installed_with_mcp(original, Some(&credential));
-        assert_eq!(
-            document["mcp_servers"][coding_agent_router::MCP_SERVER_NAME]["url"].as_str(),
-            Some("https://cp.example/api/mcp/s/ngt_secret")
-        );
-        assert_eq!(
-            document["mcp_servers"]["other"]["url"].as_str(),
-            Some("https://other.example")
-        );
+    fn a_pre_existing_inline_mcp_servers_table_is_left_untouched_through_connect_and_disconnect() {
+        // `mcp_servers_are_writable` rejects the inline form, so `install_prepared` would pass no
+        // credential into `build_state` here (simulated directly with `None`, since driving the
+        // full `install_prepared` needs a real `codex` binary for `validate_config`). This must
+        // hold even when the inline table already has its own `nasiko` entry: that entry belongs
+        // to the user (or another tool) and must survive byte-for-byte, not get silently
+        // overwritten by `apply_installed` or "changed since connect"-skipped by `disconnect`.
+        let original = "mcp_servers = { nasiko = { url = \"https://user.example\" } }\n";
+        assert!(!mcp_servers_are_writable(
+            &original.parse::<DocumentMut>().unwrap()
+        ));
+        let (document, state) = installed_with_mcp(original, None);
+        assert!(state.installed_mcp_server.is_none());
+        // A real round trip (serialize -> parse -> restore), matching what `install_local`
+        // writes to disk and `disconnect` reads back.
+        let rendered = document.to_string();
+        let mut reparsed = rendered.parse::<DocumentMut>().unwrap();
+        restore_if_unchanged(
+            &mut reparsed,
+            "model_provider",
+            &state.installed_model_provider,
+            &state.original_model_provider,
+        )
+        .unwrap();
+        restore_if_unchanged(
+            &mut reparsed,
+            "model",
+            &state.installed_model,
+            &state.original_model,
+        )
+        .unwrap();
+        restore_provider(&mut reparsed, &state).unwrap();
+        restore_mcp_server(&mut reparsed, &state).unwrap();
+        assert_eq!(reparsed.to_string(), original);
     }
 
     #[test]
