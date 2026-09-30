@@ -99,6 +99,8 @@ struct AgentDeployInfo {
     writable: bool,
     /// `agents.writable_path` — same carry-forward reasoning as `writable`.
     writable_path: Option<String>,
+    /// `agents.coding_agent_integration_id` — see `CodingAgentGuard::NotDeployable` below.
+    coding_agent_integration_id: Option<String>,
 }
 
 // ─── GET /deployments ────────────────────────────────────────────────────────
@@ -261,7 +263,7 @@ pub(crate) struct RestartDeploymentResponse {
         (status = 200, description = "Restarted", body = RestartDeploymentResponse),
         (status = 403, description = "Caller does not own this deployment"),
         (status = 404, description = "No such deployment"),
-        (status = 409, description = "Deployment is already running or starting"),
+        (status = 409, description = "Deployment is already running or starting, or the agent is a local coding agent — coding_agent_not_deployable"),
     ),
 )]
 pub(crate) async fn restart_deployment(
@@ -277,6 +279,7 @@ pub(crate) async fn restart_deployment(
     // Fetch deployment and agent info together, including stored spec columns.
     let info = match sqlx::query_as::<_, AgentDeployInfo>(
         "SELECT a.name, a.image, a.id as agent_id, a.writable, a.writable_path, a.owner_id,
+                a.coding_agent_integration_id,
                 d.build_id, d.status::text as status,
                 d.spec_ports, d.spec_image, d.k8s_deployment_name
          FROM agent_deployments d
@@ -301,6 +304,19 @@ pub(crate) async fn restart_deployment(
     // is a denial-of-service if granted too broadly.
     if !claims.is_superuser && info.owner_id != user_id {
         return StatusCode::FORBIDDEN.into_response();
+    }
+
+    // A coding-agent row must never be (re)deployed onto (Task 1.6, spec §16 A4) — the Docker
+    // path below destroys and recreates via `state.runtime.deploy` with no requirement that a
+    // live container already exist, so this is a third, deployment-id-keyed way to put a real
+    // container behind a row the MCP gateway still resolves to its owner with no flow. Only
+    // reachable for a row that already had a container deployed onto it before this task's
+    // write-side guards existed (a coding-agent row is otherwise never inserted into
+    // `agent_deployments` at all), but closed here too for completeness.
+    if let Err(r) = crate::agents::coding_agent::CodingAgentGuard::NotDeployable
+        .reject_if(info.coding_agent_integration_id.is_some())
+    {
+        return r;
     }
 
     // Atomic mark-starting BEFORE touching the runtime: two concurrent restart

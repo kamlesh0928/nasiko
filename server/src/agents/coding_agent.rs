@@ -24,6 +24,10 @@
 //!     `import_github`, and `import_registry`'s source-artifact branch) and
 //!     `import_registry`'s own image-manifest branch
 //!   - `admin::routes::deploy`'s by-name deploy and `admin::routes::restart`'s by-id redeploy
+//!   - `agents::deployments::restart_deployment`'s Docker destroy+recreate path (only
+//!     reachable for a row that already had a container deployed onto it before these guards
+//!     existed — a coding-agent row is otherwise never inserted into `agent_deployments` at
+//!     all — but closed for completeness)
 //!   - `catalog::routes::update` (`PUT /api/agents/{id}`) when the body would set `image`,
 //!     `status`, or `activate_version` paired with a `version` — metadata-only edits (name,
 //!     description, ...) still go through

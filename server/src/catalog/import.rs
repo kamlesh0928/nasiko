@@ -509,6 +509,7 @@ pub(crate) async fn build_and_deploy(
     responses(
         (status = 201, description = "Agent registered, built, and deployed", body = ImportResult),
         (status = 400, description = "Missing package file or invalid archive"),
+        (status = 409, description = "(owner, name) names a local coding agent — coding_agent_not_deployable"),
         (status = 413, description = "Upload exceeds 200 MB limit"),
     ),
 )]
@@ -594,6 +595,7 @@ pub(crate) struct GithubImportRequest {
         (status = 201, description = "Agent registered, built, and deployed", body = ImportResult),
         (status = 400, description = "Invalid repository format or archive"),
         (status = 403, description = "GitHub not connected"),
+        (status = 409, description = "(owner, name) names a local coding agent — coding_agent_not_deployable"),
         (status = 502, description = "Failed to download the repository archive"),
     ),
 )]
@@ -821,6 +823,7 @@ fn validate_registry_host(host: &str, allowed: &[String]) -> Result<(), (StatusC
         (status = 201, description = "Agent registered and deployed", body = ImportResult),
         (status = 400, description = "Invalid reference or oversized blob"),
         (status = 403, description = "Registry import disabled or host not allowed"),
+        (status = 409, description = "(owner, name) names a local coding agent — coding_agent_not_deployable"),
         (status = 422, description = "Registry host not in the allowed list"),
         (status = 502, description = "Registry unreachable or returned an error"),
         (status = 504, description = "docker pull timed out"),

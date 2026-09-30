@@ -1077,6 +1077,43 @@ async fn update_rejects_deploy_fields_on_coding_agent_row_but_allows_metadata() 
     .await
     .unwrap();
     assert_eq!(status_res.status(), 409);
+    let text = status_res.text().await.unwrap();
+    assert!(
+        text.contains("coding_agent_not_deployable"),
+        "expected coding_agent_not_deployable, got: {text}"
+    );
+
+    // A `version` write must be rejected too, even with `activate_version` omitted from the body
+    // — it defaults to `true` (`catalog/models.rs`'s `default_activate_version`), so this is the
+    // same "real deploy" case as an explicit `activate_version: true`, not a metadata edit.
+    let version_res = common::as_superuser(
+        server
+            .client
+            .put(server.url(&format!("/api/agents/{coding_id}"))),
+        uid,
+        "admin",
+    )
+    .json(&json!({"version": "2.0.0"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(version_res.status(), 409);
+    let text = version_res.text().await.unwrap();
+    assert!(
+        text.contains("coding_agent_not_deployable"),
+        "expected coding_agent_not_deployable, got: {text}"
+    );
+    let version_after: (String, Option<String>) =
+        sqlx::query_as("SELECT version, image FROM agents WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(coding_id).unwrap())
+            .fetch_one(&server.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        version_after,
+        ("1.0.0".to_string(), None),
+        "version/image must be unchanged by the rejected update"
+    );
 
     // Control: an ordinary agent's `image`/`status` update in the same test still gets through.
     let normal_agent = create_agent(
