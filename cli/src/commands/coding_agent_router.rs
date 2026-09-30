@@ -52,6 +52,34 @@ pub struct RoutingCredential {
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// The MCP server name each client registers the gateway under.
+pub const MCP_SERVER_NAME: &str = "nasiko";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpCredential {
+    pub token: String,
+    pub gateway_url: Option<String>,
+    pub connect_url: Option<String>,
+}
+
+/// Mint the bound agent's MCP gateway credential. `Ok(None)` when the control plane has no
+/// public gateway URL (`gateway_url: null`) — the caller then registers nothing rather than a
+/// dead server entry. Errors are the caller's to soften: an older control plane without this
+/// route (404) must not break LLM-routing connect.
+pub fn mcp_credential(client: &Client, agent_id: &str) -> Result<Option<McpCredential>> {
+    let response: Envelope<McpCredential> =
+        client.post_json_quiet(&format!("/agents/{agent_id}/mcp-token"), &json!({}))?;
+    if response.data.gateway_url.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(response.data))
+}
+
+/// Best-effort server-side revoke; the caller logs and continues on error.
+pub fn revoke_mcp_credential(client: &Client, agent_id: &str) -> Result<()> {
+    client.delete(&format!("/agents/{agent_id}/mcp-token"))
+}
+
 pub fn disconnect_preflight(display_name: &str, process_names: &[&str], force: bool) -> Result<()> {
     let running = running_processes(process_names);
     enforce_disconnect_preflight(display_name, &running, force)
@@ -686,6 +714,68 @@ mod tests {
         };
         let credential = credential_from_config(&binding, &cfg).unwrap();
         assert_eq!(credential.token, "routing-jwt");
+        request.assert();
+    }
+
+    #[test]
+    fn mcp_credential_mints_when_the_gateway_is_configured() {
+        let mut server = mockito::Server::new();
+        let request = server
+            .mock("POST", "/api/agents/agent/mcp-token")
+            .match_body("{}")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"token":"ngt_abc","gateway_url":"https://cp/api/mcp","connect_url":"https://cp/api/mcp/s/ngt_abc"},"status_code":200,"message":"ok"}"#,
+            )
+            .create();
+        let client = Client::for_test(&server.url(), None);
+        let credential = mcp_credential(&client, "agent").unwrap().unwrap();
+        assert_eq!(credential.token, "ngt_abc");
+        assert_eq!(
+            credential.gateway_url.as_deref(),
+            Some("https://cp/api/mcp")
+        );
+        assert_eq!(
+            credential.connect_url.as_deref(),
+            Some("https://cp/api/mcp/s/ngt_abc")
+        );
+        request.assert();
+    }
+
+    #[test]
+    fn mcp_credential_is_none_when_the_gateway_has_no_public_url() {
+        let mut server = mockito::Server::new();
+        server
+            .mock("POST", "/api/agents/agent/mcp-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":{"token":"ngt_abc","gateway_url":null,"connect_url":null}}"#)
+            .create();
+        let client = Client::for_test(&server.url(), None);
+        assert!(mcp_credential(&client, "agent").unwrap().is_none());
+    }
+
+    #[test]
+    fn mcp_credential_surfaces_an_older_control_planes_404_as_an_error() {
+        let mut server = mockito::Server::new();
+        server
+            .mock("POST", "/api/agents/agent/mcp-token")
+            .with_status(404)
+            .create();
+        let client = Client::for_test(&server.url(), None);
+        assert!(mcp_credential(&client, "agent").is_err());
+    }
+
+    #[test]
+    fn revoke_mcp_credential_accepts_a_204() {
+        let mut server = mockito::Server::new();
+        let request = server
+            .mock("DELETE", "/api/agents/agent/mcp-token")
+            .with_status(204)
+            .create();
+        let client = Client::for_test(&server.url(), None);
+        revoke_mcp_credential(&client, "agent").unwrap();
         request.assert();
     }
 

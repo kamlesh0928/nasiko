@@ -9,13 +9,15 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
+use crate::api::Client;
 use crate::commands::coding_agent_router::{self, AgentSpec, ConnectionBinding};
+use crate::config;
 
 const CONFIG_VERSION: u32 = 1;
 const PROVIDER_ID: &str = "nasiko";
 const PROVIDER_NAME: &str = "Nasiko LLM Router (managed by nasiko)";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SavedItem {
     present: bool,
     #[serde(default)]
@@ -36,6 +38,16 @@ struct ConnectionState {
     installed_model_provider: String,
     installed_model: String,
     installed_provider: String,
+    /// Whether `[mcp_servers]` existed before connect touched it, the pre-existing
+    /// `[mcp_servers.nasiko]` item if any, and the item connect installed — `None` when no
+    /// credential was minted, so disconnect has nothing to restore. All three default for state
+    /// files written before this field existed.
+    #[serde(default)]
+    original_mcp_servers_present: bool,
+    #[serde(default)]
+    original_mcp_server: SavedItem,
+    #[serde(default)]
+    installed_mcp_server: Option<String>,
 }
 
 pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
@@ -55,10 +67,25 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
         llm_config,
         executable.clone(),
     )?;
-    let result = install_prepared(&prepared, &codex, &executable);
+    // Minting is a network call layered onto an otherwise local-file install; a failure here
+    // (or an older control plane with no gateway configured) only softens to a status line —
+    // Codex routing must still connect. The credential itself is folded into the same TOML
+    // write install_prepared already performs, so a client-side write/validate failure is
+    // already the existing full-rollback path — it also needs to revoke the freshly minted
+    // credential, since nothing was left registered to use it.
+    let (mcp_credential, mcp_line) = mint_mcp_credential(&prepared);
+    let result = install_prepared(&prepared, &codex, mcp_credential.as_ref());
     let (config_path, model) = match result {
         Ok(installed) => installed,
         Err(error) => {
+            if mcp_credential.is_some() {
+                let client = Client::from_cluster_entry_with_timeout(
+                    &prepared.entry,
+                    Some(std::time::Duration::from_secs(10)),
+                );
+                let _ =
+                    coding_agent_router::revoke_mcp_credential(&client, &prepared.binding.agent_id);
+            }
             return match coding_agent_router::rollback_config(&prepared) {
                 Ok(()) => Err(error),
                 Err(rollback) => Err(error.context(format!(
@@ -76,14 +103,47 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
     );
     println!("Config:                    {}", config_path.display());
     println!("Provider:                  nasiko ({model})");
+    println!("{mcp_line}");
     println!("Session reporting is separate: nasiko agents install codex");
     Ok(())
+}
+
+/// Mints the MCP gateway credential for this connection. Returns the status line the caller
+/// prints alongside the LLM-routing success message; `Some` means the caller must fold the
+/// credential into the config it is about to write.
+fn mint_mcp_credential(
+    prepared: &coding_agent_router::PreparedConnection,
+) -> (Option<coding_agent_router::McpCredential>, String) {
+    let client = Client::from_cluster_entry_with_timeout(
+        &prepared.entry,
+        Some(std::time::Duration::from_secs(10)),
+    );
+    match coding_agent_router::mcp_credential(&client, &prepared.binding.agent_id) {
+        Ok(Some(credential)) => {
+            let line = format!(
+                "MCP gateway: connected (server \"{}\")",
+                coding_agent_router::MCP_SERVER_NAME
+            );
+            (Some(credential), line)
+        }
+        Ok(None) => (
+            None,
+            "MCP gateway: not configured on this control plane (MCP_GATEWAY_PUBLIC_URL unset); skipping"
+                .to_string(),
+        ),
+        Err(error) => (
+            None,
+            format!(
+                "MCP gateway: unavailable ({error:#}); LLM routing is connected, MCP tools are not"
+            ),
+        ),
+    }
 }
 
 fn install_prepared(
     prepared: &coding_agent_router::PreparedConnection,
     codex: &Path,
-    executable: &Path,
+    mcp_credential: Option<&coding_agent_router::McpCredential>,
 ) -> Result<(PathBuf, String)> {
     let model = responses_model(&prepared.resolved_config)?.to_string();
     let config_path = config_path();
@@ -94,9 +154,8 @@ fn install_prepared(
         config_path.clone(),
         original_config.is_some(),
         &document,
-        executable,
-        &prepared.binding.cluster_url,
         &model,
+        mcp_credential,
     );
     apply_installed(&mut document, &state)?;
     install_local(
@@ -146,6 +205,13 @@ pub fn disconnect(force: bool) -> Result<()> {
     };
     coding_agent_router::disconnect_preflight("Codex", &["codex"], force)?;
     let mut document = read_config(&state.config_path)?;
+    // Remove the MCP server registration and revoke its credential before touching the
+    // unrelated LLM-routing settings below, so a warning from either step never masks whether
+    // the routing restore itself succeeded.
+    restore_mcp_server(&mut document, &state)?;
+    if state.installed_mcp_server.is_some() {
+        revoke_mcp_credential_best_effort(&state.binding);
+    }
     restore_if_unchanged(
         &mut document,
         "model_provider",
@@ -276,11 +342,19 @@ fn build_state(
     config_path: PathBuf,
     original_config_present: bool,
     document: &DocumentMut,
-    executable: &Path,
-    cluster_url: &str,
     model: &str,
+    mcp_credential: Option<&coding_agent_router::McpCredential>,
 ) -> ConnectionState {
-    let installed_provider = provider_item(executable, cluster_url);
+    // `prepare()` always fills in `ConnectionBinding.executable` (the CLI's own binary path,
+    // used as the `codex --exec`-style auth command); reading it here instead of taking a
+    // separate parameter avoids passing the same value into this function twice.
+    let executable = binding
+        .executable
+        .as_deref()
+        .expect("prepare() always sets ConnectionBinding.executable");
+    let installed_provider = provider_item(executable, &binding.cluster_url);
+    let installed_mcp_server =
+        mcp_credential.map(|credential| snapshot(&mcp_server_item(credential)));
     ConnectionState {
         binding,
         config_version: CONFIG_VERSION,
@@ -293,7 +367,22 @@ fn build_state(
         installed_model_provider: snapshot(&value(PROVIDER_ID)),
         installed_model: snapshot(&value(model)),
         installed_provider: snapshot(&installed_provider),
+        original_mcp_servers_present: document.get("mcp_servers").is_some(),
+        original_mcp_server: capture(mcp_server_item_ref(document)),
+        installed_mcp_server,
     }
+}
+
+/// Codex's MCP client is header-less, so the credential travels in the URL
+/// (`connect_url`, `/api/mcp/s/{token}`) rather than an `Authorization` header.
+fn mcp_server_item(credential: &coding_agent_router::McpCredential) -> Item {
+    let mut server = Table::new();
+    let url = credential
+        .connect_url
+        .as_deref()
+        .expect("mcp_server_item is only called with a minted connect_url");
+    server["url"] = value(url);
+    Item::Table(server)
 }
 
 fn provider_item(executable: &Path, cluster_url: &str) -> Item {
@@ -325,6 +414,16 @@ fn apply_installed(document: &mut DocumentMut, state: &ConnectionState) -> Resul
         .as_table_mut()
         .context("Codex setting 'model_providers' must be a table")?;
     providers[PROVIDER_ID] = decode(&state.installed_provider)?;
+
+    if let Some(installed_mcp_server) = &state.installed_mcp_server {
+        if !document.contains_key("mcp_servers") {
+            document["mcp_servers"] = Item::Table(Table::new());
+        }
+        let servers = document["mcp_servers"]
+            .as_table_mut()
+            .context("Codex setting 'mcp_servers' must be a table")?;
+        servers[coding_agent_router::MCP_SERVER_NAME] = decode(installed_mcp_server)?;
+    }
     Ok(())
 }
 
@@ -405,6 +504,32 @@ fn restore_provider(document: &mut DocumentMut, state: &ConnectionState) -> Resu
     Ok(())
 }
 
+/// No-op when this connection never installed an MCP server (`installed_mcp_server` is `None`).
+fn restore_mcp_server(document: &mut DocumentMut, state: &ConnectionState) -> Result<()> {
+    let Some(installed) = &state.installed_mcp_server else {
+        return Ok(());
+    };
+    if mcp_server_snapshot(document).as_deref() != Some(installed.as_str()) {
+        eprintln!(
+            "warning: Codex setting 'mcp_servers.nasiko' changed since connect; leaving it unchanged"
+        );
+        return Ok(());
+    }
+    let Some(servers) = document.get_mut("mcp_servers").and_then(Item::as_table_mut) else {
+        return Ok(());
+    };
+    if state.original_mcp_server.present {
+        servers[coding_agent_router::MCP_SERVER_NAME] =
+            decode(&state.original_mcp_server.snapshot)?;
+    } else {
+        servers.remove(coding_agent_router::MCP_SERVER_NAME);
+    }
+    if servers.is_empty() && !state.original_mcp_servers_present {
+        document.remove("mcp_servers");
+    }
+    Ok(())
+}
+
 fn restore_top_level(document: &mut DocumentMut, key: &str, original: &SavedItem) -> Result<()> {
     if original.present {
         document[key] = decode(&original.snapshot)?;
@@ -451,6 +576,37 @@ fn provider_snapshot(document: &DocumentMut) -> Option<String> {
     provider_item_ref(document).map(snapshot)
 }
 
+fn mcp_server_item_ref(document: &DocumentMut) -> Option<&Item> {
+    document
+        .get("mcp_servers")
+        .and_then(Item::as_table)
+        .and_then(|servers| servers.get(coding_agent_router::MCP_SERVER_NAME))
+}
+
+fn mcp_server_snapshot(document: &DocumentMut) -> Option<String> {
+    mcp_server_item_ref(document).map(snapshot)
+}
+
+/// Best-effort server-side revoke during disconnect: resolves the bound cluster from config and
+/// warns rather than fails, since disconnect must still remove the local Codex config even when
+/// the control plane is unreachable.
+fn revoke_mcp_credential_best_effort(binding: &ConnectionBinding) {
+    let result = (|| -> Result<()> {
+        let cfg = config::load()?;
+        let entry = cfg.clusters.get(&binding.cluster).ok_or_else(|| {
+            anyhow::anyhow!("Nasiko cluster '{}' no longer exists", binding.cluster)
+        })?;
+        let client = Client::from_cluster_entry_with_timeout(
+            entry,
+            Some(std::time::Duration::from_secs(10)),
+        );
+        coding_agent_router::revoke_mcp_credential(&client, &binding.agent_id)
+    })();
+    if let Err(error) = result {
+        eprintln!("warning: failed to revoke the MCP gateway credential: {error:#}");
+    }
+}
+
 fn restore_file(path: &Path, content: Option<&[u8]>) -> Result<()> {
     match content {
         Some(content) => coding_agent_router::atomic_write(path, content),
@@ -493,15 +649,29 @@ mod tests {
     }
 
     fn installed(original: &str) -> (DocumentMut, ConnectionState) {
+        installed_with_mcp(original, None)
+    }
+
+    fn mcp_credential() -> coding_agent_router::McpCredential {
+        coding_agent_router::McpCredential {
+            token: "ngt_secret".into(),
+            gateway_url: Some("https://cp.example/api/mcp".into()),
+            connect_url: Some("https://cp.example/api/mcp/s/ngt_secret".into()),
+        }
+    }
+
+    fn installed_with_mcp(
+        original: &str,
+        mcp_credential: Option<&coding_agent_router::McpCredential>,
+    ) -> (DocumentMut, ConnectionState) {
         let document = original.parse::<DocumentMut>().unwrap();
         let state = build_state(
             binding(),
             "/tmp/config.toml".into(),
             true,
             &document,
-            Path::new("/Applications/Nasiko CLI/nasiko"),
-            "https://cp.example/",
             "gpt-5.4",
+            mcp_credential,
         );
         let mut installed = document;
         apply_installed(&mut installed, &state).unwrap();
@@ -610,6 +780,124 @@ base_url = "https://user.example"
             Some("https://user-change/v1")
         );
         assert!(!document.to_string().contains("hooks"));
+    }
+
+    #[test]
+    fn mcp_server_is_installed_with_the_connect_url_when_a_credential_is_minted() {
+        let credential = mcp_credential();
+        let (document, state) = installed_with_mcp("other = 1\n", Some(&credential));
+        assert_eq!(
+            document["mcp_servers"][coding_agent_router::MCP_SERVER_NAME]["url"].as_str(),
+            Some("https://cp.example/api/mcp/s/ngt_secret")
+        );
+        assert!(state.installed_mcp_server.is_some());
+        assert!(document.to_string().contains("other = 1"));
+    }
+
+    #[test]
+    fn no_credential_means_no_mcp_servers_table_is_touched() {
+        let (document, state) = installed("other = 1\n");
+        assert!(!document.contains_key("mcp_servers"));
+        assert!(state.installed_mcp_server.is_none());
+    }
+
+    #[test]
+    fn restore_mcp_server_is_a_no_op_when_this_connection_never_installed_one() {
+        let (mut document, state) = installed("other = 1\n");
+        let before = document.to_string();
+        restore_mcp_server(&mut document, &state).unwrap();
+        assert_eq!(document.to_string(), before);
+    }
+
+    #[test]
+    fn disconnect_removes_the_installed_mcp_server_and_leaves_an_unrelated_one_intact() {
+        let credential = mcp_credential();
+        let original = "[mcp_servers.other]\nurl = \"https://other.example\"\n";
+        let (mut document, state) = installed_with_mcp(original, Some(&credential));
+        restore_mcp_server(&mut document, &state).unwrap();
+        assert!(
+            document["mcp_servers"]
+                .as_table()
+                .unwrap()
+                .get(coding_agent_router::MCP_SERVER_NAME)
+                .is_none()
+        );
+        assert_eq!(
+            document["mcp_servers"]["other"]["url"].as_str(),
+            Some("https://other.example")
+        );
+    }
+
+    #[test]
+    fn disconnect_restores_a_pre_existing_mcp_server_byte_for_byte() {
+        let credential = mcp_credential();
+        let original = "[mcp_servers.nasiko]\nurl = \"https://user.example\"\n";
+        let (mut document, state) = installed_with_mcp(original, Some(&credential));
+        restore_if_unchanged(
+            &mut document,
+            "model_provider",
+            &state.installed_model_provider,
+            &state.original_model_provider,
+        )
+        .unwrap();
+        restore_if_unchanged(
+            &mut document,
+            "model",
+            &state.installed_model,
+            &state.original_model,
+        )
+        .unwrap();
+        restore_provider(&mut document, &state).unwrap();
+        restore_mcp_server(&mut document, &state).unwrap();
+        assert_eq!(document.to_string(), original);
+    }
+
+    #[test]
+    fn disconnect_drops_the_mcp_servers_table_when_it_became_empty_and_did_not_exist_before() {
+        let credential = mcp_credential();
+        let (mut document, state) = installed_with_mcp("other = 1\n", Some(&credential));
+        restore_if_unchanged(
+            &mut document,
+            "model_provider",
+            &state.installed_model_provider,
+            &state.original_model_provider,
+        )
+        .unwrap();
+        restore_if_unchanged(
+            &mut document,
+            "model",
+            &state.installed_model,
+            &state.original_model,
+        )
+        .unwrap();
+        restore_provider(&mut document, &state).unwrap();
+        restore_mcp_server(&mut document, &state).unwrap();
+        assert_eq!(document.to_string(), "other = 1\n");
+    }
+
+    #[test]
+    fn state_lacking_the_mcp_fields_still_deserializes() {
+        let state: ConnectionState = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "cluster": "local",
+            "cluster_url": "https://cp.example/",
+            "agent_id": "agent-id",
+            "agent_name": "codex",
+            "config_version": 1,
+            "config_path": "/tmp/config.toml",
+            "original_config_present": true,
+            "original_model_providers_present": true,
+            "original_model_provider": {"present": false},
+            "original_model": {"present": false},
+            "original_provider": {"present": false},
+            "installed_model_provider": "nasiko",
+            "installed_model": "gpt-5.4",
+            "installed_provider": "nasiko"
+        }))
+        .unwrap();
+        assert!(!state.original_mcp_servers_present);
+        assert!(!state.original_mcp_server.present);
+        assert!(state.installed_mcp_server.is_none());
     }
 
     #[test]

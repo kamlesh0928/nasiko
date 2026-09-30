@@ -10,6 +10,7 @@ use serde_json::{Map, Value, json};
 
 use crate::api::Client;
 use crate::commands::coding_agent_router::{self, AgentSpec, ConnectionBinding};
+use crate::config;
 
 const DEFAULT_AGENT_NAME: &str = "claude-code";
 
@@ -29,11 +30,18 @@ struct ConnectionState {
     original_env_present: bool,
     original_helper: SavedValue,
     original_base_url: SavedValue,
+    /// Whether the Nasiko MCP gateway was registered with Claude Code's own `claude mcp` store
+    /// (settings.json carries no `mcpServers`, so this is the only record of it). `false` for
+    /// connections made before this field existed, and for a control plane with no public
+    /// gateway URL to register.
+    #[serde(default)]
+    mcp_installed: bool,
 }
 
 /// One-time setup. Claude subsequently invokes the hidden credential helper itself.
 pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
-    which::which("claude").context("Claude Code is not installed or 'claude' is not on PATH")?;
+    let claude = which::which("claude")
+        .context("Claude Code is not installed or 'claude' is not on PATH")?;
     if state_path().exists() {
         bail!(
             "Claude Code is already connected; run `nasiko disconnect claude` before reconnecting"
@@ -69,13 +77,14 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
     );
     settings.insert("apiKeyHelper".into(), Value::String(helper_command.clone()));
 
-    let state = ConnectionState {
+    let mut state = ConnectionState {
         binding: prepared.binding.clone(),
         settings_path: settings_path.clone(),
         helper_command,
         original_env_present,
         original_helper,
         original_base_url,
+        mcp_installed: false,
     };
     let install_result = (|| -> Result<()> {
         coding_agent_router::atomic_write_json(&state_path(), &state)?;
@@ -94,6 +103,13 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
         };
     }
 
+    // LLM routing is now fully installed and persisted. Layering the MCP gateway on top must
+    // not undo that: a mint failure (e.g. an older control plane without this route) only
+    // downgrades to a warning. A client-side registration failure after a successful mint is
+    // different — it leaves a live credential nothing points at, so that credential is revoked
+    // and the error is returned instead of being swallowed.
+    let mcp_line = install_mcp_gateway(&claude, &prepared, &mut state)?;
+
     let provider = prepared
         .resolved_config
         .get("provider")
@@ -108,8 +124,146 @@ pub fn connect(agent: Option<&str>, llm_config: Option<&str>) -> Result<()> {
         "Connected Claude Code to Nasiko ({}, {provider}/{model}).",
         state.binding.cluster
     );
+    println!("{mcp_line}");
     println!("Run `claude` normally. Disconnect with: nasiko disconnect claude");
     Ok(())
+}
+
+/// Mints the MCP gateway credential and, when one is minted, registers it as an HTTP MCP server
+/// through Claude Code's own CLI (`claude mcp add-json`) — Claude Code does not read `mcpServers`
+/// from `settings.json`, so its own store is the only way to add a user-scope server. Returns the
+/// status line the caller prints alongside the LLM-routing success message.
+fn install_mcp_gateway(
+    claude: &Path,
+    prepared: &coding_agent_router::PreparedConnection,
+    state: &mut ConnectionState,
+) -> Result<String> {
+    let client = Client::from_cluster_entry_with_timeout(
+        &prepared.entry,
+        Some(std::time::Duration::from_secs(10)),
+    );
+    let agent_id = &prepared.binding.agent_id;
+    let credential = match coding_agent_router::mcp_credential(&client, agent_id) {
+        Ok(Some(credential)) => credential,
+        Ok(None) => {
+            return Ok(
+                "MCP gateway: not configured on this control plane (MCP_GATEWAY_PUBLIC_URL unset); skipping"
+                    .to_string(),
+            );
+        }
+        Err(error) => {
+            return Ok(format!(
+                "MCP gateway: unavailable ({error:#}); LLM routing is connected, MCP tools are not"
+            ));
+        }
+    };
+    if let Err(error) = run_mcp_add(claude, &credential) {
+        let _ = coding_agent_router::revoke_mcp_credential(&client, agent_id);
+        return Err(error);
+    }
+    state.mcp_installed = true;
+    coding_agent_router::atomic_write_json(&state_path(), &*state)?;
+    Ok(format!(
+        "MCP gateway: connected (server \"{}\")",
+        coding_agent_router::MCP_SERVER_NAME
+    ))
+}
+
+/// `claude mcp add-json --scope user <name> '<json>'` args. The credential token is embedded in
+/// the JSON blob rather than passed via `--header`, so it appears in the process argument list
+/// only for the duration of this call; `add-json` is used over `add --transport http --header`
+/// so there is no per-flag surface that can drift out of sync with what the server issues.
+fn mcp_add_command(credential: &coding_agent_router::McpCredential) -> Vec<String> {
+    let url = credential
+        .gateway_url
+        .as_deref()
+        .expect("mcp_add_command is only called with a minted gateway_url");
+    let payload = json!({
+        "type": "http",
+        "url": url,
+        "headers": {"Authorization": format!("Bearer {}", credential.token)},
+    })
+    .to_string();
+    vec![
+        "mcp".to_string(),
+        "add-json".to_string(),
+        "--scope".to_string(),
+        "user".to_string(),
+        coding_agent_router::MCP_SERVER_NAME.to_string(),
+        payload,
+    ]
+}
+
+/// `claude mcp remove --scope user <name>` args — same scope `mcp_add_command` installs into.
+fn mcp_remove_command() -> Vec<String> {
+    vec![
+        "mcp".to_string(),
+        "remove".to_string(),
+        "--scope".to_string(),
+        "user".to_string(),
+        coding_agent_router::MCP_SERVER_NAME.to_string(),
+    ]
+}
+
+fn run_mcp_add(claude: &Path, credential: &coding_agent_router::McpCredential) -> Result<()> {
+    let output = Command::new(claude)
+        .args(mcp_add_command(credential))
+        .output()
+        .context("failed to run `claude mcp add-json`")?;
+    if !output.status.success() {
+        bail!(
+            "claude mcp add-json failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Removes the Nasiko MCP server registration. Claude Code exits non-zero when the server is
+/// already absent (`No MCP server named "nasiko" in user scope`); that specific case is treated
+/// as success so disconnect stays idempotent.
+fn run_mcp_remove(claude: &Path) -> Result<()> {
+    let output = Command::new(claude)
+        .args(mcp_remove_command())
+        .output()
+        .context("failed to run `claude mcp remove`")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("No MCP server named") {
+        return Ok(());
+    }
+    bail!("claude mcp remove failed: {}", stderr.trim());
+}
+
+/// Best-effort MCP gateway teardown for disconnect: removes the client-side registration, then
+/// revokes the server-side credential. Neither failure blocks removing the local Nasiko config —
+/// both are reported as warnings.
+fn teardown_mcp_gateway(binding: &ConnectionBinding) {
+    let removal = (|| -> Result<()> {
+        let claude = which::which("claude")
+            .context("Claude Code is not installed or 'claude' is not on PATH")?;
+        run_mcp_remove(&claude)
+    })();
+    if let Err(error) = removal {
+        eprintln!("warning: failed to remove the Nasiko MCP server from Claude Code: {error:#}");
+    }
+
+    let revoke = (|| -> Result<()> {
+        let cfg = config::load()?;
+        let entry = cfg.clusters.get(&binding.cluster).ok_or_else(|| {
+            anyhow::anyhow!("Nasiko cluster '{}' no longer exists", binding.cluster)
+        })?;
+        let client = Client::from_cluster_entry_with_timeout(
+            entry,
+            Some(std::time::Duration::from_secs(10)),
+        );
+        coding_agent_router::revoke_mcp_credential(&client, &binding.agent_id)
+    })();
+    if let Err(error) = revoke {
+        eprintln!("warning: failed to revoke the MCP gateway credential: {error:#}");
+    }
 }
 
 pub fn disconnect(force: bool) -> Result<()> {
@@ -124,6 +278,9 @@ fn disconnect_internal(print: bool, force: bool) -> Result<()> {
         return Ok(());
     };
     coding_agent_router::disconnect_preflight("Claude Code", &["claude"], force)?;
+    if state.mcp_installed {
+        teardown_mcp_gateway(&state.binding);
+    }
     let mut settings = read_json_object(&state.settings_path)?;
     restore_top_level(
         &mut settings,
@@ -174,6 +331,14 @@ pub fn status() -> Result<()> {
             "active"
         } else {
             "changed since connect"
+        }
+    );
+    println!(
+        "MCP gateway: {}",
+        if state.mcp_installed {
+            "configured"
+        } else {
+            "not configured"
         }
     );
     Ok(())
@@ -376,6 +541,7 @@ mod tests {
         assert_eq!(state.binding.cluster, "local");
         assert!(state.binding.principal_id.is_none());
         assert!(state.binding.executable.is_none());
+        assert!(!state.mcp_installed);
     }
 
     #[test]
@@ -447,5 +613,36 @@ mod tests {
     #[test]
     fn shell_quotes_apostrophes() {
         assert_eq!(shell_quote(Path::new("/tmp/a'b")), "'/tmp/a'\\''b'");
+    }
+
+    fn mcp_credential() -> coding_agent_router::McpCredential {
+        coding_agent_router::McpCredential {
+            token: "ngt_secret".into(),
+            gateway_url: Some("https://cp.example/api/mcp".into()),
+            connect_url: Some("https://cp.example/api/mcp/s/ngt_secret".into()),
+        }
+    }
+
+    #[test]
+    fn mcp_add_command_registers_an_http_server_with_the_bearer_header() {
+        let args = mcp_add_command(&mcp_credential());
+        assert_eq!(args[0], "mcp");
+        assert_eq!(args[1], "add-json");
+        assert_eq!(args[2], "--scope");
+        assert_eq!(args[3], "user");
+        assert_eq!(args[4], "nasiko");
+        let payload: Value = serde_json::from_str(&args[5]).unwrap();
+        assert_eq!(payload["type"], "http");
+        assert_eq!(payload["url"], "https://cp.example/api/mcp");
+        assert_eq!(payload["headers"]["Authorization"], "Bearer ngt_secret");
+        assert_eq!(args.len(), 6);
+    }
+
+    #[test]
+    fn mcp_remove_command_targets_the_same_scope_and_name() {
+        assert_eq!(
+            mcp_remove_command(),
+            vec!["mcp", "remove", "--scope", "user", "nasiko"]
+        );
     }
 }
