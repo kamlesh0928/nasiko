@@ -35,7 +35,7 @@ use crate::usage::TokenUsageBuilder;
 /// 2. `tools/list` (and initialize/ping) → allowed with agent-only identity
 /// 3. `tools/call` with no/unknown/dead-flow traceparent → 403
 /// 3b. …unless the agent's row is a CLI-bound local coding agent
-///     (`coding_agent_integration_id` set, spec §16 A3) — such a row is never
+///     (`coding_agent_integration_id` set) — such a row is never
 ///     dispatched through a flow, so a flow-less `tools/call` resolves to its
 ///     owner instead of 403 (`agent_owner`, below `dispatch`)
 /// 4. `tools/call` where the agent is not a recorded flow participant → 403
@@ -94,19 +94,20 @@ pub async fn mcp_gateway(
 /// tool.
 ///
 /// That bound does NOT hold for a CLI-bound local coding-agent row
-/// (`coding_agent_integration_id` set, spec §16 A3/A4): such a row has no
+/// (`coding_agent_integration_id` set): such a row has no
 /// flow to require, so a leaked connect URL for one CAN call tools —
 /// attributed to, and scoped to, that row's owner: exactly the connectors the
 /// owner can access (their own, plus anything shared to them) that are also
 /// enabled for this specific agent row, never another user's. This is the
 /// same attribution the LLM router already applies to these rows with no flow
-/// at all (`oss/llm-router/src/handlers/chat.rs:312-323`). Sharing such a row
-/// out to widen that scope will be enforced against by Task 1.6 (spec A4),
-/// not yet landed. The credential itself has no TTL of its own — it rotates
-/// only on re-mint (`nasiko_mcp_gateway::agent_tokens::mint`, same primitive
-/// every gateway token uses), and there is no CLI-triggered re-mint path for
-/// these rows yet (Task 1.7's `POST /api/agents/{id}/mcp-token`); until then a
-/// leaked coding-agent connect URL is live for as long as the row is.
+/// at all (`oss/llm-router/src/handlers/chat.rs:312-323`). That scope can
+/// never widen to another user: sharing a coding-agent row is rejected with a
+/// 409 (`agents::coding_agent::reject_if_coding_agent`, checked before every
+/// `agent_grants` insert), so the row stays single-owner for as long as it
+/// exists. The credential itself has no TTL of its own — it rotates only on
+/// re-mint (`nasiko_mcp_gateway::agent_tokens::mint`, same primitive every
+/// gateway token uses); until this row gets its own CLI-triggered re-mint
+/// path, a leaked coding-agent connect URL is live for as long as the row is.
 #[utoipa::path(
     post,
     path = "/api/mcp/s/{token}",
@@ -238,8 +239,8 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
     let (user_id, verified_flow_id) = match flow_user(state, traceparent, agent_id).await {
         Ok((user_id, flow_id)) => (user_id, Some(flow_id)),
         Err(denial) => match agent_owner(state, agent_id).await {
-            // Deliberate policy (MCP_GATEWAY_AGENT_AUTH.md §5, rule 3b; spec
-            // §16 A3): a local coding agent — a row the CLI bound with
+            // Deliberate policy (MCP_GATEWAY_AGENT_AUTH.md §5, rule 3b):
+            // a local coding agent — a row the CLI bound with
             // `coding_agent_integration_id` — is never dispatched through the
             // proxy, so it never has a flow; it acts as its owner instead,
             // even for `tools/call`. Same predicate the LLM router uses for

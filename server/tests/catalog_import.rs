@@ -1,10 +1,10 @@
 //! Integration tests for `POST /api/import/upload` (`oss/server/src/catalog/import.rs`).
 //!
-//! Scoped to Task 1.6 (spec §16 A4): `build_and_deploy` — shared by `import_upload`,
-//! `import_github`, and `import_registry`'s source-artifact branch — must reject before its own
-//! `(owner_id, name)` upsert when an existing row by that key is a CLI-bound coding agent. Only
-//! `import_upload` has a real test harness (no OAuth/registry mocking needed — see the module doc
-//! in `coding_agent.rs` for the other two, untested at the integration level for that reason).
+//! `build_and_deploy` — shared by `import_upload`, `import_github`, and `import_registry`'s
+//! source-artifact branch — must reject before its own `(owner_id, name)` upsert when an
+//! existing row by that key is a CLI-bound coding agent. Only `import_upload` has a real test
+//! harness here (no OAuth/registry mocking needed); the other two exercise the same shared guard
+//! function, just without integration coverage of their own call sites.
 //!
 //! Requires infra (Postgres :5432, Redis, S3):
 //!   cargo test -p nasiko-server --test catalog_import -- --test-threads=1
@@ -84,9 +84,9 @@ async fn agent_builds_count(server: &common::TestServer, agent_id: Uuid) -> i64 
         .unwrap()
 }
 
-/// Task 1.6 (spec §16 A4): `build_and_deploy`'s `(owner_id, name)` guard must fire before
-/// `find_owned_agent` even looks the row up — checked here via the actual HTTP route rather than
-/// just the shared helper, since this is a distinct call site from `agents::upload`'s.
+/// `build_and_deploy`'s `(owner_id, name)` guard must fire before `find_owned_agent` even looks
+/// the row up — checked here via the actual HTTP route rather than just the shared helper, since
+/// this is a distinct call site from `agents::upload`'s.
 #[tokio::test]
 #[serial]
 async fn import_upload_rejects_when_name_collides_with_a_coding_agent_row_owned_by_the_caller() {

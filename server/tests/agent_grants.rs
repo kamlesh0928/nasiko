@@ -1,10 +1,9 @@
 //! Integration tests for `POST /api/agents/{id}/grants/*` (`oss/server/src/agents/grants.rs`).
 //!
-//! Coverage here is scoped to Task 1.6 (spec §16 A4): a coding-agent row
-//! (`agents.coding_agent_integration_id IS NOT NULL`) must never be shared via `agent_grants` —
-//! Task 1.5's MCP-gateway owner-fallback policy is safe only while such a row stays single-owner.
-//! No other route on this router has dedicated coverage yet, so each test also proves an ordinary
-//! row is unaffected by the new guard rather than assuming it from other suites.
+//! A coding-agent row (`agents.coding_agent_integration_id IS NOT NULL`) must never be shared via
+//! `agent_grants` — the MCP gateway's owner-fallback policy is safe only while such a row stays
+//! single-owner. No other route on this router has dedicated coverage yet, so each test also
+//! proves an ordinary row is unaffected by the guard rather than assuming it from other suites.
 //!
 //! Requires infra (Postgres :5432, Redis, S3) like the rest of the suite:
 //!   `cargo test -p nasiko-server --test agent_grants -- --test-threads=1`

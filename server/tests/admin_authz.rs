@@ -265,10 +265,9 @@ async fn restart_allows_superuser() {
     s.server.cleanup().await;
 }
 
-/// Task 1.6 (spec §16 A4): restart reads `agents.image` and redeploys with no requirement that a
-/// live container already exist — a second, image-agnostic way to put a real container behind a
-/// coding-agent row (the first being `PUT /api/agents/{id}/update`'s upsert). Must 409 even for
-/// the row's own owner.
+/// Restart reads `agents.image` and redeploys with no requirement that a live container already
+/// exist — a second, image-agnostic way to put a real container behind a coding-agent row (the
+/// first being `PUT /api/agents/{id}/update`'s upsert). Must 409 even for the row's own owner.
 #[tokio::test]
 #[serial]
 async fn restart_rejects_coding_agent_row_but_not_a_normal_one() {
@@ -437,8 +436,8 @@ async fn deploy_onto_existing_agent_name_rejects_non_owner() {
     s.server.cleanup().await;
 }
 
-/// Task 1.6 (spec §16 A4): a coding-agent row must never be deployed onto, even by its own
-/// owner — it would inherit the MCP gateway's owner-fallback policy while becoming dispatchable.
+/// A coding-agent row must never be deployed onto, even by its own owner — it would inherit the
+/// MCP gateway's owner-fallback policy while becoming dispatchable.
 #[tokio::test]
 #[serial]
 async fn deploy_onto_existing_agent_name_rejects_coding_agent_row() {

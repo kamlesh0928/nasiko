@@ -165,13 +165,19 @@ impl RuntimeResumeNotifier {
             // other path ever persisted a `context_id` naming a different
             // user's session. A zero-row affect is not a no-op to shrug at
             // (mirrors the `flows` registration guard below, same reasoning):
-            // silently skipping the mapping and returning `trace_id` anyway
-            // would hand back a `traceparent` this notifier itself never
-            // registered a `flows`/`flow_participants` row for, so the
-            // agent's retry would 403 with "traceparent does not resolve to
-            // a live flow" — the nudge must fail loudly instead of being
-            // delivered as if healthy, and must never create a trace mapping
-            // into a chat session it doesn't own.
+            // continuing to deliver the nudge anyway does NOT merely leave a
+            // `traceparent` with no live flow behind it — the registration
+            // below runs unconditionally and would still open one, keyed on
+            // this fresh `trace_id` and attributed to `owner_user_id`, over a
+            // context that user was never granted access to. And since no
+            // `session_traces` row now maps `trace_id` back to the real
+            // `context_id`, the agent's retry resolves its own traceparent to
+            // `trace_id` itself (`resolve_context_id`'s no-mapping fallback),
+            // which never matches the HITL row's actual `context_id` — so
+            // `claim_resolved_tool_approval`'s exact-match lookup fails and
+            // the human is asked to approve the same action again. Fail
+            // loudly instead: never open that flow when the ownership check
+            // itself failed.
             match sqlx::query(
                 "INSERT INTO session_traces (session_id, trace_id, agent_id)
                  SELECT $1, $2, $3

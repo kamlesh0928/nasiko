@@ -1,9 +1,9 @@
 //! Shared guard for CLI-bound coding-agent rows (`agents.coding_agent_integration_id IS NOT
-//! NULL`, spec §16 A4).
+//! NULL`).
 //!
-//! Task 1.5's owner-fallback policy at the MCP gateway (`oss/server/src/mcp/handlers/gateway.rs`)
-//! is safe only while such a row stays single-owner and is never dispatched into. Two operations
-//! would break that precondition:
+//! Such a row must stay single-owner and never be dispatched into — the MCP gateway's
+//! owner-fallback policy (`oss/server/src/mcp/handlers/gateway.rs`) depends on both holding.
+//! Two operations would break that invariant:
 //!
 //!   - **Sharing** the row via an `agent_grants` insert — a listing would then show it to
 //!     someone other than its owner, and a future route-to-local-agent feature would silently
@@ -13,28 +13,10 @@
 //!     deployed container would inherit the owner policy while being dispatchable, which is the
 //!     precondition of a participant-laundering chain.
 //!
-//! Both are rejected here with a 409, from one shared check called by every mutation that could
-//! do either:
-//!
-//!   - `agents::grants` (`make_public`, `add_user_grant`) and `agents::update`
-//!     (`update_agent`, `rollback_agent`)
-//!   - `agents::upload::upload_and_deploy`'s `(owner_id, name)` upsert
-//!   - `github::github_clone`'s `(owner_id, name)` upsert
-//!   - `catalog::import::build_and_deploy`'s `(owner_id, name)` upsert (shared by `import_upload`,
-//!     `import_github`, and `import_registry`'s source-artifact branch) and
-//!     `import_registry`'s own image-manifest branch
-//!   - `admin::routes::deploy`'s by-name deploy and `admin::routes::restart`'s by-id redeploy
-//!   - `agents::deployments::restart_deployment`'s Docker destroy+recreate path (only
-//!     reachable for a row that already had a container deployed onto it before these guards
-//!     existed — a coding-agent row is otherwise never inserted into `agent_deployments` at
-//!     all — but closed for completeness)
-//!   - `catalog::routes::update` (`PUT /api/agents/{id}`) when the body would set `image`,
-//!     `status`, or `activate_version` paired with a `version` — metadata-only edits (name,
-//!     description, ...) still go through
-//!   - `agents::reconcile::reconcile_agents_on_startup`'s selection query (a `WHERE` clause, not a
-//!     call into this module — a coding-agent row is simply never selected for redeploy on boot)
-//!   - and — wrapping, never forking, this OSS check — any edition-specific grants handler that
-//!     inserts into `agent_grants` of its own
+//! Both are rejected here with a 409. The rule: every path that inserts into `agent_grants`,
+//! changes `agents.owner_id`, or deploys onto an existing agent row must call one of the
+//! functions below before its side effect — in OSS or, wrapping rather than forking this check,
+//! in an edition-specific handler.
 //!
 //! A DB error while answering "is this a coding agent" fails the request closed (500), not open:
 //! silently treating an error as "not a coding agent" would let the share/deploy proceed exactly

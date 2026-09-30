@@ -391,22 +391,19 @@ async fn resolved_row_is_delivered_exactly_once_end_to_end() {
     assert_eq!(row.resume_dispatch_attempts, 1);
 }
 
-/// The exploit a code-quality review of Task 1.5 caught: a coding-agent row's
-/// owner-fallback `tools/call` can carry a well-formed traceparent naming
-/// some OTHER user's (the "victim's") live or recently-live flow. Before this
-/// fix, `oss/mcp-gateway/src/session.rs::resolve_context_id` could hand that
-/// flow's own trace id back as a HITL row's `context_id` (no `session_traces`
-/// mapping yet), and this notifier's resume nudge would then upsert `flows`
-/// keyed on that trace id — flipping the victim's flow back to `running` and
-/// adding the coding-agent row to `flow_participants`, after which
-/// `gateway.rs::flow_user` would resolve the coding row's calls as acting
-/// for the VICTIM, not its real owner. `create_tool_approval_id` no longer
-/// seeds a `context_id` from anything but a verified flow (see its own doc
-/// comment) — this test instead proves the second, independent guard: even
-/// if a `context_id` naming another user's flow ever reaches this notifier
-/// (a persisted row is trusted input to `notify`, not re-validated against
-/// how it was created), `traceparent_for_context`'s `flows.user_id = $2`
-/// scope on the `ON CONFLICT DO UPDATE` must make the adoption attempt a
+/// The exploit this guard closes: a coding-agent row's owner-fallback `tools/call` can carry a
+/// well-formed traceparent naming some OTHER user's (the "victim's") live or recently-live flow.
+/// Without `traceparent_for_context`'s `flows.user_id = $2` scope on the `ON CONFLICT DO UPDATE`,
+/// `oss/mcp-gateway/src/session.rs::resolve_context_id` handing that flow's own trace id back as
+/// a HITL row's `context_id` (no `session_traces` mapping yet) would let this notifier's resume
+/// nudge upsert `flows` keyed on that trace id — flipping the victim's flow back to `running` and
+/// adding the coding-agent row to `flow_participants`, after which `gateway.rs::flow_user` would
+/// resolve the coding row's calls as acting for the VICTIM, not its real owner.
+/// `create_tool_approval_id` never seeds a `context_id` from anything but a verified flow (see
+/// its own doc comment) — this test instead proves the second, independent guard: even if a
+/// `context_id` naming another user's flow ever reaches this notifier (a persisted row is trusted
+/// input to `notify`, not re-validated against how it was created), `traceparent_for_context`'s
+/// `flows.user_id = $2` scope on the `ON CONFLICT DO UPDATE` must make the adoption attempt a
 /// no-op and the notify abort, rather than silently succeeding.
 #[tokio::test]
 async fn resume_nudge_never_adopts_another_users_flow_via_context_id() {
@@ -516,8 +513,13 @@ async fn resume_nudge_never_adopts_another_users_flow_via_context_id() {
 /// `session_traces`-mapping branch, not the `is_raw_trace_id` one the test above exercises) but
 /// names a chat session owned by someone other than this HITL row's own owner. The `WHERE EXISTS`
 /// guard on the `session_traces` insert makes that insert affect 0 rows, and `notify` must abort
-/// right there rather than warn-and-continue with a `trace_id` no `flows`/`flow_participants` row
-/// was ever registered for.
+/// right there rather than warn-and-continue: the flow registration below runs unconditionally,
+/// so continuing would still open a live `flows`/`flow_participants` row for this fresh
+/// `trace_id`, attributed to the row's own owner, over a context (the victim's session) that
+/// owner was never granted. And since no `session_traces` mapping now links `trace_id` back to
+/// the real `context_id`, the agent's retry resolves to `trace_id` itself
+/// (`resolve_context_id`'s no-mapping fallback) — which never matches this HITL row's actual
+/// `context_id`, so the human would be asked to approve the same action again.
 #[tokio::test]
 async fn resume_nudge_aborts_when_context_id_names_another_users_chat_session() {
     let db = TestDb::new("hitl_context_not_owned_test").await;

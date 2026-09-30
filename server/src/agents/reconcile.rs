@@ -36,11 +36,9 @@ struct ReconcilableAgent {
 /// list on every boot.
 pub async fn reconcile_agents_on_startup(state: &AppState) {
     // `AND coding_agent_integration_id IS NULL` — a CLI-bound coding-agent row must never be
-    // deployed onto (Task 1.6, spec §16 A4). Without this, a row that somehow ended up with
-    // `status = 'running'` and a non-NULL `image` (the write-side guards elsewhere in this task
-    // close every route that could set that combination, but this SELECT is the last line of
-    // defense against any that don't) would get a real container behind it on every boot, no
-    // request/response cycle involved to check against at all.
+    // deployed onto. This is the last line of defense: it fires on every boot, with no
+    // request/response cycle to check a guard against, against any row that somehow got
+    // `status = 'running'` and a non-NULL `image` despite the write-side guards elsewhere.
     let agents = match sqlx::query_as::<_, ReconcilableAgent>(
         "SELECT id, name, image, owner_id, writable, writable_path FROM agents \
          WHERE status = 'running' AND deleted_at IS NULL AND image IS NOT NULL \

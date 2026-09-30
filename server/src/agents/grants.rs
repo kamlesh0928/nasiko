@@ -8,6 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::coding_agent::{CodingAgentGuard, reject_if_coding_agent};
 use crate::auth::Claims;
 use crate::state::AppState;
 
@@ -156,12 +157,7 @@ async fn make_public(
     if let Err(r) = check_access(&state, &claims, agent_id).await {
         return r;
     }
-    if let Err(r) = super::coding_agent::reject_if_coding_agent(
-        &state.db,
-        agent_id,
-        super::coding_agent::CodingAgentGuard::Unshareable,
-    )
-    .await
+    if let Err(r) = reject_if_coding_agent(&state.db, agent_id, CodingAgentGuard::Unshareable).await
     {
         return r;
     }
@@ -276,12 +272,7 @@ async fn add_user_grant(
     if let Err(r) = check_access(&state, &claims, agent_id).await {
         return r;
     }
-    if let Err(r) = super::coding_agent::reject_if_coding_agent(
-        &state.db,
-        agent_id,
-        super::coding_agent::CodingAgentGuard::Unshareable,
-    )
-    .await
+    if let Err(r) = reject_if_coding_agent(&state.db, agent_id, CodingAgentGuard::Unshareable).await
     {
         return r;
     }

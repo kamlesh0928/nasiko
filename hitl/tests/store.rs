@@ -1,4 +1,4 @@
-//! Postgres-backed `HitlStore`/`authorize_hitl_action` integration tests (§16 of the HITL plan).
+//! Postgres-backed `HitlStore`/`authorize_hitl_action` integration tests.
 //! Requires `DATABASE_URL` — run via `just infra` then
 //! `cargo test -p nasiko-hitl --test store -- --ignored --test-threads=1` (serial: each test
 //! truncates `hitl_requests` on entry, same `--test-threads=1` convention the repo's own

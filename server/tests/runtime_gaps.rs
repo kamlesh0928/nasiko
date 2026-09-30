@@ -817,9 +817,9 @@ async fn restart_starting_agent_returns_409() {
     server.cleanup().await;
 }
 
-/// Task 1.6 (spec §16 A4): a coding-agent row must never be (re)deployed onto, even through the
-/// deployment-id-keyed restart endpoint — a `stopped` status alone must not let the Docker
-/// destroy+recreate path in `restart_deployment` run against it.
+/// A coding-agent row must never be (re)deployed onto, even through the deployment-id-keyed
+/// restart endpoint — a `stopped` status alone must not let the Docker destroy+recreate path in
+/// `restart_deployment` run against it.
 #[tokio::test]
 #[serial]
 async fn restart_coding_agent_row_returns_409() {

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use nasiko_runtime::{ContainerId, DeploymentSpec};
 
+use crate::agents::coding_agent::CodingAgentGuard;
 use crate::auth::Claims;
 use crate::state::AppState;
 
@@ -306,15 +307,12 @@ pub(crate) async fn restart_deployment(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    // A coding-agent row must never be (re)deployed onto (Task 1.6, spec §16 A4) — the Docker
-    // path below destroys and recreates via `state.runtime.deploy` with no requirement that a
-    // live container already exist, so this is a third, deployment-id-keyed way to put a real
-    // container behind a row the MCP gateway still resolves to its owner with no flow. Only
-    // reachable for a row that already had a container deployed onto it before this task's
-    // write-side guards existed (a coding-agent row is otherwise never inserted into
-    // `agent_deployments` at all), but closed here too for completeness.
-    if let Err(r) = crate::agents::coding_agent::CodingAgentGuard::NotDeployable
-        .reject_if(info.coding_agent_integration_id.is_some())
+    // A coding-agent row must never be (re)deployed onto — the Docker path below destroys and
+    // recreates the container with no requirement that a live one already exist. A coding-agent
+    // row is otherwise never inserted into `agent_deployments` at all, so this only guards a row
+    // that somehow got one anyway.
+    if let Err(r) =
+        CodingAgentGuard::NotDeployable.reject_if(info.coding_agent_integration_id.is_some())
     {
         return r;
     }

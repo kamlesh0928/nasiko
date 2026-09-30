@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use nasiko_runtime::DeploymentStatus;
 
+use crate::agents::coding_agent::CodingAgentGuard;
 use crate::agents::upload::BuildJobPayload;
 use crate::auth::Claims;
 use crate::build::{self, BuildStatus, download_repo_tarball, routes::extract_zip_to_dir};
@@ -156,13 +157,9 @@ pub(crate) async fn update_agent(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    // A coding-agent row must never be deployed onto (Task 1.6, spec §16 A4) — it would inherit
-    // the MCP gateway's owner-fallback policy while becoming dispatchable, the precondition of a
-    // participant-laundering chain. Checked against the row already fetched above, not a fresh
-    // query — `crate::agents::coding_agent::reject_if_coding_agent` would just re-read the same
-    // column.
-    if let Err(r) = crate::agents::coding_agent::CodingAgentGuard::NotDeployable
-        .reject_if(coding_agent_integration_id.is_some())
+    // A coding-agent row must never be deployed onto. Checked against the row already fetched
+    // above, not a fresh query — `reject_if_coding_agent` would just re-read the same column.
+    if let Err(r) = CodingAgentGuard::NotDeployable.reject_if(coding_agent_integration_id.is_some())
     {
         return r;
     }
@@ -797,9 +794,8 @@ pub(crate) async fn rollback_agent(
     }
 
     // Same guard as `update_agent`: a coding-agent row must never be (re)deployed onto, including
-    // via rollback (Task 1.6, spec §16 A4).
-    if let Err(r) = crate::agents::coding_agent::CodingAgentGuard::NotDeployable
-        .reject_if(coding_agent_integration_id.is_some())
+    // via rollback.
+    if let Err(r) = CodingAgentGuard::NotDeployable.reject_if(coding_agent_integration_id.is_some())
     {
         return r;
     }

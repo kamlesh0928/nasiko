@@ -463,12 +463,12 @@ async fn list_excludes_internal_agent_even_for_superuser() {
     server.cleanup().await;
 }
 
-/// Task 1.6 (spec §16 A4): a coding-agent row is visible ONLY to its own owner, even when marked
-/// `is_public` directly — never via `is_public`, a grant, or a superuser's normally-unrestricted
-/// view. A listing showing it to anyone else would violate the single-owner precondition Task
-/// 1.5's MCP-gateway owner-fallback policy relies on. The owner themselves must still see it,
-/// though (the product expectation that a connected coding agent shows in its own owner's list) —
-/// unlike `is_internal`, this exclusion is owner-scoped, not absolute.
+/// A coding-agent row is visible ONLY to its own owner, even when marked `is_public` directly —
+/// never via `is_public`, a grant, or a superuser's normally-unrestricted view. A listing showing
+/// it to anyone else would violate the single-owner precondition the MCP gateway's owner-fallback
+/// policy relies on. The owner themselves must still see it, though (the product expectation that
+/// a connected coding agent shows in its own owner's list) — unlike `is_internal`, this exclusion
+/// is owner-scoped, not absolute.
 #[tokio::test]
 #[serial]
 async fn list_shows_coding_agent_row_only_to_its_owner() {
@@ -676,9 +676,9 @@ async fn search_includes_public_agent_for_non_owner() {
     server.cleanup().await;
 }
 
-/// Task 1.6 (spec §16 A4): `search()` used to run `agent_access_predicate` with no
-/// `coding_agent_integration_id` filter at all, so a coding-agent row marked `is_public` leaked
-/// through search to any caller. Same owner-only visibility rule as `list`/`by_skill`.
+/// `search()` runs `agent_access_predicate` with the same `coding_agent_integration_id` filter as
+/// `list`/`by_skill` — without it, a coding-agent row marked `is_public` would leak through
+/// search to any caller.
 #[tokio::test]
 #[serial]
 async fn search_shows_coding_agent_row_only_to_its_owner() {
@@ -991,11 +991,11 @@ async fn coding_agent_registration_is_server_managed_idempotent_and_conflict_saf
     server.cleanup().await;
 }
 
-/// Task 1.6 (spec §16 A4): `PUT /api/agents/{id}` must keep ordinary metadata edits working for
-/// a coding agent's owner (name/description/tags/... are legitimate — the row is still a real
-/// catalog entry, just not a deployable one) while rejecting any body that would actually deploy
-/// onto it: a new `image`, a raw `status` write (which could otherwise plant `status = 'running'`
-/// for `reconcile_agents_on_startup` to pick up and redeploy on the next boot), or an
+/// `PUT /api/agents/{id}` must keep ordinary metadata edits working for a coding agent's owner
+/// (name/description/tags/... are legitimate — the row is still a real catalog entry, just not a
+/// deployable one) while rejecting any body that would actually deploy onto it: a new `image`, a
+/// raw `status` write (which could otherwise plant `status = 'running'` for
+/// `reconcile_agents_on_startup` to pick up and redeploy on the next boot), or an
 /// `activate_version` paired with a `version`.
 #[tokio::test]
 #[serial]

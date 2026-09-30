@@ -338,8 +338,8 @@ async fn update_duplicate_version_in_agent_versions_returns_409() {
     server.cleanup().await;
 }
 
-/// Task 1.6 (spec §16 A4): a coding-agent row must never be deployed onto — it would inherit the
-/// MCP gateway's owner-fallback policy while becoming dispatchable.
+/// A coding-agent row must never be deployed onto — it would inherit the MCP gateway's
+/// owner-fallback policy while becoming dispatchable.
 #[tokio::test]
 #[serial]
 async fn update_rejects_coding_agent_row_but_not_a_normal_one() {
@@ -382,7 +382,7 @@ async fn update_rejects_coding_agent_row_but_not_a_normal_one() {
     server.cleanup().await;
 }
 
-/// Same guard, exercised via the rollback path — the other route this task must close (Task 1.6).
+/// Same guard, exercised via the rollback path — the other route that can redeploy an agent.
 #[tokio::test]
 #[serial]
 async fn rollback_rejects_coding_agent_row_but_not_a_normal_one() {

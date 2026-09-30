@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use nasiko_runtime::DeploymentStatus;
 
+use crate::agents::coding_agent::reject_if_coding_agent_by_owner_and_name;
 use crate::auth::Claims;
 use crate::build::routes::extract_zip_from_file;
 use crate::build::{self, BuildStatus};
@@ -426,16 +427,10 @@ pub(crate) async fn upload_and_deploy(
         _ => return (StatusCode::BAD_REQUEST, "name is required").into_response(),
     };
 
-    // A coding-agent row must never be deployed onto (Task 1.6, spec §16 A4) — checked against
-    // the upsert's own key, `(owner_id, name)`, and BEFORE the `ON CONFLICT (owner_id, name)`
-    // upsert below runs (which would otherwise deploy a container over it first and only reject
-    // too late to matter). No `id` exists to check yet at this point — that's exactly why this
-    // needs its own by-`(owner_id, name)` lookup rather than `reject_if_coding_agent`.
-    if let Err(r) = crate::agents::coding_agent::reject_if_coding_agent_by_owner_and_name(
-        &state.db, owner_id, &name,
-    )
-    .await
-    {
+    // A coding-agent row must never be deployed onto — checked against the upsert's own key,
+    // `(owner_id, name)`, before the `ON CONFLICT` upsert below runs. No `id` exists yet to check
+    // by, hence the by-name lookup rather than `reject_if_coding_agent`.
+    if let Err(r) = reject_if_coding_agent_by_owner_and_name(&state.db, owner_id, &name).await {
         return r;
     }
     // `version_tag` isn't resolved here — it may still come from the zip's

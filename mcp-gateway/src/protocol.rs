@@ -2183,11 +2183,10 @@ mod tests {
         // `session_traces` lookup) — and, since `test_state()`'s pool can't
         // reach a real Postgres, still degrade to the same generic error
         // (not crash), but the whole point of the gate is to skip that DB
-        // work entirely for non-AuthRequired reasons. Passing `None` here
-        // (as this test used to) made that a no-op regardless of the gate —
-        // `resolve_context_id` short-circuits on `None` before ever reaching
-        // `state.db` — so a loosened gate would have slipped past this test
-        // undetected (found in review).
+        // work entirely for non-AuthRequired reasons. Passing `None` here would
+        // make this a no-op regardless of the gate — `resolve_context_id`
+        // short-circuits on `None` before ever reaching `state.db` — so a
+        // loosened gate would slip past this test undetected.
         let cid = Uuid::new_v4();
         let resolved = unusable_mcp_session(cid, ConnectorUnusable::NotConfigured, "github");
         let p = perms(&[], vec![]);
@@ -2490,7 +2489,7 @@ mod initialize_tests {
     // into `handle_initialize`. `resolve_session`/`load_permission_context`
     // need a real DB this crate's hermetic tests can't provide, so the
     // composition is tested here as its own pure function instead of through
-    // `handle_request` end-to-end (see Task 1.3's own note on this).
+    // `handle_request` end-to-end.
 
     fn cfg(connector_id: Uuid, instructions: Option<&str>) -> MCPServerConfig {
         MCPServerConfig {

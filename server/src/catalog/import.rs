@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::agents::coding_agent::{
+    reject_if_coding_agent_by_owner_and_name, reject_if_coding_agent_by_owner_and_name_tupled,
+};
 use crate::auth::Claims;
 use crate::build::{download_repo_tarball, extract_tar_gzip, is_valid_repo_name};
 use crate::state::AppState;
@@ -205,16 +208,10 @@ pub(crate) async fn build_and_deploy(
     owner_id: Uuid,
     state: &AppState,
 ) -> Result<ImportResult, (StatusCode, String)> {
-    // A coding-agent row must never be deployed onto (Task 1.6, spec §16 A4) — checked against
-    // this function's own upsert key, `(owner_id, name)`, and BEFORE `find_owned_agent` below (an
-    // existing row's `id` isn't resolved yet, so this is the by-name variant). Shared by all
-    // three import on-ramps that call this function: `import_upload`, `import_github`, and
-    // `import_registry`'s source-artifact branch. Tupled error, not `Response`: this function
-    // isn't an axum handler itself, so its own error channel is `(StatusCode, String)`.
-    crate::agents::coding_agent::reject_if_coding_agent_by_owner_and_name_tupled(
-        &state.db, owner_id, &meta.name,
-    )
-    .await?;
+    // A coding-agent row must never be deployed onto — checked against this function's own
+    // upsert key, `(owner_id, name)`, before `find_owned_agent` below resolves an `id`. Tupled
+    // error, not `Response`: this function isn't an axum handler itself.
+    reject_if_coding_agent_by_owner_and_name_tupled(&state.db, owner_id, &meta.name).await?;
 
     let image_tag = crate::agents::build_image_tag(
         &state.config.agent_image_registry,
@@ -1028,19 +1025,11 @@ pub(crate) async fn import_registry(
         // Derive agent name from repo
         let agent_name = repo.rsplit('/').next().unwrap_or("agent").to_string();
 
-        // A coding-agent row must never be deployed onto (Task 1.6, spec §16 A4) — checked
-        // against this upsert's own key, `(owner_id, name)`, and BEFORE the docker pull below (so
-        // a rejected import does no pull work at all, not just no upsert). No test harness reaches
-        // this route today (no suite hits any `/api/import/*` path — it needs a mocked registry
-        // HTTP server), so this guard is untested at the integration level; the same
-        // `reject_if_coding_agent_by_owner_and_name` every other guarded upsert calls is
-        // exercised by `agent_upload.rs`'s and `catalog_import.rs`'s coding-agent tests.
-        if let Err(r) = crate::agents::coding_agent::reject_if_coding_agent_by_owner_and_name(
-            &state.db,
-            owner_id,
-            &agent_name,
-        )
-        .await
+        // A coding-agent row must never be deployed onto — checked against this upsert's own
+        // key, `(owner_id, name)`, before the docker pull below, so a rejected import does no
+        // pull work at all.
+        if let Err(r) =
+            reject_if_coding_agent_by_owner_and_name(&state.db, owner_id, &agent_name).await
         {
             return r;
         }

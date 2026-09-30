@@ -11,8 +11,8 @@
 //! clause — lets a minimal system-connector row actually insert, and that a
 //! NULL `url` / non-`none` `auth_type` are still rejected by the same clause.
 //!
-//! `system_connector_end_to_end_through_the_real_gateway` below is the actual
-//! acceptance test for Task 1.3/1.9: it inserts the rows a real deployment
+//! `system_connector_end_to_end_through_the_real_gateway` below is the
+//! acceptance test for a system connector: it inserts the rows a real deployment
 //! would use (public grant, synced tool catalog, per-agent access) against a
 //! real stub MCP backend and drives `/api/mcp` exactly as a deployed agent
 //! would — no route or application code is exercised in the three
@@ -315,7 +315,7 @@ async fn start_stub_system_backend() -> (String, CallLog, HeaderLog) {
     (format!("http://127.0.0.1:{port}/mcp"), calls, header_log)
 }
 
-/// Task 1.3/1.9's actual acceptance test: a `provider_type='system'`
+/// The acceptance test for a `provider_type='system'`
 /// connector — the synced catalog (`mcp_connector_tools`), a public grant,
 /// and a per-agent access row, all inserted exactly as the platform itself
 /// would (via SQL, not the connector-registration API, which rejects any
@@ -592,14 +592,12 @@ async fn system_connector_end_to_end_through_the_real_gateway() {
     server.cleanup().await;
 }
 
-/// The regression Task 1.4's review caught: on the gateway's owner-fallback
-/// path (`oss/server/src/mcp/handlers/gateway.rs::dispatch`) — reached here by
-/// a `tools/list` whose `traceparent` is syntactically well-formed (passes
-/// `FlowContext::from_traceparent`'s shape check) but names no row in `flows`
-/// at all — the identity signed for the system backend must carry `flow_id:
-/// None`, never the bogus trace id lifted from that unverified header. Before
-/// the fix, `handle_request` re-parsed the raw `traceparent` itself and would
-/// have signed that trace id as if it had been verified.
+/// On the gateway's owner-fallback path (`oss/server/src/mcp/handlers/gateway.rs::dispatch`) —
+/// reached here by a `tools/list` whose `traceparent` is syntactically well-formed (passes
+/// `FlowContext::from_traceparent`'s shape check) but names no row in `flows` at all — the
+/// identity signed for the system backend must carry `flow_id: None`, never the bogus trace id
+/// lifted from that unverified header: `handle_request` must not re-parse the raw `traceparent`
+/// itself and sign that trace id as if it had been verified.
 ///
 /// `tools/list` (unlike `tools/call`) is exempt from the flow requirement —
 /// rule 2 in `mcp_gateway_auth.rs`'s doc comment — so this must return 200
@@ -708,13 +706,12 @@ async fn owner_fallback_tools_list_with_a_bogus_traceparent_signs_flow_id_none()
     server.cleanup().await;
 }
 
-/// Task 1.5's acceptance test (spec §16 A3): a local coding agent's row
-/// (`coding_agent_integration_id` set — no CLI ever dispatches it through a
-/// flow) makes a flow-less `tools/call` and the identity signed for a system
-/// backend carries the agent's *owner* as `user_id` and `flow_id: None` — the
-/// same policy `owner_fallback_tools_list_with_a_bogus_traceparent_signs_flow_id_none`
-/// proves for the read-only owner-fallback, but here for `tools/call`
-/// specifically, which every OTHER flow-less agent is still refused for
+/// A local coding agent's row (`coding_agent_integration_id` set — no CLI ever dispatches it
+/// through a flow) makes a flow-less `tools/call` and the identity signed for a system backend
+/// carries the agent's *owner* as `user_id` and `flow_id: None` — the same policy
+/// `owner_fallback_tools_list_with_a_bogus_traceparent_signs_flow_id_none` proves for the
+/// read-only owner-fallback, but here for `tools/call` specifically, which every OTHER flow-less
+/// agent is still refused for
 /// (`mcp_gateway_auth.rs::coding_agent_row_without_flow_resolves_to_owner_for_tools_call`
 /// proves that half at the HTTP layer).
 #[tokio::test]
@@ -828,8 +825,8 @@ async fn coding_agent_flowless_tools_call_to_system_connector_signs_owner_identi
     server.cleanup().await;
 }
 
-/// Task 1.5's third acceptance test: the owner policy is a fallback, never an
-/// override. When a coding-agent row DOES have a live flow, that flow's own
+/// The owner policy is a fallback, never an override. When a coding-agent row DOES have a live
+/// flow, that flow's own
 /// user and flow id are used — seeded here for a user other than the agent's
 /// owner, so the assertion is meaningful (the owner policy would give the
 /// wrong answer if it ever won this race).
@@ -947,8 +944,7 @@ async fn coding_agent_row_with_a_live_flow_uses_the_flow_not_the_owner() {
     server.cleanup().await;
 }
 
-/// Code-quality review of Task 1.5: the widening the owner policy introduces
-/// covers not just an *unknown* trace id but a REAL, live flow the
+/// The owner policy's widening covers not just an *unknown* trace id but a REAL, live flow the
 /// coding-agent row simply isn't a participant of — a different user's,
 /// dispatched to a different agent entirely. Naming it must not let the
 /// coding-agent row ride along on it: `flow_user` still denies (rule 4, not a

@@ -387,7 +387,7 @@ async fn tools_call_inside_a_live_flow_passes_the_auth_gate() {
     server.cleanup().await;
 }
 
-// ─── Coding-agent owner policy (spec §16 A3) ─────────────────────────────────
+// ─── Coding-agent owner policy ────────────────────────────────────────────────
 //
 // A local coding agent (Claude Code / Codex / OpenCode, connected by the CLI)
 // is never dispatched through the proxy, so it never has a flow — `flow_user`
@@ -607,11 +607,10 @@ async fn url_credential_allows_tools_call_inside_its_own_flow() {
 
 // ─── `MCP-Protocol-Version` header validation ─────────────────────────────────
 //
-// Task 1.1 made the gateway negotiate `protocolVersion` in `initialize` and
-// advertise 2025-06-18. Per the MCP spec, a client that negotiated 2025-06-18
-// sends `MCP-Protocol-Version` on every subsequent request; the gateway must
-// reject a version it doesn't implement, while still treating the header as
-// optional (old clients that never negotiated never send it).
+// The gateway negotiates `protocolVersion` in `initialize` and advertises 2025-06-18. Per the MCP
+// spec, a client that negotiated 2025-06-18 sends `MCP-Protocol-Version` on every subsequent
+// request; the gateway must reject a version it doesn't implement, while still treating the
+// header as optional (old clients that never negotiated never send it).
 
 #[tokio::test]
 #[serial]

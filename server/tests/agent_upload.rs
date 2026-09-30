@@ -268,11 +268,11 @@ async fn build_jobs_count(server: &common::TestServer, agent_id: uuid::Uuid) -> 
         .unwrap()
 }
 
-/// Task 1.6 (spec §16 A4): the `(owner_id, name)` upsert must reject — not clear
-/// `coding_agent_integration_id` and deploy over it — when an existing row by that key is a
-/// CLI-bound coding agent. The check runs before the `ON CONFLICT (owner_id, name)` write and
-/// before a new `build_jobs` row is ever queued, so a name collision with a coding-agent row must
-/// never bump its version/image/status or start a build.
+/// The `(owner_id, name)` upsert must reject — not clear `coding_agent_integration_id` and
+/// deploy over it — when an existing row by that key is a CLI-bound coding agent. The check runs
+/// before the `ON CONFLICT (owner_id, name)` write and before a new `build_jobs` row is ever
+/// queued, so a name collision with a coding-agent row must never bump its version/image/status
+/// or start a build.
 #[tokio::test]
 #[serial]
 async fn upload_rejects_when_name_collides_with_a_coding_agent_row_owned_by_the_caller() {

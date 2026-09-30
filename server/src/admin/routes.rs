@@ -8,6 +8,7 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::agents::coding_agent::{CodingAgentGuard, reject_if_coding_agent};
 use crate::auth::Claims;
 use crate::catalog::agent_secrets;
 use crate::state::AppState;
@@ -88,17 +89,11 @@ async fn deploy(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    // A coding-agent row must never be deployed onto (Task 1.6, spec §16 A4) — this ad-hoc
-    // `nasiko deploy` path resolves straight to `state.runtime.deploy` below, so without this
-    // check a caller who owns a coding-agent row could redeploy an arbitrary image over it and
-    // make it dispatchable while it still resolves to its owner at the MCP gateway.
+    // A coding-agent row must never be deployed onto — this ad-hoc `nasiko deploy` path resolves
+    // straight to `state.runtime.deploy` below.
     if let Some(agent_id) = resolved_agent_id
-        && let Err(r) = crate::agents::coding_agent::reject_if_coding_agent(
-            &state.db,
-            agent_id,
-            crate::agents::coding_agent::CodingAgentGuard::NotDeployable,
-        )
-        .await
+        && let Err(r) =
+            reject_if_coding_agent(&state.db, agent_id, CodingAgentGuard::NotDeployable).await
     {
         return r;
     }
@@ -510,12 +505,9 @@ async fn restart(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    // A coding-agent row must never be (re)deployed onto (Task 1.6, spec §16 A4) — restart reads
-    // `agents.image` and calls `state.runtime.deploy` below with no requirement that a live
-    // container already exist, so without this check it's a second, image-agnostic way to put a
-    // real container behind a row the MCP gateway still resolves to its owner with no flow.
-    if let Err(r) = crate::agents::coding_agent::CodingAgentGuard::NotDeployable
-        .reject_if(coding_agent_integration_id.is_some())
+    // A coding-agent row must never be (re)deployed onto — restart reads `agents.image` and
+    // redeploys with no requirement that a live container already exist.
+    if let Err(r) = CodingAgentGuard::NotDeployable.reject_if(coding_agent_integration_id.is_some())
     {
         return r;
     }

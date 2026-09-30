@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use std::collections::HashMap;
 
+use crate::agents::coding_agent::reject_if_coding_agent_by_owner_and_name;
 use crate::agents::upload::BuildJobPayload;
 use crate::agents::utils::set_upload_status;
 use nasiko_secrets::SecretsCrypto;
@@ -749,19 +750,9 @@ async fn github_clone(
         &version_tag,
     );
 
-    // A coding-agent row must never be deployed onto (Task 1.6, spec §16 A4) — checked against
-    // this upsert's own key, `(owner_id, name)`, and BEFORE it runs. No test harness reaches this
-    // route today (the test suite never configures `github_svc`, so `github_clone` 503s before
-    // this point in every existing test — see `oss/server/tests/github_routes.rs`), so this guard
-    // is untested at the integration level; the same `reject_if_coding_agent_by_owner_and_name`
-    // every other guarded upsert calls is exercised by `agent_upload.rs`'s and
-    // `catalog_import.rs`'s coding-agent tests.
-    if let Err(r) = crate::agents::coding_agent::reject_if_coding_agent_by_owner_and_name(
-        &state.db,
-        user_id,
-        &agent_name,
-    )
-    .await
+    // A coding-agent row must never be deployed onto — checked against this upsert's own key,
+    // `(owner_id, name)`, before it runs.
+    if let Err(r) = reject_if_coding_agent_by_owner_and_name(&state.db, user_id, &agent_name).await
     {
         return r;
     }
