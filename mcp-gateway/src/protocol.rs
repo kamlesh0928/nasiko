@@ -287,8 +287,8 @@ fn inject_identity(servers: &mut [MCPServerConfig], signed: &str) {
 ///
 /// When search is enabled (`MCP_TOOL_SEARCH_MODE != none`):
 /// - With a verified flow: resolves the user's query from `flows.title`, runs
-///   flat search, returns top-k matched tools + pinned tools + the three
-///   meta-tools (`nasiko_search_tools`, `nasiko_call_tool`, `recover_compressed`).
+///   flat search, returns top-k matched tools + the three meta-tools
+///   (`nasiko_search_tools`, `nasiko_call_tool`, `recover_compressed`).
 /// - Without one (agent startup, or a flow-less owner-fallback call): returns
 ///   only the meta-tools.
 ///
@@ -610,6 +610,31 @@ pub async fn handle_tools_call(
     verified_flow_id: Option<&str>,
 ) -> Value {
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+
+    // ── nasiko_call_tool meta-tool: the fixed-menu executor ──────────────
+    // Unwrap and re-enter the routed path with the inner tool, so nothing
+    // downstream can tell the two entry points apart. Handled before the
+    // outer `arguments` are cloned: only the inner object is needed here.
+    if tool_name == CALL_TOOL_META {
+        return match parse_call_tool_target(params.get("arguments")) {
+            Ok((inner_name, inner_arguments)) => {
+                call_routed_tool(
+                    state,
+                    user_id,
+                    req_id,
+                    inner_name,
+                    inner_arguments,
+                    resolved,
+                    perms,
+                    traceparent,
+                    verified_flow_id,
+                )
+                .await
+            }
+            Err(message) => err(req_id, codes::INVALID_PARAMS, message),
+        };
+    }
+
     let arguments = params
         .get("arguments")
         .cloned()
@@ -716,29 +741,6 @@ pub async fn handle_tools_call(
                 codes::INTERNAL_ERROR,
                 format!("failed to read the recovery store: {e}"),
             ),
-        };
-    }
-
-    // ── nasiko_call_tool meta-tool: the fixed-menu executor ──────────────
-    // Unwrap and re-enter the routed path with the inner tool, so nothing
-    // downstream can tell the two entry points apart.
-    if tool_name == CALL_TOOL_META {
-        return match parse_call_tool_target(params.get("arguments")) {
-            Ok((inner_name, inner_arguments)) => {
-                call_routed_tool(
-                    state,
-                    user_id,
-                    req_id,
-                    inner_name,
-                    inner_arguments,
-                    resolved,
-                    perms,
-                    traceparent,
-                    verified_flow_id,
-                )
-                .await
-            }
-            Err(message) => err(req_id, codes::INVALID_PARAMS, message),
         };
     }
 
