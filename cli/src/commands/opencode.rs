@@ -194,6 +194,12 @@ fn failed_reconnect_shares_the_restored_credential(
     previous.mcp_installed && previous.binding.agent_id == new_agent_id
 }
 
+/// Whether LLM routing is connected, judged by the routing state file alone: `connect` writes it
+/// and `disconnect` removes it, so its presence is the one durable signal.
+pub fn is_connected() -> bool {
+    state_path().exists()
+}
+
 pub fn disconnect(force: bool) -> Result<()> {
     let Some(state) = load_state()? else {
         println!("OpenCode routing is not connected to Nasiko.");

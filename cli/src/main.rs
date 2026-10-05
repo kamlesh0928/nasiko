@@ -121,7 +121,8 @@ enum CpCommands {
     Up,
     /// Stop local Nasiko cluster
     Down,
-    /// Register a CP by URL, or connect a supported coding agent
+    /// Register a CP by URL, or connect a supported coding agent (routing + MCP only;
+    /// `nasiko agents install <agent>` sets up everything)
     #[command(after_help = "Config: ~/.nasiko/config.json")]
     Connect {
         /// Control-plane URL, `claude`, `codex`, or `opencode`
@@ -135,7 +136,8 @@ enum CpCommands {
         #[arg(long)]
         config: Option<String>,
     },
-    /// Disconnect a local integration
+    /// Disconnect a local integration (routing + MCP only; `nasiko agents uninstall <agent>`
+    /// removes everything)
     Disconnect {
         target: String,
         /// Disconnect even when the coding agent is still running
@@ -430,8 +432,45 @@ mod tests {
         assert!(matches!(
             install.command,
             Commands::Ops(AgentOpsCommands::Agents {
-                command: nasiko::AgentsCommands::Install { agent, no_content }
-            }) if agent == "claude" && no_content
+                command: nasiko::AgentsCommands::Install { agent, no_content, routing_agent, config }
+            }) if agent == "claude" && no_content && routing_agent.is_none() && config.is_none()
+        ));
+
+        let routed = Cli::try_parse_from([
+            "nasiko",
+            "agents",
+            "install",
+            "codex",
+            "--agent",
+            "local-agent",
+            "--config",
+            "production",
+        ])
+        .unwrap();
+        assert!(matches!(
+            routed.command,
+            Commands::Ops(AgentOpsCommands::Agents {
+                command: nasiko::AgentsCommands::Install { agent, no_content, routing_agent, config }
+            }) if agent == "codex"
+                && !no_content
+                && routing_agent.as_deref() == Some("local-agent")
+                && config.as_deref() == Some("production")
+        ));
+
+        let uninstall = Cli::try_parse_from(["nasiko", "agents", "uninstall", "opencode"]).unwrap();
+        assert!(matches!(
+            uninstall.command,
+            Commands::Ops(AgentOpsCommands::Agents {
+                command: nasiko::AgentsCommands::Uninstall { agent, force }
+            }) if agent == "opencode" && !force
+        ));
+        let forced =
+            Cli::try_parse_from(["nasiko", "agents", "uninstall", "opencode", "--force"]).unwrap();
+        assert!(matches!(
+            forced.command,
+            Commands::Ops(AgentOpsCommands::Agents {
+                command: nasiko::AgentsCommands::Uninstall { agent, force }
+            }) if agent == "opencode" && force
         ));
 
         let report =
@@ -441,6 +480,41 @@ mod tests {
             Commands::Ops(AgentOpsCommands::Agents {
                 command: nasiko::AgentsCommands::Report { agent }
             }) if agent == "opencode"
+        ));
+    }
+
+    #[test]
+    fn hidden_integration_commands_take_the_same_setup_flags() {
+        let install = Cli::try_parse_from([
+            "nasiko",
+            "integration",
+            "install",
+            "claude",
+            "--agent",
+            "local-agent",
+            "--config",
+            "production",
+            "--no-content",
+        ])
+        .unwrap();
+        assert!(matches!(
+            install.command,
+            Commands::Integration(IntegrationCommands::Integration {
+                command: IntegrationSubCommands::Install { agent, no_content, routing_agent, config }
+            }) if agent == "claude"
+                && no_content
+                && routing_agent.as_deref() == Some("local-agent")
+                && config.as_deref() == Some("production")
+        ));
+
+        let uninstall =
+            Cli::try_parse_from(["nasiko", "integration", "uninstall", "codex", "--force"])
+                .unwrap();
+        assert!(matches!(
+            uninstall.command,
+            Commands::Integration(IntegrationCommands::Integration {
+                command: IntegrationSubCommands::Uninstall { agent, force }
+            }) if agent == "codex" && force
         ));
     }
 }
