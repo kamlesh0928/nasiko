@@ -42,9 +42,7 @@ The command surface is defined in `cli/src/main.rs` (top-level groups + grouped 
 Setup:
   up         Start local Nasiko cluster (pulls the CP image from DockerHub)
   down       Stop local cluster
-  connect    Register a CP by URL, or connect a coding agent's LLM routing + MCP gateway
-             (routing-only primitive; `agents install` sets up everything)
-  disconnect Disconnect a coding agent's LLM routing + MCP gateway (routing-only)
+  connect    Register a CP by URL
   use        Switch active cluster
   clusters   List configured control planes
   status     Control plane health + metrics
@@ -92,11 +90,6 @@ Agents (registry + lifecycle):
   agents frameworks      List available frameworks
   agents list-uploaded   List agents uploaded by the current user
   agents chat            Chat directly with a locally running agent
-  agents discover        Show which coding agents are on this machine
-  agents install         Set up a local coding agent: session reporting, LLM routing and the
-                         MCP gateway (routing and MCP for claude, codex, opencode)
-  agents uninstall       Remove a local coding agent's session reporting, LLM routing and MCP
-                         gateway registration (--force while the agent is running)
 
 GitHub:
   github status      Show GitHub connection status

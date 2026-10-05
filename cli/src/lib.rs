@@ -669,28 +669,18 @@ pub enum MafExecutionCommands {
 pub enum AgentsCommands {
     /// Discover coding agents installed on this machine
     Discover,
-    /// Set up a local coding agent: session reporting, LLM routing and the MCP gateway
-    /// (routing and MCP for claude, codex, opencode)
+    /// Install session reporting for a local coding agent
     Install {
-        /// Agent to set up: claude, codex, opencode, or cursor
+        /// Agent to install (e.g. claude or opencode)
         agent: String,
         /// Report tokens, latency and cost, but omit conversation content
         #[arg(long)]
         no_content: bool,
-        /// Existing routing agent name or UUID (claude, codex, opencode)
-        #[arg(long = "agent", value_name = "NAME|UUID")]
-        routing_agent: Option<String>,
-        /// Nasiko LLM config name or UUID (claude, codex, opencode)
-        #[arg(long)]
-        config: Option<String>,
     },
-    /// Remove a local coding agent's session reporting, LLM routing and MCP gateway registration
+    /// Remove session reporting for a local coding agent
     Uninstall {
-        /// Agent to remove: claude, codex, opencode, or cursor
+        /// Agent to uninstall (e.g. claude or opencode)
         agent: String,
-        /// Disconnect routing even when the coding agent is still running
-        #[arg(long)]
-        force: bool,
     },
     /// Validate and deliver queued coding-agent events
     Sync,
@@ -1205,20 +1195,13 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
         },
         AgentOpsCommands::Agents { command } => match command {
             AgentsCommands::Discover => commands::integration::status(),
-            AgentsCommands::Install {
-                agent,
-                no_content,
-                routing_agent,
-                config,
-            } => commands::integration::setup(commands::integration::SetupOptions {
-                agent_id: &agent,
-                no_content,
-                routing_agent: routing_agent.as_deref(),
-                llm_config: config.as_deref(),
-            }),
-            AgentsCommands::Uninstall { agent, force } => {
-                commands::integration::teardown(&agent, force)
+            AgentsCommands::Install { agent, no_content } => {
+                commands::integration::install(commands::integration::InstallOptions {
+                    agent_id: &agent,
+                    no_content,
+                })
             }
+            AgentsCommands::Uninstall { agent } => commands::integration::uninstall(&agent),
             AgentsCommands::Sync => commands::integration::sync(),
             AgentsCommands::Report { agent } => commands::integration::report(&agent),
             AgentsCommands::Ls => commands::agents::cmd_ls(),
@@ -1480,28 +1463,18 @@ pub fn dispatch_registry(cmd: RegistrySubCommands) -> Result<()> {
 pub enum IntegrationSubCommands {
     /// Show which coding agents are on this machine and their reporting status
     Status,
-    /// Set up a local coding agent: session reporting, LLM routing and the MCP gateway
-    /// (routing and MCP for claude, codex, opencode)
+    /// Register a coding agent and start reporting its sessions to Nasiko
     Install {
-        /// Agent to set up: claude, codex, opencode, or cursor
+        /// Agent to install (e.g. claude or opencode)
         agent: String,
         /// Report tokens, latency and cost, but omit conversation text from spans
         #[arg(long)]
         no_content: bool,
-        /// Existing routing agent name or UUID (claude, codex, opencode)
-        #[arg(long = "agent", value_name = "NAME|UUID")]
-        routing_agent: Option<String>,
-        /// Nasiko LLM config name or UUID (claude, codex, opencode)
-        #[arg(long)]
-        config: Option<String>,
     },
-    /// Remove a local coding agent's session reporting, LLM routing and MCP gateway registration
+    /// Stop reporting a coding agent's sessions and remove its hook
     Uninstall {
-        /// Agent to remove: claude, codex, opencode, or cursor
+        /// Agent to uninstall (e.g. claude or opencode)
         agent: String,
-        /// Disconnect routing even when the coding agent is still running
-        #[arg(long)]
-        force: bool,
     },
     /// Export one session's new turns. Invoked by the installed hook, not by hand.
     #[command(hide = true)]
@@ -1516,20 +1489,13 @@ pub enum IntegrationSubCommands {
 pub fn dispatch_integration(cmd: IntegrationSubCommands) -> Result<()> {
     match cmd {
         IntegrationSubCommands::Status => commands::integration::status(),
-        IntegrationSubCommands::Install {
-            agent,
-            no_content,
-            routing_agent,
-            config,
-        } => commands::integration::setup(commands::integration::SetupOptions {
-            agent_id: &agent,
-            no_content,
-            routing_agent: routing_agent.as_deref(),
-            llm_config: config.as_deref(),
-        }),
-        IntegrationSubCommands::Uninstall { agent, force } => {
-            commands::integration::teardown(&agent, force)
+        IntegrationSubCommands::Install { agent, no_content } => {
+            commands::integration::install(commands::integration::InstallOptions {
+                agent_id: &agent,
+                no_content,
+            })
         }
+        IntegrationSubCommands::Uninstall { agent } => commands::integration::uninstall(&agent),
         IntegrationSubCommands::Report { agent } => commands::integration::report(&agent),
         IntegrationSubCommands::Sync => commands::integration::sync(),
     }

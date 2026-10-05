@@ -2,9 +2,8 @@
 //!
 //! `nasiko agents discover` answers "what coding agents are on this machine".
 //! `nasiko agents install <id>` goes further: it registers that agent in
-//! the control plane, connects LLM routing and the MCP gateway where the
-//! client supports them ([`setup`]), and installs a hook that durably queues
-//! completed turns for delivery to the cluster active when they were captured.
+//! the control plane and installs a hook that durably queues completed turns
+//! for delivery to the cluster active when they were captured.
 
 mod agents;
 mod catalog;
@@ -13,7 +12,6 @@ mod launcher;
 mod model;
 mod queue;
 mod report;
-mod setup;
 mod state;
 mod sync;
 
@@ -24,9 +22,7 @@ use agents::Agent;
 use catalog::Support;
 use state::{AgentState, InstallationBinding, IntegrationState};
 
-pub use setup::{SetupOptions, setup, teardown};
-
-/// Options for the session-reporting half of an install; [`setup`] drives the whole thing.
+/// Options accepted by `nasiko agents install`.
 pub struct InstallOptions<'a> {
     pub agent_id: &'a str,
     /// Keep prompt and response text out of exported spans.
@@ -62,7 +58,7 @@ pub fn status() -> Result<()> {
         );
     }
 
-    println!("\nSet up an agent (reporting, routing, MCP):  nasiko agents install <agent>");
+    println!("\nInstall session reporting:  nasiko agents install <agent>");
     Ok(())
 }
 

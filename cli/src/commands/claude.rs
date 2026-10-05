@@ -299,12 +299,6 @@ fn teardown_mcp_gateway(binding: &ConnectionBinding) {
     coding_agent_router::revoke_bound_mcp_credential_best_effort(binding);
 }
 
-/// Whether LLM routing is connected, judged by the connection state file alone: `connect`
-/// writes it last and `disconnect` removes it last, so its presence is the one durable signal.
-pub fn is_connected() -> bool {
-    state_path().exists()
-}
-
 pub fn disconnect(force: bool) -> Result<()> {
     disconnect_internal(true, force)
 }

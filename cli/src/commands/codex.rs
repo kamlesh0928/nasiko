@@ -227,12 +227,6 @@ fn responses_model(config: &serde_json::Value) -> Result<&str> {
         .context("resolved Nasiko LLM config is missing a model")
 }
 
-/// Whether LLM routing is connected, judged by the routing state file alone: `connect` writes it
-/// and `disconnect` removes it, so its presence is the one durable signal.
-pub fn is_connected() -> bool {
-    state_path().exists()
-}
-
 pub fn disconnect(force: bool) -> Result<()> {
     let Some(state) = load_state()? else {
         println!("Codex routing: not connected");
