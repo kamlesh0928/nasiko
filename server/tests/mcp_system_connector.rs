@@ -1356,6 +1356,41 @@ async fn nasiko_call_tool_runs_a_found_system_tool_identically_to_the_direct_cal
          executor would be pointless here: {names:?}"
     );
 
+    // The search result must be readable the way an MCP client reads any
+    // `tools/call` result — through `content` — and agree with the
+    // `structuredContent` and bare `tools` views of the same payload. A
+    // fixed-menu client that only sees `content` would otherwise be told the
+    // search found nothing.
+    let res = mcp(json!({
+        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+        "params": {"name": "nasiko_search_tools", "arguments": {"query": "save file", "limit": 5}},
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(res.status(), 200);
+    let search: Value = res.json().await.unwrap();
+    let result = &search["result"];
+    assert_eq!(
+        result["content"][0]["type"], "text",
+        "search result must carry an MCP text content block: {search:?}"
+    );
+    let from_content: Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().expect("content text"))
+            .expect("content text is the JSON payload");
+    assert_eq!(
+        from_content["tools"], result["tools"],
+        "content and bare `tools` views must agree: {search:?}"
+    );
+    assert_eq!(
+        result["structuredContent"]["tools"], result["tools"],
+        "structuredContent and bare `tools` views must agree: {search:?}"
+    );
+    assert!(
+        result["search_mode"].is_string() && from_content["search_mode"] == result["search_mode"],
+        "search_mode must be present in every view: {search:?}"
+    );
+
     let arguments = json!({ "path": "notes.md" });
     let res = mcp(direct_call(2, SAVE_FILE, arguments.clone()))
         .send()

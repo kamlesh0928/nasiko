@@ -672,13 +672,20 @@ pub async fn handle_tools_call(
             .await;
 
         let tools: Vec<Value> = matches.iter().map(tool_match_to_json).collect();
-        return ok(
-            req_id,
-            json!({
-                "tools": tools,
-                "search_mode": format!("{:?}", state.config.tool_search_mode),
-            }),
-        );
+        let payload = json!({
+            "tools": tools,
+            "search_mode": format!("{:?}", state.config.tool_search_mode),
+        });
+        // A `tools/call` result is read through `content` by MCP clients (a
+        // fixed-menu client such as Claude Code shows the model nothing else),
+        // and through `structuredContent` by schema-aware ones; the bare
+        // `tools`/`search_mode` fields stay at the top level for programmatic
+        // callers that already read them directly.
+        let text = payload.to_string();
+        let mut result = payload.clone();
+        result["content"] = json!([{ "type": "text", "text": text }]);
+        result["structuredContent"] = payload;
+        return ok(req_id, result);
     }
 
     // ── recover_compressed meta-tool (IP-5) ──────────────────────────────
