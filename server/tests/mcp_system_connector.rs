@@ -290,10 +290,13 @@ async fn start_stub_system_backend() -> (String, CallLog, HeaderLog) {
             })),
             "tools/call" => {
                 let name = body["params"]["name"].as_str().unwrap_or("").to_string();
+                // Echoed back so a test can see which arguments actually
+                // arrived, not just which tool.
+                let arguments = body["params"]["arguments"].clone();
                 calls.lock().unwrap().push(name.clone());
                 Json(json!({
                     "jsonrpc": "2.0", "id": id,
-                    "result": {"content": [{"type": "text", "text": format!("stub executed '{name}'")}]},
+                    "result": {"content": [{"type": "text", "text": format!("stub executed '{name}' with {arguments}")}]},
                 }))
             }
             other => Json(json!({
@@ -313,6 +316,60 @@ async fn start_stub_system_backend() -> (String, CallLog, HeaderLog) {
     });
 
     (format!("http://127.0.0.1:{port}/mcp"), calls, header_log)
+}
+
+/// The rows a deployment carries for one system connector — the connector
+/// itself, a public grant, the synced two-tool catalog, and `agent_id`'s
+/// access row with `tool_rules` — inserted by SQL exactly as the platform
+/// would. Returns the connector id.
+async fn seed_system_connector(
+    server: &TestServer,
+    backend_url: &str,
+    name: &str,
+    agent_id: Uuid,
+    tool_rules: Value,
+) -> Uuid {
+    let connector_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO mcp_connectors (provider_type, source_kind, name, url, auth_type, instructions) \
+         VALUES ('system', 'system', $1, $2, 'none', 'instr') \
+         RETURNING id",
+    )
+    .bind(name)
+    .bind(backend_url)
+    .fetch_one(&server.db)
+    .await
+    .expect("insert system connector");
+
+    sqlx::query(
+        "INSERT INTO mcp_connector_grants (connector_id, grant_type, grantee_id) \
+         VALUES ($1, 'public', '*')",
+    )
+    .bind(connector_id)
+    .execute(&server.db)
+    .await
+    .expect("insert public grant");
+
+    for tool in [SAVE_FILE, LIST_FILES] {
+        sqlx::query("INSERT INTO mcp_connector_tools (connector_id, tool_name) VALUES ($1, $2)")
+            .bind(connector_id)
+            .bind(tool)
+            .execute(&server.db)
+            .await
+            .expect("insert synced connector tool");
+    }
+
+    sqlx::query(
+        "INSERT INTO mcp_agent_connector_access (agent_id, connector_id, enabled, tool_rules) \
+         VALUES ($1, $2, true, $3)",
+    )
+    .bind(agent_id)
+    .bind(connector_id)
+    .bind(tool_rules)
+    .execute(&server.db)
+    .await
+    .expect("insert agent connector access");
+
+    connector_id
 }
 
 /// The acceptance test for a `provider_type='system'`
@@ -1210,6 +1267,279 @@ async fn coding_agent_row_with_foreign_flow_does_not_leak_an_approval_event() {
         leaked, 0,
         "no hitl_requests row for this coding-agent row may ever carry the \
          victim's flow id as its context_id"
+    );
+
+    server.cleanup().await;
+}
+
+// ─── nasiko_call_tool: the executor for fixed-menu clients ──────────────────
+//
+// Under the default search mode `tools/list` carries only matched tools plus
+// the gateway's meta-tools, never the full manifest. An MCP client that can
+// only invoke tools present in that list (Claude Code, Codex, OpenCode) can
+// therefore find `save_file` with `nasiko_search_tools` yet has no way to
+// call it — `nasiko_call_tool` is that way. These tests drive it through the
+// real gateway against the real stub backend and hold it to one standard: the
+// result must be exactly what the direct call would have produced.
+
+/// The `tools/call` body a fixed-menu client sends to run `tool` through the
+/// executor — `tool`'s own arguments nested under the executor's.
+fn via_call_tool(id: u64, tool: &str, arguments: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": {
+            "name": "nasiko_call_tool",
+            "arguments": { "name": tool, "arguments": arguments },
+        },
+    })
+}
+
+/// The same call, named directly — the body the executor must be
+/// indistinguishable from.
+fn direct_call(id: u64, tool: &str, arguments: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": { "name": tool, "arguments": arguments },
+    })
+}
+
+#[tokio::test]
+#[serial]
+async fn nasiko_call_tool_runs_a_found_system_tool_identically_to_the_direct_call() {
+    // Default search mode on purpose — this is the fixed-menu scenario itself,
+    // not the eager-fan-out rollback path the other tests in this file need.
+    let server = TestServer::start().await;
+
+    let owner = seed_user(&server, "ws-call-tool-owner").await;
+    let agent_id = seed_agent(&server, owner, "ws-call-tool-agent").await;
+    let (backend_url, backend_calls, _) = start_stub_system_backend().await;
+    seed_system_connector(
+        &server,
+        &backend_url,
+        "ws-call-tool-connector",
+        agent_id,
+        json!([]),
+    )
+    .await;
+
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+    let (_, traceparent) = common::open_flow(&server.db, owner, agent_id).await;
+    let mcp = |body: Value| {
+        server
+            .client
+            .post(server.url("/api/mcp"))
+            .bearer_auth(&token)
+            .header("traceparent", &traceparent)
+            .json(&body)
+    };
+
+    // The menu a fixed-menu client is confined to: the meta-tools, not save_file.
+    let res = mcp(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    let names: Vec<&str> = body["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"nasiko_search_tools") && names.contains(&"nasiko_call_tool"),
+        "a search mode must list the search meta-tool and the executor side by side: {names:?}"
+    );
+    assert!(
+        !names.contains(&SAVE_FILE),
+        "sanity: a search mode must not list the real tool itself, or the \
+         executor would be pointless here: {names:?}"
+    );
+
+    let arguments = json!({ "path": "notes.md" });
+    let res = mcp(direct_call(2, SAVE_FILE, arguments.clone()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let direct: Value = res.json().await.unwrap();
+    assert!(
+        direct.get("error").is_none(),
+        "direct save_file call must not error: {direct:?}"
+    );
+
+    let res = mcp(via_call_tool(2, SAVE_FILE, arguments))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let via_executor: Value = res.json().await.unwrap();
+    assert_eq!(
+        via_executor, direct,
+        "the executor's response must be byte-identical to the direct call's"
+    );
+    let text = via_executor["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains("notes.md"),
+        "the inner arguments, not the executor's own, must reach the backend: {via_executor:?}"
+    );
+    assert_eq!(
+        backend_calls.lock().unwrap().as_slice(),
+        &[SAVE_FILE.to_string(), SAVE_FILE.to_string()],
+        "the stub must have seen save_file twice — never nasiko_call_tool"
+    );
+
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn nasiko_call_tool_is_blocked_by_a_tool_rule_identically_to_the_direct_call() {
+    let server = TestServer::start().await;
+
+    let owner = seed_user(&server, "ws-call-tool-block-owner").await;
+    let agent_id = seed_agent(&server, owner, "ws-call-tool-block-agent").await;
+    let (backend_url, backend_calls, _) = start_stub_system_backend().await;
+    seed_system_connector(
+        &server,
+        &backend_url,
+        "ws-call-tool-block-connector",
+        agent_id,
+        json!([{"pattern": SAVE_FILE, "stance": "block"}]),
+    )
+    .await;
+
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+    let (_, traceparent) = common::open_flow(&server.db, owner, agent_id).await;
+    let mcp = |body: Value| {
+        server
+            .client
+            .post(server.url("/api/mcp"))
+            .bearer_auth(&token)
+            .header("traceparent", &traceparent)
+            .json(&body)
+    };
+
+    let res = mcp(direct_call(1, SAVE_FILE, json!({})))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "a block decision is a JSON-RPC error");
+    let direct: Value = res.json().await.unwrap();
+    assert_eq!(
+        direct["error"]["code"],
+        json!(nasiko_mcp_gateway::types::codes::TOOL_BLOCKED),
+        "{direct:?}"
+    );
+
+    let res = mcp(via_call_tool(1, SAVE_FILE, json!({})))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let via_executor: Value = res.json().await.unwrap();
+    assert_eq!(
+        via_executor, direct,
+        "a rule that blocks the inner tool must block the executor identically"
+    );
+    assert!(
+        backend_calls.lock().unwrap().is_empty(),
+        "a blocked call must never reach the backend by either route"
+    );
+
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn nasiko_call_tool_ask_rule_records_the_inner_tool_not_the_executor() {
+    // A live flow this agent participates in: that is what makes the ask
+    // decision persist a `hitl_requests` row and publish an approval event at
+    // all (`coding_agent_row_with_foreign_flow_does_not_leak_an_approval_event`
+    // above covers the flow-less half). Both the record and the event must
+    // name the inner tool — the human approves `save_file`, and the resumed
+    // retry's own routing resolves to `save_file`, so anything else would
+    // leave the approval unmatchable.
+    let server = TestServer::start().await;
+
+    let owner = seed_user(&server, "ws-call-tool-ask-owner").await;
+    let agent_id = seed_agent(&server, owner, "ws-call-tool-ask-agent").await;
+    let (backend_url, backend_calls, _) = start_stub_system_backend().await;
+    let connector_id = seed_system_connector(
+        &server,
+        &backend_url,
+        "ws-call-tool-ask-connector",
+        agent_id,
+        json!([{"pattern": SAVE_FILE, "stance": "ask"}]),
+    )
+    .await;
+
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+    let (flow_id, traceparent) = common::open_flow(&server.db, owner, agent_id).await;
+    let mut events = server.flow_events.subscribe(&flow_id).await;
+
+    let res = server
+        .client
+        .post(server.url("/api/mcp"))
+        .bearer_auth(&token)
+        .header("traceparent", &traceparent)
+        .json(&via_call_tool(1, SAVE_FILE, json!({ "path": "notes.md" })))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(
+        body["error"]["code"],
+        json!(nasiko_mcp_gateway::types::codes::TOOL_ASK),
+        "{body:?}"
+    );
+    let hitl_request_id: Uuid = body["error"]["data"]["hitl_request_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("a verified flow must persist an approval row: {body:?}"));
+
+    let (tool_name, question): (Option<String>, Value) =
+        sqlx::query_as("SELECT tool_name, question FROM hitl_requests WHERE id = $1")
+            .bind(hitl_request_id)
+            .fetch_one(&server.db)
+            .await
+            .expect("the approval row must exist");
+    assert_eq!(
+        tool_name.as_deref(),
+        Some(SAVE_FILE),
+        "the approval record must carry the inner tool name"
+    );
+    assert_eq!(question["tool_name"], json!(SAVE_FILE), "{question:?}");
+    assert_eq!(
+        question["connector_id"],
+        json!(connector_id),
+        "{question:?}"
+    );
+
+    match events.try_recv() {
+        Ok(nasiko_flow::FlowEvent::ToolApprovalRequired {
+            agent_id: event_agent,
+            server: event_server,
+            tool,
+        }) => {
+            assert_eq!(event_agent, agent_id.to_string());
+            assert_eq!(
+                tool, SAVE_FILE,
+                "the approval card must name the inner tool"
+            );
+            assert_eq!(
+                event_server, "ws-call-tool-ask-connector",
+                "the approval card must name the inner tool's connector"
+            );
+        }
+        other => panic!("expected a ToolApprovalRequired event for the inner tool, got {other:?}"),
+    }
+    assert!(
+        backend_calls.lock().unwrap().is_empty(),
+        "an ask decision must not reach the backend"
     );
 
     server.cleanup().await;

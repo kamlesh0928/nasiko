@@ -40,6 +40,19 @@ pub fn rpc_error(req_id: &Value, code: i64, message: impl Into<String>) -> Value
     err(req_id, code, message)
 }
 
+/// The three tool names the gateway answers itself rather than routing to a
+/// backend. `nasiko_call_tool` refuses every one of them as its inner tool.
+const SEARCH_TOOLS_META: &str = "nasiko_search_tools";
+const CALL_TOOL_META: &str = "nasiko_call_tool";
+const RECOVER_COMPRESSED_META: &str = "recover_compressed";
+
+fn is_meta_tool(name: &str) -> bool {
+    matches!(
+        name,
+        SEARCH_TOOLS_META | CALL_TOOL_META | RECOVER_COMPRESSED_META
+    )
+}
+
 /// Full JSON-RPC dispatch for the agent-facing gateway. Returns `None` for a
 /// notification (a request with no `id`).
 ///
@@ -274,10 +287,10 @@ fn inject_identity(servers: &mut [MCPServerConfig], signed: &str) {
 ///
 /// When search is enabled (`MCP_TOOL_SEARCH_MODE != none`):
 /// - With a verified flow: resolves the user's query from `flows.title`, runs
-///   flat search, returns top-k matched tools + pinned tools +
-///   `nasiko_search_tools`.
+///   flat search, returns top-k matched tools + pinned tools + the three
+///   meta-tools (`nasiko_search_tools`, `nasiko_call_tool`, `recover_compressed`).
 /// - Without one (agent startup, or a flow-less owner-fallback call): returns
-///   only `nasiko_search_tools`.
+///   only the meta-tools.
 ///
 /// When search is disabled (`none`): delegates to `aggregate_tools` (legacy fan-out).
 // `verified_flow_id` pushed this from 7 to 8 (added for the same
@@ -364,8 +377,12 @@ pub async fn handle_tools_list(
         }
     }
 
-    // Always include the search meta-tool so the agent can discover more tools.
+    // The meta-tools ride along in every search-mode listing: the search
+    // itself, the executor that runs what it finds (the real tools are not in
+    // this list, so a client that can only call listed tools has no other way
+    // to reach one), and compressed-content recovery.
     tools.push(nasiko_search_tools_definition());
+    tools.push(nasiko_call_tool_definition());
     tools.push(recover_compressed_definition());
 
     ok(req_id, json!({ "tools": tools }))
@@ -408,7 +425,7 @@ fn tool_match_to_json(m: &crate::search::ToolMatch) -> Value {
 /// `tools/list` so agents can search for tools not in the initial set.
 fn nasiko_search_tools_definition() -> Value {
     json!({
-        "name": "nasiko_search_tools",
+        "name": SEARCH_TOOLS_META,
         "description": "Search for available tools by describing what you need. Use this when you need a capability not already in your tool list.",
         "inputSchema": {
             "type": "object",
@@ -426,6 +443,72 @@ fn nasiko_search_tools_definition() -> Value {
             "required": ["query"]
         }
     })
+}
+
+/// The `nasiko_call_tool` meta-tool definition — the executor for an MCP
+/// client that can only invoke tools present in `tools/list` (Claude Code,
+/// Codex, OpenCode). Listed exactly where `nasiko_search_tools` is: in the
+/// search modes the real tools are not in the list, so a tool the search
+/// found is otherwise unreachable from such a client.
+fn nasiko_call_tool_definition() -> Value {
+    json!({
+        "name": CALL_TOOL_META,
+        "description": "Execute a tool found with nasiko_search_tools by name. Use this when you cannot call the found tool directly. `name` is the tool name exactly as returned by the search; `arguments` is the JSON object matching that tool's inputSchema.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The tool name exactly as returned by nasiko_search_tools"
+                },
+                "arguments": {
+                    "type": "object",
+                    "description": "The arguments for that tool, matching its inputSchema",
+                    "default": {}
+                }
+            },
+            "required": ["name"]
+        }
+    })
+}
+
+/// What `nasiko_call_tool` was asked to run — the inner tool's name and its
+/// own arguments (`{}` when omitted) — or the invalid-params message to
+/// answer with. A gateway meta-tool is refused as the inner name: the
+/// executor exists to reach tools a client cannot call directly, and the
+/// meta-tools are always directly callable, so nesting one could only loop.
+fn parse_call_tool_target(arguments: Option<&Value>) -> Result<(&str, Value), &'static str> {
+    let name = arguments
+        .and_then(|a| a.get("name"))
+        .and_then(Value::as_str)
+        .ok_or("nasiko_call_tool requires `name`, the tool name exactly as returned by nasiko_search_tools")?;
+    if is_meta_tool(name) {
+        return Err("nasiko_call_tool cannot call gateway meta-tools; call them directly");
+    }
+    let inner_arguments = match arguments.and_then(|a| a.get("arguments")) {
+        None | Some(Value::Null) => json!({}),
+        Some(object @ Value::Object(_)) => object.clone(),
+        Some(_) => return Err("nasiko_call_tool `arguments` must be a JSON object"),
+    };
+    Ok((name, inner_arguments))
+}
+
+/// The tool a `tools/call` is really about, for everything outside this
+/// module that records or reports a tool name (usage, metrics, the approval
+/// flow event): `params.name`, except that `nasiko_call_tool` resolves to the
+/// inner tool it dispatches — by the same parse `handle_tools_call` uses, so
+/// the recorded name can never differ from the called one. An executor call
+/// the parse rejects resolves to `nasiko_call_tool` itself: no inner tool was
+/// ever attempted.
+pub fn invoked_tool_name(params: &Value) -> &str {
+    let outer = params.get("name").and_then(Value::as_str).unwrap_or("");
+    if outer != CALL_TOOL_META {
+        return outer;
+    }
+    match parse_call_tool_target(params.get("arguments")) {
+        Ok((inner, _)) => inner,
+        Err(_) => outer,
+    }
 }
 
 /// The W3C trace-id out of a `traceparent`, which is what a flow is keyed by.
@@ -450,7 +533,7 @@ pub(crate) fn flow_id_of(traceparent: &str) -> Option<String> {
 /// meets its first elision marker, because the marker is the only place the handle appears.
 fn recover_compressed_definition() -> Value {
     json!({
-        "name": "recover_compressed",
+        "name": RECOVER_COMPRESSED_META,
         "description": "Retrieve the full, uncompressed content that an elision marker stands in for. Call this when a payload you were given contains a marker like `[… 412 lines elided · recover: nasiko://c/9f3a… ]` and the elided part matters for your answer.",
         "inputSchema": {
             "type": "object",
@@ -491,7 +574,11 @@ fn needs_auth_required(
     }
 }
 
-/// `tools/call` — route, enforce two-layer permissions, forward to the backend.
+/// `tools/call` — answer the gateway's own meta-tools (`nasiko_search_tools`,
+/// `recover_compressed`, and the `nasiko_call_tool` executor), and hand every
+/// real tool — named directly, or as the executor's inner tool — to
+/// `call_routed_tool`, the one path that routes, enforces both permission
+/// layers and forwards to the backend.
 ///
 /// `traceparent` and `verified_flow_id` carry the same two-different-things
 /// split `handle_request`'s own doc comment explains: `traceparent` is the
@@ -522,24 +609,14 @@ pub async fn handle_tools_call(
     traceparent: Option<&str>,
     verified_flow_id: Option<&str>,
 ) -> Value {
-    // Outbound trace context for backend calls only — never the fallback
-    // path's raw `traceparent`. A coding-agent row's owner-fallback call may
-    // carry a well-formed (self-generated, or another user's) traceparent
-    // even though `verified_flow_id` is `None`; forwarding it as-is would let
-    // that row's spans land inside someone else's Tempo trace. `Option::and`
-    // collapses to `None` unless BOTH sides are `Some` — i.e. only on the
-    // verified path, where `traceparent` and `verified_flow_id` name the same
-    // flow anyway, so a deployed agent's behavior is unchanged.
-    let outbound_traceparent = verified_flow_id.and(traceparent);
-
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let mut arguments = params
+    let arguments = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
 
     // ── nasiko_search_tools meta-tool ────────────────────────────────────
-    if tool_name == "nasiko_search_tools" {
+    if tool_name == SEARCH_TOOLS_META {
         let query = arguments
             .get("query")
             .and_then(|v| v.as_str())
@@ -580,7 +657,7 @@ pub async fn handle_tools_call(
     }
 
     // ── recover_compressed meta-tool (IP-5) ──────────────────────────────
-    if tool_name == "recover_compressed" {
+    if tool_name == RECOVER_COMPRESSED_META {
         let Some(handle) = arguments
             .get("handle")
             .and_then(|v| v.as_str())
@@ -641,6 +718,76 @@ pub async fn handle_tools_call(
             ),
         };
     }
+
+    // ── nasiko_call_tool meta-tool: the fixed-menu executor ──────────────
+    // Unwrap and re-enter the routed path with the inner tool, so nothing
+    // downstream can tell the two entry points apart.
+    if tool_name == CALL_TOOL_META {
+        return match parse_call_tool_target(params.get("arguments")) {
+            Ok((inner_name, inner_arguments)) => {
+                call_routed_tool(
+                    state,
+                    user_id,
+                    req_id,
+                    inner_name,
+                    inner_arguments,
+                    resolved,
+                    perms,
+                    traceparent,
+                    verified_flow_id,
+                )
+                .await
+            }
+            Err(message) => err(req_id, codes::INVALID_PARAMS, message),
+        };
+    }
+
+    call_routed_tool(
+        state,
+        user_id,
+        req_id,
+        tool_name,
+        arguments,
+        resolved,
+        perms,
+        traceparent,
+        verified_flow_id,
+    )
+    .await
+}
+
+/// The one path every real tool call takes — routing, both permission
+/// layers, the backend call — whether the client named `tool_name` directly
+/// or asked `nasiko_call_tool` to run it. Taking the name and arguments
+/// rather than the request's `params` is what makes that so: the executor
+/// unwraps its inner call and re-enters here, and from this point on
+/// routing, `perms.decide`, the `Ask` approval record and its retry match,
+/// the backend request and every logged tool name see the inner tool — the
+/// wrapper no longer exists.
+///
+/// `outbound_traceparent` is the only trace context a backend ever receives
+/// — never the fallback path's raw `traceparent`. A coding-agent row's
+/// owner-fallback call may carry a well-formed (self-generated, or another
+/// user's) traceparent even though `verified_flow_id` is `None`; forwarding
+/// it as-is would let that row's spans land inside someone else's Tempo
+/// trace. `Option::and` collapses to `None` unless BOTH sides are `Some` —
+/// i.e. only on the verified path, where `traceparent` and
+/// `verified_flow_id` name the same flow anyway.
+// Nine parameters: `handle_tools_call`'s eight plus the arguments, which the
+// executor supplies from its own `arguments` rather than from `params`.
+#[allow(clippy::too_many_arguments)]
+async fn call_routed_tool(
+    state: &McpState,
+    user_id: Uuid,
+    req_id: &Value,
+    tool_name: &str,
+    mut arguments: Value,
+    resolved: &ResolvedSession,
+    perms: &PermissionContext,
+    traceparent: Option<&str>,
+    verified_flow_id: Option<&str>,
+) -> Value {
+    let outbound_traceparent = verified_flow_id.and(traceparent);
 
     let (server, original) = match router::route_tool(tool_name, &resolved.servers) {
         Ok(pair) => pair,
@@ -2555,6 +2702,326 @@ mod tests {
         });
         let unwrapped = unwrap_multi_execute_response(response.clone());
         assert_eq!(unwrapped, response);
+    }
+
+    // ─── nasiko_call_tool: the executor for fixed-menu clients ─────────────────
+
+    /// `tools/list` with no verified flow — the agent-startup shape every
+    /// fixed-menu client sees first — under `mode`. Hermetic: no flow means no
+    /// `flows.title` lookup, and `None` mode's manifest cache treats the
+    /// unreachable Redis as a miss.
+    async fn listed_tool_names(mode: ToolSearchMode) -> Vec<String> {
+        let mut state = test_state();
+        state.config.tool_search_mode = mode;
+        let res = handle_tools_list(
+            &state,
+            Uuid::new_v4(),
+            &json!(1),
+            &[],
+            &[],
+            &perms(&[], vec![]),
+            None,
+            None,
+        )
+        .await;
+        res["result"]["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tools array: {res}"))
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn nasiko_call_tool_is_listed_exactly_where_nasiko_search_tools_is() {
+        // A fixed-menu client can only invoke what `tools/list` carries, so
+        // wherever the search meta-tool hides the real tools, the executor
+        // that runs a found one must sit beside it.
+        for mode in [ToolSearchMode::Semantic, ToolSearchMode::Keyword] {
+            let names = listed_tool_names(mode).await;
+            assert!(
+                names.iter().any(|n| n == "nasiko_search_tools"),
+                "{mode:?}: {names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n == "nasiko_call_tool"),
+                "{mode:?}: {names:?}"
+            );
+        }
+        // `None` lists the real tools themselves — no search, no executor.
+        let names = listed_tool_names(ToolSearchMode::None).await;
+        assert!(
+            !names.iter().any(|n| n == "nasiko_call_tool"),
+            "None mode must not advertise the executor: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "nasiko_search_tools"),
+            "None mode must not advertise the search meta-tool: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nasiko_call_tool_with_invalid_params_is_rejected_before_routing() {
+        // 127.0.0.1:9 is unreachable — a rejected executor call must never
+        // reach the backend, so this neither hangs nor errors on the network.
+        let cid = Uuid::new_v4();
+        let resolved = mcp_session("http://127.0.0.1:9/mcp", cid, false);
+        let p = perms(&[cid], vec![]);
+        let tool = format!("{}__echo", crate::types::connector_prefix(cid));
+        for (arguments, expected) in [
+            (json!({}), "requires `name`"),
+            (json!({"name": 42}), "requires `name`"),
+            (json!({"arguments": {}}), "requires `name`"),
+            (
+                json!({"name": tool, "arguments": "not-an-object"}),
+                "must be a JSON object",
+            ),
+        ] {
+            let res = handle_tools_call(
+                &test_state(),
+                Uuid::new_v4(),
+                &json!(1),
+                &json!({ "name": "nasiko_call_tool", "arguments": arguments }),
+                &resolved,
+                &p,
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(res["error"]["code"], json!(codes::INVALID_PARAMS), "{res}");
+            let message = res["error"]["message"].as_str().unwrap_or("");
+            assert!(message.contains(expected), "{res}");
+        }
+    }
+
+    #[tokio::test]
+    async fn nasiko_call_tool_refuses_to_call_a_gateway_meta_tool() {
+        let cid = Uuid::new_v4();
+        let resolved = mcp_session("http://127.0.0.1:9/mcp", cid, false);
+        let p = perms(&[cid], vec![]);
+        for inner in [
+            "nasiko_call_tool",
+            "nasiko_search_tools",
+            "recover_compressed",
+        ] {
+            let res = handle_tools_call(
+                &test_state(),
+                Uuid::new_v4(),
+                &json!(1),
+                &json!({ "name": "nasiko_call_tool", "arguments": { "name": inner } }),
+                &resolved,
+                &p,
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(res["error"]["code"], json!(codes::INVALID_PARAMS), "{res}");
+            assert_eq!(
+                res["error"]["message"],
+                json!("nasiko_call_tool cannot call gateway meta-tools; call them directly"),
+                "{res}"
+            );
+        }
+    }
+
+    /// Both entry points, same inner call, same `req_id` — so a byte-identical
+    /// comparison is meaningful.
+    async fn direct_and_via_executor(
+        state: &McpState,
+        resolved: &ResolvedSession,
+        p: &PermissionContext,
+        tool: &str,
+        arguments: Value,
+    ) -> (Value, Value) {
+        let user = Uuid::new_v4();
+        let direct = handle_tools_call(
+            state,
+            user,
+            &json!(1),
+            &json!({ "name": tool, "arguments": arguments }),
+            resolved,
+            p,
+            None,
+            None,
+        )
+        .await;
+        let via_executor = handle_tools_call(
+            state,
+            user,
+            &json!(1),
+            &json!({
+                "name": "nasiko_call_tool",
+                "arguments": { "name": tool, "arguments": arguments },
+            }),
+            resolved,
+            p,
+            None,
+            None,
+        )
+        .await;
+        (direct, via_executor)
+    }
+
+    #[tokio::test]
+    async fn nasiko_call_tool_is_indistinguishable_from_the_direct_call_at_the_backend() {
+        // The backend accepts only the inner tool's un-namespaced name with the
+        // inner arguments, twice: once from the direct call, once unwrapped by
+        // the executor. Anything else — the wrapper's own name, or arguments
+        // nested one level too deep — misses the mock and fails the call.
+        let mut backend = mockito::Server::new_async().await;
+        let hit = backend
+            .mock("POST", "/mcp")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "tools/call",
+                "params": { "name": "echo", "arguments": { "path": "notes.md" } },
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let url = format!("http://localhost:{}/mcp", backend.socket_address().port());
+
+        let mut state = test_state();
+        state.authorizer = std::sync::Arc::new(AllowAllAuthorizer);
+        let cid = Uuid::new_v4();
+        let resolved = mcp_session(&url, cid, true);
+        let p = perms(&[cid], vec![]);
+        let tool = format!("{}__echo", crate::types::connector_prefix(cid));
+
+        let (direct, via_executor) =
+            direct_and_via_executor(&state, &resolved, &p, &tool, json!({ "path": "notes.md" }))
+                .await;
+
+        assert_eq!(direct["result"]["ok"], json!(true), "{direct}");
+        assert_eq!(
+            via_executor, direct,
+            "the executor's response must be byte-identical to the direct call's"
+        );
+        hit.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn nasiko_call_tool_is_blocked_exactly_as_the_direct_call_is() {
+        // Unreachable backend on purpose: a Denied decision returns before any
+        // backend call, so the executor must also never get that far.
+        let mut state = test_state();
+        state.authorizer = std::sync::Arc::new(AllowAllAuthorizer);
+        let cid = Uuid::new_v4();
+        let resolved = mcp_session("http://127.0.0.1:9/mcp", cid, false);
+        let p = perms(&[cid], vec![rule(cid, "*", Stance::Block)]);
+        let tool = format!("{}__echo", crate::types::connector_prefix(cid));
+
+        let (direct, via_executor) =
+            direct_and_via_executor(&state, &resolved, &p, &tool, json!({})).await;
+
+        assert_eq!(
+            direct["error"]["code"],
+            json!(codes::TOOL_BLOCKED),
+            "{direct}"
+        );
+        assert_eq!(via_executor, direct, "{via_executor}");
+        let message = via_executor["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains(&tool) && !message.contains("nasiko_call_tool"),
+            "the denial must name the inner tool, never the wrapper: {via_executor}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nasiko_call_tool_ask_decision_is_the_inner_tools_ask_decision() {
+        // No flow, so nothing is persisted (hermetic, same as
+        // `generic_mcp_ask_without_traceparent_returns_tool_ask_without_hitl_id`)
+        // — but the TOOL_ASK the executor answers must be the inner tool's own:
+        // same code, same connector label, the inner name in the message.
+        let mut state = test_state();
+        state.authorizer = std::sync::Arc::new(AllowAllAuthorizer);
+        let cid = Uuid::new_v4();
+        let resolved = mcp_session("http://127.0.0.1:9/mcp", cid, false);
+        let p = perms(&[cid], vec![rule(cid, "*", Stance::Ask)]);
+        let tool = format!("{}__echo", crate::types::connector_prefix(cid));
+
+        let (direct, via_executor) =
+            direct_and_via_executor(&state, &resolved, &p, &tool, json!({})).await;
+
+        assert_eq!(direct["error"]["code"], json!(codes::TOOL_ASK), "{direct}");
+        assert_eq!(via_executor, direct, "{via_executor}");
+        assert_eq!(
+            via_executor["error"]["data"]["server"],
+            json!("uploaded-server"),
+            "{via_executor}"
+        );
+        // The ask names the un-namespaced inner tool, exactly as the direct
+        // path does (`ask_with_hitl_request` takes `original`).
+        let message = via_executor["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("'echo'") && !message.contains("nasiko_call_tool"),
+            "the ask must name the inner tool, never the wrapper: {via_executor}"
+        );
+    }
+
+    // The adapter itself — the one parse both the executor's dispatch and the
+    // route layer's `invoked_tool_name` go through.
+
+    #[test]
+    fn invoked_tool_name_is_the_inner_tool_only_for_an_executor_call_that_dispatches() {
+        assert_eq!(
+            invoked_tool_name(&json!({ "name": "abcd__echo", "arguments": {} })),
+            "abcd__echo"
+        );
+        assert_eq!(
+            invoked_tool_name(&json!({
+                "name": "nasiko_call_tool",
+                "arguments": { "name": "abcd__echo", "arguments": { "path": "x" } },
+            })),
+            "abcd__echo"
+        );
+        // What the parse rejects was never attempted as an inner tool, so the
+        // record must say the executor itself failed — not blame a tool the
+        // client never validly named.
+        for rejected in [
+            json!({}),
+            json!({ "name": "nasiko_search_tools" }),
+            json!({ "name": "abcd__echo", "arguments": "not-an-object" }),
+        ] {
+            assert_eq!(
+                invoked_tool_name(&json!({ "name": "nasiko_call_tool", "arguments": rejected })),
+                "nasiko_call_tool"
+            );
+        }
+        assert_eq!(invoked_tool_name(&json!({})), "");
+    }
+
+    #[test]
+    fn parse_call_tool_target_defaults_omitted_arguments_to_an_empty_object() {
+        let omitted = json!({ "name": "abcd__echo" });
+        let (name, arguments) = parse_call_tool_target(Some(&omitted)).expect("valid target");
+        assert_eq!(name, "abcd__echo");
+        assert_eq!(arguments, json!({}));
+
+        let null = json!({ "name": "abcd__echo", "arguments": null });
+        let (_, arguments) =
+            parse_call_tool_target(Some(&null)).expect("null arguments mean omitted");
+        assert_eq!(arguments, json!({}));
+
+        assert!(parse_call_tool_target(None).is_err());
+    }
+
+    #[test]
+    fn nasiko_call_tool_definition_requires_only_the_inner_name() {
+        let def = nasiko_call_tool_definition();
+        assert_eq!(def["name"], "nasiko_call_tool");
+        assert_eq!(def["inputSchema"]["required"], json!(["name"]));
+        assert_eq!(def["inputSchema"]["properties"]["name"]["type"], "string");
+        assert_eq!(
+            def["inputSchema"]["properties"]["arguments"]["type"],
+            "object"
+        );
+        assert_eq!(
+            def["inputSchema"]["properties"]["arguments"]["default"],
+            json!({})
+        );
     }
 }
 

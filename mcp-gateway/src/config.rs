@@ -10,7 +10,9 @@ use nasiko_config::Config;
 /// Default `initialize.instructions` sentence when `MCP_GATEWAY_INSTRUCTIONS`
 /// is unset or blank — keeps the field non-empty on an unconfigured deployment.
 pub(crate) const DEFAULT_GATEWAY_INSTRUCTIONS: &str = "You are connected to the Nasiko MCP gateway. \
-    Tools listed here are the platform's connectors; call them directly by name.";
+    Tools listed here are the platform's connectors; call them directly by name. To find a tool \
+    that is not listed, use nasiko_search_tools, then call the found tool by name — or through \
+    nasiko_call_tool if your client can only call listed tools.";
 
 /// Tool search mode — selects the `ToolSearchIndex` implementation wired at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

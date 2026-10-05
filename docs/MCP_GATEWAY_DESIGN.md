@@ -548,6 +548,8 @@ sequenceDiagram
 
 The permission check is repeated in full at call time, not only at list time — this closes the window where a tool could be listed as available and then blocked a moment before it's actually invoked.
 
+**Gateway meta-tools.** Three tool names are answered by the gateway itself rather than routed to a backend. `nasiko_search_tools` searches the tool index by a natural-language description and returns tool definitions; `nasiko_call_tool` executes a tool found that way, by its exact name and arguments, for MCP clients that can only invoke tools present in `tools/list`; `recover_compressed` returns the full content behind an elision marker. In the search modes (`MCP_TOOL_SEARCH_MODE=semantic|keyword`, the default) `tools/list` carries only the query-matched tools plus these three; under `none` the full manifest is listed and none of them is advertised, though all stay callable. `nasiko_call_tool` re-enters the `tools/call` path above with the inner tool, so routing, the permission stance, an ask-stance approval record, usage and telemetry are all attributed to the inner tool, never to the wrapper — and it refuses to nest another meta-tool.
+
 ### 9.3 Connecting a connector (unified across auth types)
 
 ```mermaid

@@ -215,10 +215,12 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
     let traceparent = headers
         .get(nasiko_flow::TRACEPARENT_HEADER)
         .and_then(|v| v.to_str().ok());
+    // `invoked_tool_name`, not `params.name`: a `nasiko_call_tool` call is
+    // recorded — usage, metrics, the approval event below — as the inner
+    // tool it ran, resolved by the same parse the protocol layer dispatches on.
     let tool_name = body
         .get("params")
-        .and_then(|p| p.get("name"))
-        .and_then(|v| v.as_str())
+        .map(protocol::invoked_tool_name)
         .unwrap_or("")
         .to_string();
 

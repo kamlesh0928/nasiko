@@ -432,6 +432,135 @@ async fn coding_agent_row_without_flow_resolves_to_owner_for_tools_call() {
     server.cleanup().await;
 }
 
+/// A minimal MCP backend for the executor test below: answers `tools/call`
+/// with a fixed result and records each tool name it was asked to run. The
+/// gateway's generic transport sends `tools/call` directly (no `initialize`
+/// handshake), so nothing else needs answering.
+async fn start_call_log_backend() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use axum::{Json, Router, extract::State, routing::post};
+    type CallLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    async fn handle(
+        State(calls): State<CallLog>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let name = body["params"]["name"].as_str().unwrap_or("").to_string();
+        calls.lock().unwrap().push(name.clone());
+        Json(serde_json::json!({
+            "jsonrpc": "2.0", "id": id,
+            "result": {"content": [{"type": "text", "text": format!("ran '{name}'")}]},
+        }))
+    }
+
+    let calls: CallLog = Default::default();
+    let app = Router::new()
+        .route("/mcp", post(handle))
+        .with_state(calls.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://127.0.0.1:{port}/mcp"), calls)
+}
+
+#[tokio::test]
+#[serial]
+async fn coding_agent_row_executes_via_nasiko_call_tool_as_via_the_direct_name() {
+    // Rule 3b meets the fixed-menu executor: a local coding agent is exactly
+    // the kind of client that can only invoke listed tools, and it never has
+    // a flow. Through the owner policy, `nasiko_call_tool` must reach the
+    // backend precisely as the direct name does — and must not widen rule 3
+    // for a plain deployed row.
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "gw-owner-call-tool").await;
+    let agent_id = seed_agent(&server, owner, "gw-agent-call-tool").await;
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'claude' WHERE id = $1")
+        .bind(agent_id)
+        .execute(&server.db)
+        .await
+        .unwrap();
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+
+    // A system connector owning `save_file` — the only bare-name routing a
+    // generic backend gets (`router::route_tool`'s synced-catalog match).
+    let (backend_url, backend_calls) = start_call_log_backend().await;
+    let connector_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO mcp_connectors (provider_type, source_kind, name, url, auth_type) \
+         VALUES ('system', 'system', 'gw-call-tool-connector', $1, 'none') RETURNING id",
+    )
+    .bind(&backend_url)
+    .fetch_one(&server.db)
+    .await
+    .expect("insert system connector");
+    sqlx::query(
+        "INSERT INTO mcp_connector_grants (connector_id, grant_type, grantee_id) \
+         VALUES ($1, 'public', '*')",
+    )
+    .bind(connector_id)
+    .execute(&server.db)
+    .await
+    .expect("insert public grant");
+    sqlx::query(
+        "INSERT INTO mcp_connector_tools (connector_id, tool_name) VALUES ($1, 'save_file')",
+    )
+    .bind(connector_id)
+    .execute(&server.db)
+    .await
+    .expect("insert synced connector tool");
+    sqlx::query(
+        "INSERT INTO mcp_agent_connector_access (agent_id, connector_id, enabled) \
+         VALUES ($1, $2, true)",
+    )
+    .bind(agent_id)
+    .bind(connector_id)
+    .execute(&server.db)
+    .await
+    .expect("insert agent connector access");
+
+    let direct = serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+        "params": {"name": "save_file", "arguments": {"path": "a.md"}}});
+    let via_executor = serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+        "params": {"name": "nasiko_call_tool",
+                   "arguments": {"name": "save_file", "arguments": {"path": "a.md"}}}});
+
+    // No traceparent either time — the owner policy is the whole admission.
+    let res = post_mcp(&server, Some(&token), None, &direct).await;
+    assert_eq!(res.status(), 200);
+    let direct_body: serde_json::Value = res.json().await.unwrap();
+    assert!(
+        direct_body.get("error").is_none(),
+        "direct save_file call must succeed: {direct_body}"
+    );
+
+    let res = post_mcp(&server, Some(&token), None, &via_executor).await;
+    assert_eq!(
+        res.status(),
+        200,
+        "the executor must pass the owner policy exactly as the direct name does"
+    );
+    let executor_body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(
+        executor_body, direct_body,
+        "the executor's response must be byte-identical to the direct call's"
+    );
+    assert_eq!(
+        backend_calls.lock().unwrap().as_slice(),
+        &["save_file".to_string(), "save_file".to_string()],
+        "the backend must have seen save_file twice — never nasiko_call_tool"
+    );
+
+    // A plain deployed row stays refused without a flow (rule 3) — the
+    // executor is not a second door.
+    let deployed = seed_agent(&server, owner, "gw-agent-call-tool-deployed").await;
+    let deployed_token = common::mint_gateway_token(&server.db, deployed).await;
+    let res = post_mcp(&server, Some(&deployed_token), None, &via_executor).await;
+    assert_eq!(res.status(), 403);
+
+    server.cleanup().await;
+}
+
 #[tokio::test]
 #[serial]
 async fn soft_deleted_coding_agent_row_is_not_admitted() {
