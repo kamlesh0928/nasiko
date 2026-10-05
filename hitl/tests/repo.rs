@@ -1251,3 +1251,46 @@ async fn find_linked_direct_chat_row_never_crosses_agents() {
         "must never return another agent's row, even with a matching metadata.hitl_request_id link"
     );
 }
+
+/// A coding-agent context (`coding:{agent_id}`) is already the stable identity a session grant
+/// should be keyed by — the desk has no chat session at all. Mapping it onto a `chat_sessions` row
+/// would key the grant to a conversation the coding agent never took part in, and the two callers
+/// (the resolve route's grant write and the gateway's retry lookup) would then disagree the moment
+/// the owner's session count changed between approve and retry. So the lookup returns the synthetic
+/// context unchanged, even when exactly one chat session exists — the case the unambiguous
+/// fallback below would otherwise fire for.
+#[tokio::test]
+async fn resolve_stable_session_context_returns_a_coding_agent_context_unchanged() {
+    let db = TestDb::new("hitl_test").await;
+    sqlx::query(
+        "INSERT INTO chat_sessions (session_id, user_id, agent_id, title) VALUES ($1, $2, $3, 't')",
+    )
+    .bind("ses_only_one")
+    .bind(db.owner_user_id)
+    .bind(db.agent_id)
+    .execute(&db.pool)
+    .await
+    .expect("seed the owner's single chat session with this agent");
+
+    // Sanity: a non-session context does get mapped onto that lone session.
+    let mapped = repo::resolve_stable_session_context(
+        &db.pool,
+        db.owner_user_id,
+        db.agent_id,
+        "0af7651916cd43dd8448eb211c80319c",
+    )
+    .await
+    .expect("lookup");
+    assert_eq!(mapped.as_deref(), Some("ses_only_one"));
+
+    let coding = nasiko_hitl::coding_agent_context_id(db.agent_id);
+    let kept =
+        repo::resolve_stable_session_context(&db.pool, db.owner_user_id, db.agent_id, &coding)
+            .await
+            .expect("lookup");
+    assert_eq!(
+        kept.as_deref(),
+        Some(coding.as_str()),
+        "a coding-agent context is never remapped onto a chat session"
+    );
+}

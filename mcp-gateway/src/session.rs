@@ -89,6 +89,100 @@ pub async fn invalidate_session_cache(state: &McpState, user_id: Uuid) {
     cache::delete(&state.redis, &session_cache_key(user_id)).await;
 }
 
+/// Which human-approval namespace a request belongs to — the one input every
+/// `tool_approval` helper in `protocol.rs` (`create_tool_approval_id`,
+/// `resolve_tool_approval_retry`, `ask_with_hitl_request`) keys its
+/// `context_id` on, and the one thing the route layer's approval event is
+/// published under.
+///
+/// Built exactly once per request, by the route layer
+/// (`oss/server/src/mcp/handlers/gateway.rs::dispatch`), from facts that layer
+/// verified itself: `Flow` from `flow_user`'s `flows`/`flow_participants`
+/// check, `CodingAgent` from the owner-rule arm for a row whose
+/// `coding_agent_integration_id` is set, carrying the id of the agent whose
+/// credential authenticated the call. Nothing below the route layer ever
+/// derives a scope from a header — a raw `traceparent` is not proof of
+/// anything, and a `CodingAgent` scope for a row not admitted by the owner
+/// rule is unconstructible because that arm is the only place one is made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalScope {
+    /// The trace id proven to name a live flow this agent participates in —
+    /// the value `verified_flow_id` carries everywhere else. Approvals live in
+    /// that flow's conversation ([`resolve_context_id`]).
+    Flow(String),
+    /// A CLI-bound local coding-agent row acting as its owner (rule 3b): no
+    /// flow exists, so approvals are keyed to the desk itself —
+    /// `coding:{agent_id}` (`nasiko_hitl::coding_agent_context_id`), stable
+    /// across every call it makes. Another agent, or this agent inside a real
+    /// flow, resolves a different context and so can never consume them.
+    CodingAgent(Uuid),
+    /// No verified flow and no coding-agent admission — a deployed row's
+    /// read-only owner fallback. Nothing to key an approval on: an `ask`
+    /// decision is answered but never persisted or matched.
+    None,
+}
+
+impl ApprovalScope {
+    /// The verified flow id, which only a [`ApprovalScope::Flow`] has. Every
+    /// consumer that needs the flow for something other than approvals
+    /// (identity signing, outbound trace context, the tools/list query title)
+    /// reads it through here, so it can never disagree with the scope.
+    pub fn verified_flow_id(&self) -> Option<&str> {
+        match self {
+            ApprovalScope::Flow(flow_id) => Some(flow_id),
+            ApprovalScope::CodingAgent(_) | ApprovalScope::None => None,
+        }
+    }
+
+    /// The `FlowEventBus` channel a `ToolApprovalRequired` event for this
+    /// scope is published on: the flow id itself for a flow (the channel the
+    /// chat SSE stream forwards from), the synthetic context for a coding
+    /// desk, nothing for an unscoped call.
+    pub fn event_channel(&self) -> Option<String> {
+        match self {
+            ApprovalScope::Flow(flow_id) => Some(flow_id.clone()),
+            ApprovalScope::CodingAgent(agent_id) => {
+                Some(nasiko_hitl::coding_agent_context_id(*agent_id))
+            }
+            ApprovalScope::None => None,
+        }
+    }
+}
+
+/// The `context_id` a `tool_approval` row is created with and matched on for
+/// `scope` — `None` when there is nothing to key an approval on, in which case
+/// the caller answers the ask without persisting or matching anything.
+///
+/// A flow's context is its conversation ([`resolve_context_id`]) — unless that
+/// value sits in the coding-agent namespace (`coding:` prefix), which a
+/// conversation id can only do by a client naming its A2A `contextId` that
+/// way, since `agent_proxy.rs` upserts a caller-supplied `contextId` as the
+/// session id verbatim. Such a context is refused rather than used: the
+/// namespace belongs to coding desks alone, so a real flow can never create a
+/// row — or consume a grant — a desk's retry would match.
+pub async fn resolve_approval_context_id(
+    state: &McpState,
+    scope: &ApprovalScope,
+) -> Option<String> {
+    match scope {
+        ApprovalScope::Flow(flow_id) => {
+            let context_id = resolve_context_id(state, Some(flow_id)).await?;
+            if nasiko_hitl::is_coding_agent_context(&context_id) {
+                tracing::warn!(
+                    %flow_id, %context_id,
+                    "flow conversation id sits in the coding-agent context namespace — refusing to key an approval on it"
+                );
+                return None;
+            }
+            Some(context_id)
+        }
+        ApprovalScope::CodingAgent(agent_id) => {
+            Some(nasiko_hitl::coding_agent_context_id(*agent_id))
+        }
+        ApprovalScope::None => None,
+    }
+}
+
 /// Resolve the conversation id a paused `auth_required`/`tool_approval` HITL
 /// request should be recorded against — the closest thing MCP has to an A2A
 /// `contextId`, via `session_traces` (populated by `agent_proxy` on every
@@ -107,10 +201,10 @@ pub async fn invalidate_session_cache(state: &McpState, user_id: Uuid) {
 /// naming a flow it isn't a participant of, and seeding a `context_id` from
 /// that would let a human approving the resulting HITL row re-open and join
 /// that OTHER flow (`oss/hitl/src/notifier.rs`'s resume path treats a 32-hex
-/// context as a flow id) — acting as that flow's user from then on. See
-/// `oss/mcp-gateway/src/protocol.rs`'s `create_tool_approval_id`/
-/// `resolve_tool_approval_retry`/`handle_auth_required` doc comments for the
-/// three call sites this matters for.
+/// context as a flow id) — acting as that flow's user from then on. The
+/// `auth_required` path (`protocol.rs::handle_auth_required`) calls this
+/// directly; the `tool_approval` helpers go through
+/// [`resolve_approval_context_id`], which adds the coding-agent namespace.
 pub async fn resolve_context_id(
     state: &McpState,
     verified_flow_id: Option<&str>,

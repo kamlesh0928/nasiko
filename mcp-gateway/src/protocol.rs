@@ -13,7 +13,7 @@ use crate::error::McpError;
 use crate::permissions::{self, PermissionContext, ToolAccess, toolkit_from_composio_slug};
 use crate::provider::generic::DEFAULT_CALL_TIMEOUT;
 use crate::router;
-use crate::session::{self, ResolvedSession};
+use crate::session::{self, ApprovalScope, ResolvedSession};
 use crate::state::McpState;
 use crate::types::{
     ConnectorUnusable, LATEST_PROTOCOL_VERSION, MCPServerConfig, SUPPORTED_PROTOCOL_VERSIONS,
@@ -56,16 +56,18 @@ fn is_meta_tool(name: &str) -> bool {
 /// Full JSON-RPC dispatch for the agent-facing gateway. Returns `None` for a
 /// notification (a request with no `id`).
 ///
-/// `traceparent` and `verified_flow_id` are deliberately two different
-/// parameters, not one: `traceparent` is the raw header, propagated to
-/// backends and used to resolve unrelated things (a flow's title for tool
-/// search, a `context_id` for HITL) that only need a best-effort trace id.
-/// `verified_flow_id` is what the route layer (`oss/server/src/mcp/handlers/
-/// gateway.rs::flow_user`) actually proved resolves to a live flow this agent
-/// participates in — it alone may be signed into the identity header, because
-/// only it is trustworthy. A caller on the read-only owner-fallback path
-/// (flow lookup failed, so `user_id` is the agent's owner instead) must pass
-/// `None` here even when `traceparent` still carries a well-formed but
+/// `traceparent` and `scope` are deliberately two different parameters, not
+/// one: `traceparent` is the raw header, propagated to backends and used to
+/// resolve unrelated things (a flow's title for tool search) that only need a
+/// best-effort trace id. `scope` is what the route layer
+/// (`oss/server/src/mcp/handlers/gateway.rs::dispatch`) actually established:
+/// `ApprovalScope::Flow` carries the trace id `flow_user` proved resolves to a
+/// live flow this agent participates in — the `verified_flow_id` below, which
+/// alone may be signed into the identity header, because only it is
+/// trustworthy; `ApprovalScope::CodingAgent` marks a coding-agent row admitted
+/// as its owner with no flow; `ApprovalScope::None` is the read-only
+/// owner-fallback path. A caller on either flow-less path must pass a
+/// flow-less scope even when `traceparent` still carries a well-formed but
 /// unverified trace id — signing that trace id back out would launder an
 /// unverified claim into a header a backend is told to trust unconditionally.
 pub async fn handle_request(
@@ -74,9 +76,10 @@ pub async fn handle_request(
     agent_id: Uuid,
     body: &Value,
     traceparent: Option<&str>,
-    verified_flow_id: Option<&str>,
+    scope: &ApprovalScope,
 ) -> Option<Value> {
     let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let verified_flow_id = scope.verified_flow_id();
 
     let Some(req_id) = body.get("id").cloned() else {
         tracing::debug!(method, "mcp notification");
@@ -160,7 +163,7 @@ pub async fn handle_request(
                 &resolved,
                 &perms,
                 traceparent,
-                verified_flow_id,
+                scope,
             )
             .await
         }
@@ -580,24 +583,24 @@ fn needs_auth_required(
 /// `call_routed_tool`, the one path that routes, enforces both permission
 /// layers and forwards to the backend.
 ///
-/// `traceparent` and `verified_flow_id` carry the same two-different-things
-/// split `handle_request`'s own doc comment explains: `traceparent` is the
-/// raw header (only ever used below as *outbound* trace context, gated to
-/// the verified case — see `outbound_traceparent`), `verified_flow_id` is
-/// what the route layer actually proved resolves to a live flow this agent
-/// participates in. Every HITL `context_id` resolution in this call tree
-/// (`handle_auth_required`, `create_tool_approval_id`,
-/// `resolve_tool_approval_retry`, and their `detect_composio_auth_required`/
-/// `ask_with_hitl_request` wrappers) takes `verified_flow_id`, never
-/// `traceparent` — see those functions' own docs for why: a raw traceparent
-/// naming a flow this agent isn't a participant of (the coding-agent
-/// owner-fallback path's whole reason for existing) must never seed a HITL
-/// row's `context_id`, or resolving that row would re-open and join the
-/// NAMED flow, not this call's actual one.
-// `verified_flow_id` pushed this from 7 to 8 — same call as `handle_tools_list`'s
+/// `traceparent` and `scope` carry the same two-different-things split
+/// `handle_request`'s own doc comment explains: `traceparent` is the raw
+/// header (only ever used below as *outbound* trace context, gated to the
+/// verified case — see `outbound_traceparent`), `scope` is what the route
+/// layer actually established about this call. Every HITL `context_id`
+/// resolution in this call tree takes the scope's verified facts, never
+/// `traceparent`: the `tool_approval` helpers (`create_tool_approval_id`,
+/// `resolve_tool_approval_retry`, `ask_with_hitl_request`) key on `scope`
+/// itself via `session::resolve_approval_context_id`, and the `auth_required`
+/// ones (`handle_auth_required`, `detect_composio_auth_required`) on
+/// `scope.verified_flow_id()`. See those functions' own docs for why: a raw
+/// traceparent naming a flow this agent isn't a participant of (the
+/// coding-agent owner-fallback path's whole reason for existing) must never
+/// seed a HITL row's `context_id`, or resolving that row would re-open and
+/// join the NAMED flow, not this call's actual one.
+// The scope pushed this from 7 to 8 — same call as `handle_tools_list`'s
 // own identical allow just above: not worth a params struct for one more
-// `Option<&str>` this fix required, on a function with exactly one call site
-// (`handle_request`).
+// argument on a function with exactly one call site (`handle_request`).
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_tools_call(
     state: &McpState,
@@ -607,7 +610,7 @@ pub async fn handle_tools_call(
     resolved: &ResolvedSession,
     perms: &PermissionContext,
     traceparent: Option<&str>,
-    verified_flow_id: Option<&str>,
+    scope: &ApprovalScope,
 ) -> Value {
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -627,7 +630,7 @@ pub async fn handle_tools_call(
                     resolved,
                     perms,
                     traceparent,
-                    verified_flow_id,
+                    scope,
                 )
                 .await
             }
@@ -760,7 +763,7 @@ pub async fn handle_tools_call(
         resolved,
         perms,
         traceparent,
-        verified_flow_id,
+        scope,
     )
     .await
 }
@@ -777,11 +780,11 @@ pub async fn handle_tools_call(
 /// `outbound_traceparent` is the only trace context a backend ever receives
 /// — never the fallback path's raw `traceparent`. A coding-agent row's
 /// owner-fallback call may carry a well-formed (self-generated, or another
-/// user's) traceparent even though `verified_flow_id` is `None`; forwarding
-/// it as-is would let that row's spans land inside someone else's Tempo
-/// trace. `Option::and` collapses to `None` unless BOTH sides are `Some` —
-/// i.e. only on the verified path, where `traceparent` and
-/// `verified_flow_id` name the same flow anyway.
+/// user's) traceparent even though the scope has no verified flow;
+/// forwarding it as-is would let that row's spans land inside someone else's
+/// Tempo trace. `Option::and` collapses to `None` unless BOTH sides are
+/// `Some` — i.e. only on the verified path, where `traceparent` and the
+/// scope's flow id name the same flow anyway.
 // Nine parameters: `handle_tools_call`'s eight plus the arguments, which the
 // executor supplies from its own `arguments` rather than from `params`.
 #[allow(clippy::too_many_arguments)]
@@ -794,8 +797,9 @@ async fn call_routed_tool(
     resolved: &ResolvedSession,
     perms: &PermissionContext,
     traceparent: Option<&str>,
-    verified_flow_id: Option<&str>,
+    scope: &ApprovalScope,
 ) -> Value {
+    let verified_flow_id = scope.verified_flow_id();
     let outbound_traceparent = verified_flow_id.and(traceparent);
 
     let (server, original) = match router::route_tool(tool_name, &resolved.servers) {
@@ -955,7 +959,7 @@ async fn call_routed_tool(
                     perms.agent_id,
                     server.connector_id,
                     &original,
-                    verified_flow_id,
+                    scope,
                 )
                 .await
                 {
@@ -978,7 +982,7 @@ async fn call_routed_tool(
                             &original,
                             &server.name,
                             req_id,
-                            verified_flow_id,
+                            scope,
                         )
                         .await;
                     }
@@ -1016,7 +1020,7 @@ async fn call_routed_tool(
                     perms.agent_id,
                     cid,
                     tool_name,
-                    verified_flow_id,
+                    scope,
                 )
                 .await
                 {
@@ -1039,7 +1043,7 @@ async fn call_routed_tool(
                             tool_name,
                             "composio",
                             req_id,
-                            verified_flow_id,
+                            scope,
                         )
                         .await;
                     }
@@ -1113,7 +1117,7 @@ async fn call_routed_tool(
                             perms.agent_id,
                             cid,
                             slug,
-                            verified_flow_id,
+                            scope,
                         )
                         .await
                         {
@@ -1134,15 +1138,9 @@ async fn call_routed_tool(
             if !ask_tools.is_empty() {
                 let mut hitl_request_ids = Vec::with_capacity(ask_tools.len());
                 for (cid, slug) in &ask_tools {
-                    if let Some(id) = create_tool_approval_id(
-                        state,
-                        user_id,
-                        perms.agent_id,
-                        *cid,
-                        slug,
-                        verified_flow_id,
-                    )
-                    .await
+                    if let Some(id) =
+                        create_tool_approval_id(state, user_id, perms.agent_id, *cid, slug, scope)
+                            .await
                     {
                         hitl_request_ids.push(id);
                     }
@@ -1496,7 +1494,7 @@ async fn handle_auth_required(
 
 /// Best-effort: persist a pending `tool_approval` row for one `(connector,
 /// tool)` `Stance::Ask` decision (M2's store), returning its id. `None` when
-/// there's no verified flow to resolve a `context_id` from (required by
+/// the scope yields no `context_id` to key it on (required by
 /// `chk_hitl_tool_approval_identity`), or on a DB failure (logged) — either
 /// way the caller still returns `TOOL_ASK`; persistence never changes the
 /// ask/deny decision itself, only whether a row exists to resolve against
@@ -1504,26 +1502,30 @@ async fn handle_auth_required(
 /// the `COMPOSIO_MULTI_EXECUTE_TOOL` batch-ask path, which persists one row
 /// per asked tool.
 ///
-/// Takes `verified_flow_id`, never the raw `traceparent` — a `context_id`
-/// seeded from an unverified trace id would let a coding-agent row's
-/// owner-fallback call (no participant of the flow it names) plant a
-/// resolvable HITL row against someone else's conversation; see
-/// `oss/hitl/src/notifier.rs`'s resume path for what approving that row
-/// would otherwise do with it.
+/// Keys the row on `scope` (`session::resolve_approval_context_id`), never
+/// on the raw `traceparent` — a `context_id` seeded from an unverified trace
+/// id would let a coding-agent row's owner-fallback call (no participant of
+/// the flow it names) plant a resolvable HITL row against someone else's
+/// conversation; see `oss/hitl/src/notifier.rs`'s resume path for what
+/// approving that row would otherwise do with it. A coding-agent scope keys
+/// the row on the desk's own `coding:{agent_id}` context instead, so the
+/// owner sees it under their pending approvals and the desk's retry matches
+/// it; the row's `owner_user_id` is `user_id`, the owner the route layer
+/// resolved.
 async fn create_tool_approval_id(
     state: &McpState,
     user_id: Uuid,
     agent_id: Uuid,
     connector_id: Uuid,
     tool_name: &str,
-    verified_flow_id: Option<&str>,
+    scope: &ApprovalScope,
 ) -> Option<Uuid> {
-    let context_id = match session::resolve_context_id(state, verified_flow_id).await {
+    let context_id = match session::resolve_approval_context_id(state, scope).await {
         Some(id) => id,
         None => {
             tracing::warn!(
                 tool = %tool_name, %connector_id,
-                "tool_approval ask with no verified flow to resolve a context_id from — skipping hitl persistence"
+                "tool_approval ask with no approval scope to resolve a context_id from — skipping hitl persistence"
             );
             return None;
         }
@@ -1587,18 +1589,23 @@ enum RetryOutcome {
 /// per-slug inside the `COMPOSIO_MULTI_EXECUTE_TOOL` batch loop, alongside its
 /// two pre-existing single-tool call sites.
 ///
-/// Takes `verified_flow_id`, never the raw `traceparent` — see
+/// Keys the lookup on `scope`, never the raw `traceparent` — see
 /// `create_tool_approval_id`'s doc comment for why a `context_id` must never
-/// be seeded from a trace id this agent wasn't proven to participate in.
+/// be seeded from a trace id this agent wasn't proven to participate in. The
+/// same `resolve_approval_context_id` that created the row resolves it here,
+/// so a coding-agent desk's retry lands on the very `coding:{agent_id}` row
+/// (or session grant) its ask produced, and only that desk's: the tuple
+/// carries `agent_id`, and a real flow of the same agent resolves a
+/// conversation id outside the `coding:` namespace.
 async fn resolve_tool_approval_retry(
     state: &McpState,
     user_id: Uuid,
     agent_id: Uuid,
     connector_id: Uuid,
     tool_name: &str,
-    verified_flow_id: Option<&str>,
+    scope: &ApprovalScope,
 ) -> RetryOutcome {
-    let Some(context_id) = session::resolve_context_id(state, verified_flow_id).await else {
+    let Some(context_id) = session::resolve_approval_context_id(state, scope).await else {
         return RetryOutcome::AskAgain;
     };
 
@@ -1698,18 +1705,11 @@ async fn ask_with_hitl_request(
     tool_name: &str,
     connector_label: &str,
     req_id: &Value,
-    verified_flow_id: Option<&str>,
+    scope: &ApprovalScope,
 ) -> Value {
     let mut data = json!({ "server": connector_label });
-    if let Some(id) = create_tool_approval_id(
-        state,
-        user_id,
-        agent_id,
-        connector_id,
-        tool_name,
-        verified_flow_id,
-    )
-    .await
+    if let Some(id) =
+        create_tool_approval_id(state, user_id, agent_id, connector_id, tool_name, scope).await
     {
         data["hitl_request_id"] = json!(id);
     }
@@ -1917,9 +1917,16 @@ mod tests {
     async fn unknown_method_is_rejected_before_permission_or_session_work() {
         let state = test_state();
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover"});
-        let res = handle_request(&state, Uuid::new_v4(), Uuid::new_v4(), &body, None, None)
-            .await
-            .expect("a request with an id must produce a response");
+        let res = handle_request(
+            &state,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            &body,
+            None,
+            &ApprovalScope::None,
+        )
+        .await
+        .expect("a request with an id must produce a response");
         assert_eq!(
             res["error"]["code"],
             json!(codes::METHOD_NOT_FOUND),
@@ -2180,7 +2187,7 @@ mod tests {
             &resolved,
             &p,
             None,
-            None,
+            &ApprovalScope::None,
         )
         .await;
 
@@ -2214,7 +2221,7 @@ mod tests {
             &resolved,
             &p,
             None,
-            None,
+            &ApprovalScope::None,
         )
         .await;
 
@@ -2255,7 +2262,7 @@ mod tests {
             &resolved,
             &p,
             None,
-            None,
+            &ApprovalScope::None,
         )
         .await;
 
@@ -2288,7 +2295,7 @@ mod tests {
             &resolved,
             &p,
             None,
-            None,
+            &ApprovalScope::None,
         )
         .await;
         assert_eq!(res["error"]["code"], json!(codes::TOOL_BLOCKED), "{res}");
@@ -2307,7 +2314,7 @@ mod tests {
             &resolved,
             &p,
             None,
-            None,
+            &ApprovalScope::None,
         )
         .await;
         assert_eq!(res["error"]["code"], json!(codes::TOOL_BLOCKED), "{res}");
@@ -2326,7 +2333,7 @@ mod tests {
             &resolved,
             &p,
             None,
-            None,
+            &ApprovalScope::None,
         )
         .await;
         assert_eq!(res["error"]["code"], json!(codes::TOOL_ASK), "{res}");
@@ -2360,7 +2367,7 @@ mod tests {
             &resolved,
             &p,
             None,
-            None,
+            &ApprovalScope::None,
         )
         .await;
         assert_eq!(res["result"]["ok"], json!(true), "{res}");
@@ -2394,7 +2401,7 @@ mod tests {
             &resolved,
             &p,
             None,
-            None,
+            &ApprovalScope::None,
         )
         .await;
         assert!(
@@ -2447,7 +2454,7 @@ mod tests {
             &resolved,
             &p,
             None,
-            None,
+            &ApprovalScope::None,
         )
         .await;
 
@@ -2482,7 +2489,7 @@ mod tests {
             &resolved,
             &p,
             None,
-            None,
+            &ApprovalScope::None,
         )
         .await;
 
@@ -2518,7 +2525,7 @@ mod tests {
             &resolved,
             &p,
             Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
-            Some("0af7651916cd43dd8448eb211c80319c"),
+            &ApprovalScope::Flow("0af7651916cd43dd8448eb211c80319c".to_string()),
         )
         .await;
 
@@ -2549,7 +2556,7 @@ mod tests {
             &resolved,
             &p,
             None,
-            None,
+            &ApprovalScope::None,
         )
         .await;
 
@@ -2557,6 +2564,60 @@ mod tests {
         assert!(
             res["error"]["data"].get("hitl_request_id").is_none(),
             "no traceparent means nothing was persisted: {res}"
+        );
+    }
+
+    // ─── ApprovalScope → HITL context mapping ───────────────────────────────
+    //
+    // `ApprovalScope::None` and `ApprovalScope::CodingAgent` resolve without a
+    // DB round trip, so these stay hermetic against `test_state()`'s
+    // unreachable pool; the `Flow` arm is covered by the integration tests in
+    // `tests/tool_approval.rs`, which need a real `session_traces` table.
+
+    #[tokio::test]
+    async fn unscoped_approval_resolves_no_context_and_keeps_skipping_persistence() {
+        assert_eq!(
+            session::resolve_approval_context_id(&test_state(), &ApprovalScope::None).await,
+            None
+        );
+        assert_eq!(ApprovalScope::None.verified_flow_id(), None);
+        assert_eq!(ApprovalScope::None.event_channel(), None);
+    }
+
+    #[tokio::test]
+    async fn coding_agent_scope_resolves_the_synthetic_per_agent_context() {
+        let agent_id = Uuid::new_v4();
+        let scope = ApprovalScope::CodingAgent(agent_id);
+        let context = session::resolve_approval_context_id(&test_state(), &scope)
+            .await
+            .expect("a coding desk always has a context to key approvals on");
+        assert_eq!(context, format!("coding:{agent_id}"));
+        assert!(nasiko_hitl::is_coding_agent_context(&context));
+        // The event is published under the very same key the row carries.
+        assert_eq!(scope.event_channel().as_deref(), Some(context.as_str()));
+        // A coding desk has no verified flow: nothing may be signed or forwarded as one.
+        assert_eq!(scope.verified_flow_id(), None);
+        // Two desks never share a context, even for the same owner.
+        assert_ne!(
+            session::resolve_approval_context_id(
+                &test_state(),
+                &ApprovalScope::CodingAgent(Uuid::new_v4())
+            )
+            .await,
+            Some(context)
+        );
+    }
+
+    #[test]
+    fn flow_scope_exposes_its_verified_flow_id_and_publishes_on_it() {
+        let scope = ApprovalScope::Flow("0af7651916cd43dd8448eb211c80319c".to_string());
+        assert_eq!(
+            scope.verified_flow_id(),
+            Some("0af7651916cd43dd8448eb211c80319c")
+        );
+        assert_eq!(
+            scope.event_channel().as_deref(),
+            Some("0af7651916cd43dd8448eb211c80319c")
         );
     }
 
@@ -2578,7 +2639,7 @@ mod tests {
             &resolved,
             &perms(&[cid], vec![rule(cid, "*", Stance::Block)]),
             None,
-            None,
+            &ApprovalScope::None,
         )
         .await;
         assert_eq!(
@@ -2595,7 +2656,7 @@ mod tests {
             &resolved,
             &perms(&[], vec![]), // connector never enabled
             None,
-            None,
+            &ApprovalScope::None,
         )
         .await;
         assert_eq!(
@@ -2794,7 +2855,7 @@ mod tests {
                 &resolved,
                 &p,
                 None,
-                None,
+                &ApprovalScope::None,
             )
             .await;
             assert_eq!(res["error"]["code"], json!(codes::INVALID_PARAMS), "{res}");
@@ -2821,7 +2882,7 @@ mod tests {
                 &resolved,
                 &p,
                 None,
-                None,
+                &ApprovalScope::None,
             )
             .await;
             assert_eq!(res["error"]["code"], json!(codes::INVALID_PARAMS), "{res}");
@@ -2851,7 +2912,7 @@ mod tests {
             resolved,
             p,
             None,
-            None,
+            &ApprovalScope::None,
         )
         .await;
         let via_executor = handle_tools_call(
@@ -2865,7 +2926,7 @@ mod tests {
             resolved,
             p,
             None,
-            None,
+            &ApprovalScope::None,
         )
         .await;
         (direct, via_executor)

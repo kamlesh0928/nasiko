@@ -1127,16 +1127,17 @@ async fn coding_agent_row_with_a_foreign_live_flow_still_resolves_to_owner() {
     server.cleanup().await;
 }
 
-/// The cross-user event-injection regression a code-quality review of Task
-/// 1.5 caught: on the same foreign-live-flow setup as the test above, an
-/// `ask`-stance tool call must not publish a `ToolApprovalRequired` event
-/// onto the FOREIGN flow's `FlowEventBus` channel. `a2a_dispatch.rs` forwards
-/// that channel straight into the flow owner's SSE stream, so before the fix
-/// a coding-agent row could name any live flow's trace id and land an
-/// attacker-chosen server/tool "needs approval" card in a completely
-/// unrelated user's chat — despite never being a participant of that flow.
-/// The fix keys the publish on `verified_flow_id` (`None` here, since this
-/// agent isn't a participant), never a re-parse of the raw `traceparent`.
+/// The cross-user event-injection guard: on the same foreign-live-flow setup
+/// as the test above, an `ask`-stance tool call must not publish a
+/// `ToolApprovalRequired` event onto the FOREIGN flow's `FlowEventBus`
+/// channel. `a2a_dispatch.rs` forwards that channel straight into the flow
+/// owner's SSE stream, so a coding-agent row that could name any live flow's
+/// trace id would land an attacker-chosen server/tool "needs approval" card in
+/// a completely unrelated user's chat — despite never being a participant of
+/// that flow. The publish and the HITL row are keyed on the `ApprovalScope`
+/// the route layer established — the coding desk's own `coding:{agent_id}`
+/// context here, since this agent is not a participant of the named flow —
+/// never on a re-parse of the raw `traceparent`.
 #[tokio::test]
 #[serial]
 async fn coding_agent_row_with_foreign_flow_does_not_leak_an_approval_event() {
@@ -1230,15 +1231,28 @@ async fn coding_agent_row_with_foreign_flow_does_not_leak_an_approval_event() {
         json!(nasiko_mcp_gateway::types::codes::TOOL_ASK),
         "must be the normal ask decision: {body:?}"
     );
-    // Second regression (participant laundering through HITL context, caught
-    // in a follow-up review): a flow-less `tools/call` has no `verified_flow_id`,
-    // so `create_tool_approval_id` must refuse to persist anything — the
-    // response must not claim a `hitl_request_id` that resolves against the
-    // victim's flow.
-    assert!(
-        body["error"]["data"].get("hitl_request_id").is_none(),
-        "no verified flow means no context_id to persist against — must not \
-         claim a hitl_request_id that doesn't exist: {body:?}"
+    // Participant laundering through the HITL context: the row this ask
+    // persists is the coding desk's own (`coding:{agent_id}`, owned by the
+    // desk's owner) — never one keyed to the victim's flow, which approving
+    // would otherwise re-open and join (`oss/hitl/src/notifier.rs`).
+    let hitl_request_id: Uuid = body["error"]["data"]["hitl_request_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("a coding desk's ask persists a row of its own: {body:?}"));
+    let (context_id, row_owner): (Option<String>, Uuid) =
+        sqlx::query_as("SELECT context_id, owner_user_id FROM hitl_requests WHERE id = $1")
+            .bind(hitl_request_id)
+            .fetch_one(&server.db)
+            .await
+            .expect("the approval row must exist");
+    assert_eq!(
+        context_id.as_deref(),
+        Some(nasiko_hitl::coding_agent_context_id(agent_id).as_str()),
+        "the row is keyed to the desk, not to the flow named on the wire"
+    );
+    assert_eq!(
+        row_owner, owner,
+        "the row belongs to the desk's owner, never the victim"
     );
 
     // The regression: nothing must have been published onto the VICTIM's own

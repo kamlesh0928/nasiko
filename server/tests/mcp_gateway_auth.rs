@@ -607,6 +607,413 @@ async fn soft_deleted_coding_agent_row_is_not_admitted() {
     server.cleanup().await;
 }
 
+// ─── Coding-agent HITL approvals: ask → approve/deny → retry, with no flow ────
+//
+// A coding-agent row's `tools/call` has no flow, so there is no conversation to
+// key a human approval on. The gateway keys it to the desk itself instead — the
+// synthetic context `coding:{agent_id}` (`nasiko_hitl::coding_agent_context_id`)
+// — so an `ask`-stance rule produces a real `hitl_requests` row the owner can
+// see under `GET /api/hitl/pending` and resolve through the real route, and the
+// agent's retry matches it. These tests drive that loop end to end through the
+// real gateway and the real resolve route against a stub backend.
+
+const ASK_TOOL: &str = "save_file";
+
+/// The rows a deployment carries for one system connector whose `save_file`
+/// tool is `ask`-stance for every agent in `agent_ids`: the connector, a
+/// public grant, the synced catalog, and one access row per agent. Returns the
+/// connector id.
+async fn seed_ask_connector(
+    server: &TestServer,
+    backend_url: &str,
+    name: &str,
+    agent_ids: &[Uuid],
+) -> Uuid {
+    let connector_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO mcp_connectors (provider_type, source_kind, name, url, auth_type) \
+         VALUES ('system', 'system', $1, $2, 'none') RETURNING id",
+    )
+    .bind(name)
+    .bind(backend_url)
+    .fetch_one(&server.db)
+    .await
+    .expect("insert system connector");
+    sqlx::query(
+        "INSERT INTO mcp_connector_grants (connector_id, grant_type, grantee_id) \
+         VALUES ($1, 'public', '*')",
+    )
+    .bind(connector_id)
+    .execute(&server.db)
+    .await
+    .expect("insert public grant");
+    sqlx::query("INSERT INTO mcp_connector_tools (connector_id, tool_name) VALUES ($1, $2)")
+        .bind(connector_id)
+        .bind(ASK_TOOL)
+        .execute(&server.db)
+        .await
+        .expect("insert synced connector tool");
+    for agent_id in agent_ids {
+        sqlx::query(
+            "INSERT INTO mcp_agent_connector_access (agent_id, connector_id, enabled, tool_rules) \
+             VALUES ($1, $2, true, $3)",
+        )
+        .bind(agent_id)
+        .bind(connector_id)
+        .bind(serde_json::json!([{"pattern": ASK_TOOL, "stance": "ask"}]))
+        .execute(&server.db)
+        .await
+        .expect("insert agent connector access with ask-stance rule");
+    }
+    connector_id
+}
+
+fn direct_call(id: u64, tool: &str) -> serde_json::Value {
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": {"name": tool, "arguments": {"path": "notes.md"}}})
+}
+
+fn via_call_tool(id: u64, tool: &str) -> serde_json::Value {
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": {"name": "nasiko_call_tool",
+                   "arguments": {"name": tool, "arguments": {"path": "notes.md"}}}})
+}
+
+/// `POST /api/hitl/{id}/resolve` as `owner` — the same route and body the web
+/// UI and `nasiko` CLI send.
+async fn resolve_hitl(
+    server: &TestServer,
+    owner: Uuid,
+    hitl_id: Uuid,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    let req = server
+        .client
+        .post(server.url(&format!("/api/hitl/{hitl_id}/resolve")))
+        .json(&body);
+    common::as_member(req, &owner.to_string(), "owner")
+        .send()
+        .await
+        .unwrap()
+}
+
+/// The ids under `GET /api/hitl/pending` as `owner` sees it.
+async fn pending_ids_for(server: &TestServer, owner: Uuid) -> Vec<Uuid> {
+    let req = server.client.get(server.url("/api/hitl/pending"));
+    let res = common::as_member(req, &owner.to_string(), "owner")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    body["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .filter_map(|r| r["id"].as_str().and_then(|s| s.parse().ok()))
+        .collect()
+}
+
+fn hitl_request_id(body: &serde_json::Value) -> Uuid {
+    body["error"]["data"]["hitl_request_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("a coding-agent ask must persist an approval row: {body}"))
+}
+
+#[tokio::test]
+#[serial]
+async fn coding_agent_ask_without_a_flow_is_recorded_under_the_owner_and_approvable() {
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "gw-owner-coding-ask").await;
+    let agent_id = seed_agent(&server, owner, "gw-agent-coding-ask").await;
+    mark_coding_agent(&server, agent_id).await;
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+    let (backend_url, backend_calls) = start_call_log_backend().await;
+    let connector_id = seed_ask_connector(
+        &server,
+        &backend_url,
+        "gw-coding-ask-connector",
+        &[agent_id],
+    )
+    .await;
+
+    let coding_context = nasiko_hitl::coding_agent_context_id(agent_id);
+    // The approval event is published on the synthetic context, never on a
+    // flow id this row does not have — subscribe before the call so nothing
+    // is missed.
+    let mut events = server.flow_events.subscribe(&coding_context).await;
+
+    // No traceparent: the owner rule is the whole admission.
+    let res = post_mcp(&server, Some(&token), None, &direct_call(1, ASK_TOOL)).await;
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(
+        body["error"]["code"],
+        serde_json::json!(nasiko_mcp_gateway::types::codes::TOOL_ASK),
+        "{body}"
+    );
+    let hitl_id = hitl_request_id(&body);
+
+    let (context_id, row_owner, tool_name, row_connector, kind, status): (
+        Option<String>,
+        Uuid,
+        Option<String>,
+        Option<Uuid>,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT context_id, owner_user_id, tool_name, connector_id, kind, status \
+         FROM hitl_requests WHERE id = $1",
+    )
+    .bind(hitl_id)
+    .fetch_one(&server.db)
+    .await
+    .expect("the approval row must exist");
+    assert_eq!(context_id.as_deref(), Some(coding_context.as_str()));
+    assert_eq!(row_owner, owner, "the row is the owner's to approve");
+    assert_eq!(tool_name.as_deref(), Some(ASK_TOOL));
+    assert_eq!(row_connector, Some(connector_id));
+    assert_eq!(
+        (kind.as_str(), status.as_str()),
+        ("tool_approval", "pending")
+    );
+
+    match events.try_recv() {
+        Ok(nasiko_flow::FlowEvent::ToolApprovalRequired {
+            agent_id: event_agent,
+            server: event_server,
+            tool,
+        }) => {
+            assert_eq!(event_agent, agent_id.to_string());
+            assert_eq!(event_server, "gw-coding-ask-connector");
+            assert_eq!(tool, ASK_TOOL);
+        }
+        other => {
+            panic!("expected a ToolApprovalRequired event on the coding context, got {other:?}")
+        }
+    }
+
+    assert!(
+        pending_ids_for(&server, owner).await.contains(&hitl_id),
+        "the owner's pending list is the surface a human approves from"
+    );
+    assert!(
+        backend_calls.lock().unwrap().is_empty(),
+        "an ask decision must not reach the backend"
+    );
+
+    // Approve for the session through the real route.
+    let res = resolve_hitl(
+        &server,
+        owner,
+        hitl_id,
+        serde_json::json!({"decision": "approve", "scope": "session"}),
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+    let resolved: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(resolved["status"], "resolved", "{resolved}");
+    assert!(!pending_ids_for(&server, owner).await.contains(&hitl_id));
+
+    let grant_context: Option<String> = sqlx::query_scalar(
+        "SELECT context_id FROM mcp_session_tool_grants WHERE hitl_request_id = $1",
+    )
+    .bind(hitl_id)
+    .fetch_optional(&server.db)
+    .await
+    .expect("grant lookup");
+    assert_eq!(
+        grant_context.as_deref(),
+        Some(coding_context.as_str()),
+        "the session grant is keyed to the same synthetic context the retry resolves"
+    );
+
+    // The very same call now proceeds — named directly, and through the executor.
+    for body in [direct_call(2, ASK_TOOL), via_call_tool(3, ASK_TOOL)] {
+        let res = post_mcp(&server, Some(&token), None, &body).await;
+        assert_eq!(res.status(), 200);
+        let out: serde_json::Value = res.json().await.unwrap();
+        assert!(
+            out.get("error").is_none(),
+            "an approved call must reach the backend: {out}"
+        );
+    }
+    assert_eq!(
+        backend_calls.lock().unwrap().as_slice(),
+        &[ASK_TOOL.to_string(), ASK_TOOL.to_string()],
+        "the backend must have seen the inner tool twice"
+    );
+
+    // A deployed row still gets rule 3's 403 before any of this can start.
+    let deployed = seed_agent(&server, owner, "gw-agent-coding-ask-deployed").await;
+    let deployed_token = common::mint_gateway_token(&server.db, deployed).await;
+    let res = post_mcp(
+        &server,
+        Some(&deployed_token),
+        None,
+        &direct_call(4, ASK_TOOL),
+    )
+    .await;
+    assert_eq!(res.status(), 403);
+
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn coding_agent_ask_denied_by_the_owner_blocks_the_retry() {
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "gw-owner-coding-deny").await;
+    let agent_id = seed_agent(&server, owner, "gw-agent-coding-deny").await;
+    mark_coding_agent(&server, agent_id).await;
+    let token = common::mint_gateway_token(&server.db, agent_id).await;
+    let (backend_url, backend_calls) = start_call_log_backend().await;
+    seed_ask_connector(
+        &server,
+        &backend_url,
+        "gw-coding-deny-connector",
+        &[agent_id],
+    )
+    .await;
+
+    let res = post_mcp(&server, Some(&token), None, &direct_call(1, ASK_TOOL)).await;
+    let body: serde_json::Value = res.json().await.unwrap();
+    let hitl_id = hitl_request_id(&body);
+
+    let res = resolve_hitl(
+        &server,
+        owner,
+        hitl_id,
+        serde_json::json!({"decision": "reject"}),
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        res.json::<serde_json::Value>().await.unwrap()["status"],
+        "rejected"
+    );
+
+    let res = post_mcp(&server, Some(&token), None, &via_call_tool(2, ASK_TOOL)).await;
+    assert_eq!(res.status(), 200);
+    let out: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(
+        out["error"]["code"],
+        serde_json::json!(nasiko_mcp_gateway::types::codes::TOOL_BLOCKED),
+        "a denied retry is blocked, not re-asked: {out}"
+    );
+    assert!(
+        out["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("denied by the user"),
+        "{out}"
+    );
+    assert!(
+        backend_calls.lock().unwrap().is_empty(),
+        "a denied call must never reach the backend"
+    );
+
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn coding_agent_approval_is_scoped_to_its_own_desk() {
+    let server = TestServer::start().await;
+    let owner = seed_user(&server, "gw-owner-coding-scope").await;
+    let desk_a = seed_agent(&server, owner, "gw-agent-coding-scope-a").await;
+    let desk_b = seed_agent(&server, owner, "gw-agent-coding-scope-b").await;
+    mark_coding_agent(&server, desk_a).await;
+    // One active row per (owner, integration) — `agents_owner_coding_integration_active_uniq`
+    // — so the owner's second desk is a different coding agent.
+    sqlx::query("UPDATE agents SET coding_agent_integration_id = 'codex' WHERE id = $1")
+        .bind(desk_b)
+        .execute(&server.db)
+        .await
+        .expect("mark the second desk as a coding agent");
+    let token_a = common::mint_gateway_token(&server.db, desk_a).await;
+    let token_b = common::mint_gateway_token(&server.db, desk_b).await;
+    let (backend_url, backend_calls) = start_call_log_backend().await;
+    seed_ask_connector(
+        &server,
+        &backend_url,
+        "gw-coding-scope-connector",
+        &[desk_a, desk_b],
+    )
+    .await;
+
+    // Desk A asks and the owner approves it for the session.
+    let res = post_mcp(&server, Some(&token_a), None, &direct_call(1, ASK_TOOL)).await;
+    let body: serde_json::Value = res.json().await.unwrap();
+    let hitl_a = hitl_request_id(&body);
+    let res = resolve_hitl(
+        &server,
+        owner,
+        hitl_a,
+        serde_json::json!({"decision": "approve", "scope": "session"}),
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+
+    // Desk B — same owner, same connector, same tool — is a different desk:
+    // its context is `coding:{desk_b}`, so A's grant is not its to consume.
+    let res = post_mcp(&server, Some(&token_b), None, &direct_call(2, ASK_TOOL)).await;
+    let body_b: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(
+        body_b["error"]["code"],
+        serde_json::json!(nasiko_mcp_gateway::types::codes::TOOL_ASK),
+        "another desk must be asked afresh: {body_b}"
+    );
+    let hitl_b = hitl_request_id(&body_b);
+    assert_ne!(hitl_a, hitl_b);
+    let context_b: Option<String> =
+        sqlx::query_scalar("SELECT context_id FROM hitl_requests WHERE id = $1")
+            .bind(hitl_b)
+            .fetch_one(&server.db)
+            .await
+            .expect("row b");
+    assert_eq!(
+        context_b.as_deref(),
+        Some(nasiko_hitl::coding_agent_context_id(desk_b).as_str())
+    );
+
+    // Desk A itself, acting inside a real flow, is in the flow's conversation —
+    // not the desk's synthetic context — so the desk grant does not apply there.
+    let (flow_id, traceparent) = common::open_flow(&server.db, owner, desk_a).await;
+    let res = post_mcp(
+        &server,
+        Some(&token_a),
+        Some(&traceparent),
+        &direct_call(3, ASK_TOOL),
+    )
+    .await;
+    let body_flow: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(
+        body_flow["error"]["code"],
+        serde_json::json!(nasiko_mcp_gateway::types::codes::TOOL_ASK),
+        "a real flow is a different approval scope: {body_flow}"
+    );
+    let hitl_flow = hitl_request_id(&body_flow);
+    let context_flow: Option<String> =
+        sqlx::query_scalar("SELECT context_id FROM hitl_requests WHERE id = $1")
+            .bind(hitl_flow)
+            .fetch_one(&server.db)
+            .await
+            .expect("flow row");
+    assert_eq!(
+        context_flow.as_deref(),
+        Some(flow_id.as_str()),
+        "the flow-path row is keyed to the flow's conversation, never to the desk"
+    );
+
+    assert!(
+        backend_calls.lock().unwrap().is_empty(),
+        "neither the other desk nor the flow call may ride on desk A's approval"
+    );
+
+    server.cleanup().await;
+}
+
 // ─── URL-credential form: POST /api/mcp/s/{token} ────────────────────────────
 //
 // Same credential, same ladder — only the transport differs. These exist to

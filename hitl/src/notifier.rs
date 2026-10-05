@@ -20,7 +20,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::dispatcher::{NotifyError, ResumeNotifier};
-use crate::types::{DECISION_APPROVE, HitlKind, HitlRequest};
+use crate::types::{DECISION_APPROVE, HitlKind, HitlRequest, is_coding_agent_context};
 
 /// `flows.title` for the row `traceparent_for_context` registers — named here instead of inline
 /// in the SQL text (nit from review).
@@ -306,6 +306,25 @@ impl ResumeNotifier for RuntimeResumeNotifier {
             .context_id
             .as_deref()
             .ok_or(NotifyError::MissingContextId(request.id))?;
+
+        // A coding-agent context (`coding:{agent_id}`, see `CODING_AGENT_CONTEXT_PREFIX`) belongs
+        // to a CLI-bound local coding agent: it was never dispatched into a flow and has no A2A
+        // endpoint, so there is no paused conversation to push the decision into. The decision
+        // still takes effect — the agent's own retry of the tool call resolves the same synthetic
+        // context and matches the resolved row or its session grant — so this is a delivery with
+        // nothing to send, not a failure: `Ok(())` records `completed`. Returning an error here
+        // would instead record `failed` (the `session_traces` ownership guard below would raise
+        // the permanent `ContextNotOwned`, since the context names no chat session) and, had the
+        // call gone ahead, `traceparent_for_context` would open a `flows` window for a trace id
+        // nothing holds.
+        if is_coding_agent_context(context_id) {
+            tracing::info!(
+                id = %request.id, %context_id,
+                "resume notifier: coding-agent context has no flow or endpoint to nudge — \
+                 the agent's own retry carries the decision; nothing to deliver"
+            );
+            return Ok(());
+        }
 
         let endpoint = self.resolve_agent_endpoint(request.agent_id).await?;
         let message = build_resume_message(request);
