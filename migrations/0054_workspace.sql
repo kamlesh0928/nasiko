@@ -1,4 +1,4 @@
--- 0041_workspace.sql (part 1: system connectors)
+-- 0054_workspace.sql (part 1: system connectors)
 ALTER TABLE mcp_connectors DROP CONSTRAINT IF EXISTS mcp_connectors_provider_type_check;
 ALTER TABLE mcp_connectors
     ADD CONSTRAINT mcp_connectors_provider_type_check

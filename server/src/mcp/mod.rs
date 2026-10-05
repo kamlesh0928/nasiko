@@ -240,7 +240,7 @@ pub fn composio_callback_router() -> Router<AppState> {
 // ─── Shared error + auth helpers ────────────────────────────────────────────
 
 /// Standard API envelope: `{"data": …, "status_code": N, "message": "…"}`.
-/// `pub` (not `pub(crate)`) so `ee/server`'s own MCP-related handlers
+/// `pub` (not `pub(crate)`) so the EE server's own MCP-related handlers
 /// (`mcp_sharing.rs`) can produce the same envelope shape.
 pub struct ApiResponse {
     status: StatusCode,
@@ -333,7 +333,7 @@ where
 }
 
 /// Wraps [`McpError`] as an HTTP response for the management routes. `pub` so
-/// `ee/server`'s MCP handlers can return it too (see [`ApiResponse`]).
+/// The EE server's MCP handlers can return it too (see [`ApiResponse`]).
 pub struct ApiError(pub McpError);
 
 impl IntoResponse for ApiError {

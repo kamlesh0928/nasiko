@@ -366,6 +366,7 @@ pub async fn handle_tools_list(
 
     // Always include the search meta-tool so the agent can discover more tools.
     tools.push(nasiko_search_tools_definition());
+    tools.push(recover_compressed_definition());
 
     ok(req_id, json!({ "tools": tools }))
 }
@@ -425,6 +426,55 @@ fn nasiko_search_tools_definition() -> Value {
             "required": ["query"]
         }
     })
+}
+
+/// The W3C trace-id out of a `traceparent`, which is what a flow is keyed by.
+///
+/// Mirrors `nasiko_llm_router::routing::boundary::parse_flow_id`; duplicated rather than shared
+/// because this crate does not depend on the router.
+pub(crate) fn flow_id_of(traceparent: &str) -> Option<String> {
+    let parts: Vec<&str> = traceparent.split('-').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let trace_id = parts[1];
+    let valid = trace_id.len() == 32
+        && trace_id.bytes().all(|b| b.is_ascii_hexdigit())
+        && trace_id.bytes().any(|b| b != b'0');
+    valid.then(|| trace_id.to_ascii_lowercase())
+}
+
+/// The `recover_compressed` meta-tool definition (PRD §9 IP-5).
+///
+/// Listed unconditionally, like the search meta-tool: an agent has to know it exists *before* it
+/// meets its first elision marker, because the marker is the only place the handle appears.
+fn recover_compressed_definition() -> Value {
+    json!({
+        "name": "recover_compressed",
+        "description": "Retrieve the full, uncompressed content that an elision marker stands in for. Call this when a payload you were given contains a marker like `[… 412 lines elided · recover: nasiko://c/9f3a… ]` and the elided part matters for your answer.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "handle": {
+                    "type": "string",
+                    "description": "The handle from the elision marker, with or without the `nasiko://c/` prefix"
+                }
+            },
+            "required": ["handle"]
+        }
+    })
+}
+
+/// Strip the marker's URI prefix and parse what is left as a handle.
+///
+/// The model copies the handle out of prose, so it arrives with whatever punctuation surrounded
+/// it. Accepting both forms is cheaper than teaching it one.
+fn parse_recovery_handle(raw: &str) -> Option<Uuid> {
+    raw.trim()
+        .trim_start_matches("nasiko://c/")
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+        .parse()
+        .ok()
 }
 
 /// Whether a connector-connection lookup means an `auth_required` pause should fire. `Err` (a
@@ -527,6 +577,69 @@ pub async fn handle_tools_call(
                 "search_mode": format!("{:?}", state.config.tool_search_mode),
             }),
         );
+    }
+
+    // ── recover_compressed meta-tool (IP-5) ──────────────────────────────
+    if tool_name == "recover_compressed" {
+        let Some(handle) = arguments
+            .get("handle")
+            .and_then(|v| v.as_str())
+            .and_then(parse_recovery_handle)
+        else {
+            return err(
+                req_id,
+                codes::INVALID_PARAMS,
+                "recover_compressed requires `handle`, the identifier from an elision marker",
+            );
+        };
+
+        // Scope, not just lookup: the handle alone is a bearer token, so the row must also
+        // belong to this user and to the flow this call is being made inside. `flow_id` is the
+        // traceparent trace-id, which `tools/call` has already proven this agent participates in.
+        let Some(flow_id) = traceparent.and_then(crate::protocol::flow_id_of) else {
+            return err(
+                req_id,
+                codes::INVALID_PARAMS,
+                "recover_compressed is only available inside a flow",
+            );
+        };
+
+        let row: Result<Option<(String, String)>, _> = sqlx::query_as(
+            "SELECT content, content_type FROM compression_originals \
+             WHERE handle = $1 AND owner_id = $2 AND flow_id = $3",
+        )
+        .bind(handle)
+        .bind(user_id)
+        .bind(&flow_id)
+        .fetch_optional(&state.db)
+        .await;
+
+        return match row {
+            // Deliberately one message for "no such handle" and "not yours": distinguishing them
+            // would turn the handle into an existence oracle across flows.
+            Ok(None) => ok(
+                req_id,
+                json!({
+                    "content": [{
+                        "type": "text",
+                        "text": "No recoverable content for that handle. It may have expired, or belong to a different conversation."
+                    }],
+                    "isError": true
+                }),
+            ),
+            Ok(Some((content, content_type))) => ok(
+                req_id,
+                json!({
+                    "content": [{ "type": "text", "text": content }],
+                    "_meta": { "content_type": content_type }
+                }),
+            ),
+            Err(e) => err(
+                req_id,
+                codes::INTERNAL_ERROR,
+                format!("failed to read the recovery store: {e}"),
+            ),
+        };
     }
 
     let (server, original) = match router::route_tool(tool_name, &resolved.servers) {
@@ -1569,6 +1682,55 @@ fn unwrap_multi_execute_response(response: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    // ── IP-5: recover_compressed ────────────────────────────────────────────
+
+    #[test]
+    fn recovery_handle_parses_out_of_a_marker_however_the_model_copies_it() {
+        let id = "9f3a1c2e-4b5d-6e7f-8a9b-0c1d2e3f4a5b";
+        for raw in [
+            id.to_string(),
+            format!("nasiko://c/{id}"),
+            format!(" nasiko://c/{id} "),
+            format!("`{id}`"),
+            format!("[{id}]"),
+        ] {
+            assert_eq!(
+                parse_recovery_handle(&raw).map(|u| u.to_string()),
+                Some(id.to_string()),
+                "failed to parse: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_handle_is_rejected_rather_than_guessed() {
+        for raw in ["", "nasiko://c/", "not-a-uuid", "../../etc/passwd"] {
+            assert!(parse_recovery_handle(raw).is_none(), "accepted: {raw}");
+        }
+    }
+
+    #[test]
+    fn flow_id_is_the_trace_id_of_the_traceparent() {
+        assert_eq!(
+            flow_id_of("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").as_deref(),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736")
+        );
+        // An all-zero trace id is the "no trace" sentinel, not a flow.
+        assert!(flow_id_of("00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none());
+        assert!(flow_id_of("garbage").is_none());
+    }
+
+    #[test]
+    fn recover_compressed_is_offered_to_every_agent() {
+        // The handle only ever appears inside an elision marker, so an agent that has not been
+        // told the tool exists cannot act on the marker it is given.
+        let def = recover_compressed_definition();
+        assert_eq!(def["name"], "recover_compressed");
+        assert!(def["inputSchema"]["properties"]["handle"].is_object());
+        assert_eq!(def["inputSchema"]["required"][0], "handle");
+    }
+
     use super::*;
     use crate::config::{McpConfig, ToolSearchMode};
     use crate::permissions::PermissionRule;

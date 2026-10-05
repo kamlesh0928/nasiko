@@ -371,7 +371,7 @@ pub async fn register_connector(
     };
 
     // Always probe the server's own `initialize` response — `instructions` is
-    // stored verbatim as its own column (0041_workspace.sql) regardless of
+    // stored verbatim as its own column (0054_workspace.sql) regardless of
     // whether the caller supplied a description, since it's a distinct value
     // the gateway's own `initialize` forwards later, not a description
     // substitute. The description itself keeps its original precedence:

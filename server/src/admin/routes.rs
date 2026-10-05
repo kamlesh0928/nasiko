@@ -702,7 +702,7 @@ async fn record_lifecycle_status(state: &AppState, name: &str, status: &str) {
     // - Bringing an agent UP may only touch the newest row. An agent-wide sweep
     //   would resurrect every historical row as `running`, which is not just a
     //   smudged history — EE's crash guardian polls *every* row in
-    //   ('starting','running') (ee/server/src/crash_guardian.rs), so each stale
+    //   ('starting','running') (the EE crash guardian), so each stale
     //   row becomes a phantom deployment it probes and can mark crashed.
     // - Taking one DOWN sweeps the agent, matching `destroy` above. Nothing of
     //   this agent's is running afterwards, so any row still claiming otherwise
@@ -824,6 +824,32 @@ async fn resolve_full_env(
     }
     env.entry("OPENAI_MODEL".into())
         .or_insert_with(|| state.config.openai_model.clone());
+
+    // 4. Same reasoning as the platform-LLM-config gap above, same fix shape —
+    // this is a plain `agents` column (migration 0032), not a secret, so it's
+    // not in `agent_secrets` at all. Unconditional insert, not `.or_insert`:
+    // guards against a stale CODING_AGENT_MINIMAL_CODE secret a pre-migration
+    // agent might still carry in `secrets_env` (see the matching comment in
+    // `AppState::agent_env`, state.rs). The outer `deploy()` caller's own
+    // `entry().or_insert()` merge still lets an explicit `-e
+    // CODING_AGENT_MINIMAL_CODE=...` on this specific request win over it.
+    let minimal_code_enabled: Option<bool> =
+        sqlx::query_scalar("SELECT minimal_code_enabled FROM agents WHERE id = $1")
+            .bind(agent_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+    let minimal_code_enabled = minimal_code_enabled.unwrap_or(false);
+    tracing::info!(
+        %agent_id,
+        minimal_code_enabled,
+        "resolve_full_env: injecting CODING_AGENT_MINIMAL_CODE"
+    );
+    env.insert(
+        "CODING_AGENT_MINIMAL_CODE".into(),
+        minimal_code_enabled.to_string(),
+    );
 
     env
 }

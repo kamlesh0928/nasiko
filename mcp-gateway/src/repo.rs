@@ -52,7 +52,7 @@ pub struct McpConnector {
     /// The backend's own `initialize.instructions`, harvested at probe time
     /// (`connectors::probe_initialize`) and forwarded verbatim by the
     /// gateway's own `initialize` (`protocol::handle_initialize`). Distinct
-    /// from `description` — see `0041_workspace.sql`'s doc comment.
+    /// from `description` — see `0054_workspace.sql`'s doc comment.
     pub instructions: Option<String>,
     // composio-only
     pub auth_config_id: Option<String>,

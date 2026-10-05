@@ -21,7 +21,7 @@ use nasiko_react_agent::{
 };
 use nasiko_types::a2a::{self as a2a, JsonRpcRequest, PartContent, StreamResponse};
 
-use nasiko_orchestrator::{AgentSelector, SessionHistory};
+use nasiko_orchestrator::{AgentSelector, ContextTiers, context_selection};
 
 use nasiko_flow::FlowContext;
 
@@ -216,7 +216,16 @@ pub async fn a2a_dispatch_handler(
     // multi-turn chats keep their history either way. An unknown id simply
     // fetches zero rows.
     let history_sid = session_id.as_deref().unwrap_or(&context_id);
-    let history = SessionHistory::fetch(history_sid, &state.db, 20).await;
+    let history_store = state.history_vector_store();
+    let history = context_selection::fetch_for_user(
+        &state.db,
+        user_id,
+        history_sid,
+        &history_store,
+        &text,
+        &ContextTiers::from_config(&state.config),
+    )
+    .await;
 
     let query = history.with_current_query(&text);
 
@@ -279,6 +288,7 @@ pub async fn a2a_dispatch_handler(
             user_id,
             &[],
             session_id,
+            history.user_turn_count(),
         )
         .await
     }
@@ -552,6 +562,10 @@ pub(crate) async fn orchestrator_stream(
         Some(text)
     };
 
+    // One read per turn, shared by IP-3 below. See `compression_opt_in` for why this is
+    // aggregated over the caller's agents rather than read off a single one.
+    let compression_opted_in = nasiko_orchestrator::compression_opt_in(&state.db, user_id).await;
+
     let config = OrchestratorConfig {
         // `state.config.openai_model` is already loaded via `env_or("OPENAI_MODEL",
         // "gpt-4o-mini")` (oss/config/src/lib.rs) — read that shared, validated
@@ -566,7 +580,18 @@ pub(crate) async fn orchestrator_stream(
         temperature: Some(0.2),
         policy: policy.clone(),
         preamble,
-        ..Default::default()
+        // IP-3. Read here rather than defaulted, because `ContextConfig::default()` is
+        // deliberately inert — without this the compressor is compiled in but unreachable.
+        // Gated by the deployment flag AND the per-agent opt-in, so the UI switch starts and
+        // stops this with the rest of the stack instead of leaving one layer running.
+        context: nasiko_react_agent::ContextConfig {
+            compress: nasiko_compress::Policy {
+                enabled: state.config.react_compress_enabled && compression_opted_in,
+                min_bytes: state.config.react_compress_min_bytes,
+                ..Default::default()
+            },
+            ..nasiko_react_agent::ContextConfig::default()
+        },
     };
 
     // Real root span for this exchange. Its ids seed the FlowContext, so the
@@ -653,7 +678,14 @@ pub(crate) async fn orchestrator_stream(
         caller_uuid,
     );
 
+    // `A2aClient`'s own default is deliberately short — it is shared with agent
+    // card / discovery fetches, where a long hang is the wrong behaviour. This
+    // client makes real agent turns, including the `message/send` fallback taken
+    // by agents that reject `message/stream`, so it carries the agent budget.
     let a2a_client = nasiko_react_agent::A2aClient::new()
+        .with_timeout(std::time::Duration::from_secs(
+            state.config.agent_call_timeout_secs,
+        ))
         .with_headers(vec![("traceparent".to_string(), traceparent)]);
 
     // Each agent the orchestrator calls authenticates to /api/mcp with its own
@@ -1115,11 +1147,12 @@ async fn resolve_agent(state: &AppState, target: &str) -> Result<AgentRow, A2aDi
     // Excludes `is_internal` agents unconditionally, including for the owning
     // superuser — this is the platform's only generic A2A entry point, and an
     // internal agent (e.g. Weave's dashboard-generator) must be reachable
-    // exclusively through its own dedicated route (`ee/server/src/weave_surface.rs`),
-    // never here, or the superuser-ACL-bypass would leak it into ordinary chat
+    // exclusively through its own dedicated route, never here, or the
+    // superuser-ACL-bypass would leak it into ordinary chat
     // history/usage tracking.
     sqlx::query_as::<_, AgentRow>(
-        "SELECT id, name, status FROM agents \
+        "SELECT id, name, status, minimal_code_enabled, skills \
+         FROM agents \
          WHERE (id::text = $1 OR name = $1) AND status = 'running' AND NOT is_internal",
     )
     .bind(target)
@@ -1156,6 +1189,13 @@ async fn agent_stream(
     // `Sse::new(...).into_response()` requires to be `'static` — a caller-borrowed `&str`
     // cannot satisfy that, only a value this function owns and moves into the generator can.
     session_id: Option<String>,
+    // Prior user turns in this session (`history.user_turn_count()` at the call
+    // site) — picks which minimal-code ladder variant to inject below. A fresh
+    // session has nothing in its workspace yet to search for; forcing the full
+    // search-first ladder there only spends tokens finding nothing. An
+    // established session (several turns in) leans the other way — see
+    // nasiko-coding-policy's minimal_code_addendum() doc comment.
+    prior_turn_count: usize,
 ) -> Result<Response, A2aDispatchError> {
     let endpoint = resolve_endpoint(state, &agent.id.to_string(), &agent.name)
         .await
@@ -1230,6 +1270,38 @@ async fn agent_stream(
     .execute(&state.db)
     .await;
 
+    // Minimal-code ladder injection: only what's actually FORWARDED to the
+    // agent gets the addendum appended — `query` itself stays untouched, so
+    // everything above that already used it (the flow title, the span's
+    // captured input, session_traces) keeps showing the real conversation,
+    // not an implementation detail. The agent needs zero code of its own to
+    // support this: it just sees a longer task description, exactly as it
+    // would if a human had pasted the same extra paragraph in by hand.
+    //
+    // `prior_turn_count` picks the ladder variant: a session's first turn has
+    // an empty workspace, so the full "search the codebase first" ladder just
+    // spends tokens finding nothing there — confirmed empirically (chat
+    // 2026-09-22) to cost more per turn than not having the ladder on at all,
+    // on exactly this kind of from-scratch task. See nasiko-coding-policy's
+    // minimal_code_addendum() doc comment for the three-tier reasoning.
+    // Built from `outbound_query`, never from `query`: `outbound_query` is `query` plus any
+    // server-injected context (enterprise supplemental knowledge), and it is what the agent is
+    // meant to receive. Building from `query` here silently dropped that injection — the
+    // context was resolved on every dispatch and then thrown away.
+    let effective_query =
+        if agent.minimal_code_enabled && crate::catalog::models::has_coding_skills(&agent.skills) {
+            let addendum = nasiko_coding_policy::minimal_code_addendum(prior_turn_count);
+            tracing::info!(
+                agent_id = %agent.id,
+                %context_id,
+                prior_turn_count,
+                "a2a_dispatch: injecting minimal-code ladder"
+            );
+            format!("{outbound_query}\n{addendum}")
+        } else {
+            outbound_query.to_string()
+        };
+
     // Streaming first (`message/stream`): agents that stream (all the Rust
     // seed agents, and python a2a-sdk servers) deliver live tokens and tool
     // activity. The SSE loop below terminates itself on the first terminal
@@ -1238,10 +1310,10 @@ async fn agent_stream(
     // (or reject `message/stream`) fall through to the non-streaming branch,
     // which retries with `message/send`.
     let req_body = if file_parts.is_empty() {
-        nasiko_types::a2a::build_stream_request(outbound_query, Some(context_id))
+        nasiko_types::a2a::build_stream_request(&effective_query, Some(context_id))
     } else {
         nasiko_types::a2a::build_stream_request_with_parts(
-            outbound_query,
+            &effective_query,
             Some(context_id),
             file_parts,
         )
@@ -1256,11 +1328,13 @@ async fn agent_stream(
             .post(&endpoint)
             .header("A2A-Version", nasiko_types::a2a::A2A_VERSION_HEADER_VALUE)
             .header("traceparent", crate::telemetry::traceparent_for(&flow_ctx))
-            // Agent turns can legitimately run past the shared client's default
-            // 60s timeout (long tool calls, multi-step orchestration); override
+            // Agent turns can legitimately run past the shared client's short
+            // default (long tool calls, multi-step orchestration); override
             // per-request instead of raising the global default for every caller
             // of `state.http_client`.
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(std::time::Duration::from_secs(
+                state.config.agent_call_timeout_secs,
+            ))
     };
 
     let response = build_agent_req()
@@ -1459,7 +1533,7 @@ async fn agent_stream(
         // retry once with plain `message/send`.
         if resp_body.get("error").is_some() {
             let retry_body =
-                nasiko_types::a2a::build_send_request(outbound_query, Some(&context_id));
+                nasiko_types::a2a::build_send_request(&effective_query, Some(&context_id));
             let retry = build_agent_req()
                 .json(&retry_body)
                 .send()
@@ -1828,8 +1902,8 @@ async fn ensure_orchestrator_chat_session(
     };
 
     let _ = sqlx::query(
-        "INSERT INTO chat_sessions (session_id, user_id, agent_id, agent_url, title) \
-         VALUES ($1, $2, NULL, '/api/orchestrator/a2a', $3) \
+        "INSERT INTO chat_sessions (session_id, user_id, agent_id, agent_url, title, session_type) \
+         VALUES ($1, $2, NULL, '/api/orchestrator/a2a', $3, 'orchestrator') \
          ON CONFLICT (session_id) DO NOTHING",
     )
     .bind(context_id)
@@ -1842,13 +1916,21 @@ async fn ensure_orchestrator_chat_session(
         return;
     }
 
-    let _ =
-        sqlx::query("INSERT INTO chat_messages (session_id, role, content) VALUES ($1, $2, $3)")
-            .bind(context_id)
-            .bind(role)
-            .bind(query)
-            .execute(&state.db)
-            .await;
+    // 10s dedup guard: mirrors the one in agent_proxy.rs — the CLI's A2A
+    // method negotiation can hit this path twice for the same logical
+    // message when it retries under a different JSON-RPC method name.
+    let _ = sqlx::query(
+        "INSERT INTO chat_messages (session_id, role, content) \
+         SELECT $1, $2, $3 WHERE NOT EXISTS ( \
+             SELECT 1 FROM chat_messages \
+             WHERE session_id = $1 AND role = $2 AND content = $3 \
+               AND timestamp > now() - INTERVAL '10 seconds')",
+    )
+    .bind(context_id)
+    .bind(role)
+    .bind(query)
+    .execute(&state.db)
+    .await;
 }
 
 pub(crate) async fn resolve_endpoint(
@@ -2257,6 +2339,13 @@ struct AgentRow {
     id: Uuid,
     name: String,
     status: String,
+    /// Plain column (migration 0032), not a secret — read fresh on every
+    /// dispatch so the minimal-code ladder injection below applies
+    /// immediately when toggled, with no agent restart needed.
+    minimal_code_enabled: bool,
+    /// The agent card's skills, classified here rather than in SQL so the dispatch path and
+    /// the settings page share one answer — see [`catalog::models::has_coding_skills`].
+    skills: sqlx::types::Json<Vec<crate::catalog::models::Skill>>,
 }
 
 #[derive(Debug)]

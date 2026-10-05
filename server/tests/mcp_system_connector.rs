@@ -1,5 +1,5 @@
 //! `provider_type='system'` connector rows — schema-only coverage for
-//! `0041_workspace.sql`, plus an end-to-end proof that a system connector
+//! `0054_workspace.sql`, plus an end-to-end proof that a system connector
 //! actually works through the real gateway.
 //!
 //! `chk_connectors_provider_fields` (0003_mcp.sql) originally allowed only the

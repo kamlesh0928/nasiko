@@ -1,10 +1,9 @@
 //! Startup reconciliation: redeploys any agent whose DB row says
 //! `status = 'running'` but has no live runtime resource — e.g. after a
 //! tenant cluster restore recreates the database and rustfs/registry data
-//! but not the Kubernetes Deployments/Services (`ee/multi-tenant`'s
-//! `BackupOrchestrator::do_start` only restarts `nasiko-server` itself; it
-//! never touches individual agent workloads — this closes that gap from the
-//! side that actually has the runtime handle).
+//! but not the Kubernetes Deployments/Services (the restore path only restarts
+//! `nasiko-server` itself; it never touches individual agent workloads — this
+//! closes that gap from the side that actually has the runtime handle).
 //!
 //! General-purpose, not restore-specific: this also repairs any cluster
 //! whose deployments were wiped by drift outside a restore. Mirrors
