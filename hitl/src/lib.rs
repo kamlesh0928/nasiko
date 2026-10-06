@@ -20,7 +20,7 @@ pub use store::{
 };
 pub use types::{
     AUTH_ACTION_CONFIRM, AUTH_ACTION_START, AUTH_OUTCOME_CONFIRMED, AUTH_OUTCOME_DENIED,
-    AUTH_REPLY_AUTHORIZED, CODING_AGENT_CONTEXT_PREFIX, DECISION_APPROVE, DECISION_REJECT,
-    GRANT_SCOPE_ONCE, GRANT_SCOPE_SESSION, HitlKind, HitlOrigin, HitlRequest, HitlStatus,
-    NewHitlRequest, ParseEnumError, ResumeStatus, coding_agent_context_id, is_coding_agent_context,
+    AUTH_REPLY_AUTHORIZED, DECISION_APPROVE, DECISION_REJECT, GRANT_SCOPE_ONCE,
+    GRANT_SCOPE_SESSION, HitlKind, HitlOrigin, HitlRequest, HitlStatus, NewHitlRequest,
+    ParseEnumError, ResumeStatus,
 };

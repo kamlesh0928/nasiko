@@ -113,31 +113,6 @@ pub const AUTH_OUTCOME_DENIED: &str = "denied";
 /// literally (see `oss/server/src/hitl/mod.rs::answer_text`'s own doc comment).
 pub const AUTH_REPLY_AUTHORIZED: &str = "authorized";
 
-/// Namespace of the synthetic `context_id` a CLI-bound local coding agent's `tool_approval` rows
-/// are keyed by. Such a row is never dispatched through a flow, so the MCP gateway has no
-/// conversation to resolve a context from; it keys the approval to the agent itself instead —
-/// `coding:{agent_id}` ([`coding_agent_context_id`]) — stable across every call the desk makes.
-///
-/// The prefix is what keeps this namespace disjoint from every real context: a flow-derived
-/// context is a `chat_sessions.session_id` or a 32-hex trace id, and the gateway refuses to key an
-/// approval on a flow-derived value that carries this prefix (`session::resolve_approval_context_id`
-/// in `oss/mcp-gateway`), so a grant written for a coding desk can never be consumed by the same
-/// agent acting inside a real flow, or the reverse. Shared from this crate because three places
-/// have to agree on it: the gateway (create + retry match), the resolve route's session-grant
-/// write (`resolve_stable_session_context`), and the resume notifier (nothing to nudge).
-pub const CODING_AGENT_CONTEXT_PREFIX: &str = "coding:";
-
-/// The synthetic approval context for a coding-agent row — see [`CODING_AGENT_CONTEXT_PREFIX`].
-pub fn coding_agent_context_id(agent_id: Uuid) -> String {
-    format!("{CODING_AGENT_CONTEXT_PREFIX}{agent_id}")
-}
-
-/// True when `context_id` lives in the coding-agent namespace — see
-/// [`CODING_AGENT_CONTEXT_PREFIX`].
-pub fn is_coding_agent_context(context_id: &str) -> bool {
-    context_id.starts_with(CODING_AGENT_CONTEXT_PREFIX)
-}
-
 /// Mirrors the `hitl_requests` table (migration `0007_hitl.sql`).
 ///
 /// `question` is write-once at creation; `human_response` is written only by `resolve()`;
@@ -674,28 +649,5 @@ mod tests {
         assert_eq!(req.arguments_hash.as_deref(), Some("sha256:abc"));
         assert!(req.maf_execution_id.is_none());
         assert!(req.chat_session_id.is_none());
-    }
-
-    #[test]
-    fn coding_agent_context_is_the_prefixed_agent_id_and_nothing_else_matches_it() {
-        let agent_id = Uuid::new_v4();
-        let context = coding_agent_context_id(agent_id);
-        assert_eq!(context, format!("coding:{agent_id}"));
-        assert!(is_coding_agent_context(&context));
-        assert_ne!(
-            context,
-            coding_agent_context_id(Uuid::new_v4()),
-            "two agents never share a synthetic context"
-        );
-
-        // The two shapes a flow-derived context can take are outside the namespace.
-        assert!(!is_coding_agent_context("0af7651916cd43dd8448eb211c80319c"));
-        assert!(!is_coding_agent_context(
-            "ses_0af7651916cd43dd8448eb211c80319c"
-        ));
-        assert!(!is_coding_agent_context(""));
-        // The prefix is matched literally — no case folding, no surrounding whitespace.
-        assert!(!is_coding_agent_context(&format!("Coding:{agent_id}")));
-        assert!(!is_coding_agent_context(&format!(" coding:{agent_id}")));
     }
 }

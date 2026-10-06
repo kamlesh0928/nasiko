@@ -17,7 +17,7 @@ use nasiko_mcp_gateway::OssConnectorAuthorizer;
 use nasiko_mcp_gateway::permissions::PermissionContext;
 use nasiko_mcp_gateway::protocol::handle_tools_call;
 use nasiko_mcp_gateway::provider::ComposioProvider;
-use nasiko_mcp_gateway::session::{ApprovalScope, ResolvedSession};
+use nasiko_mcp_gateway::session::ResolvedSession;
 use nasiko_mcp_gateway::types::{
     ConnectorUnusable, MCPServerConfig, ServerType, UnusableConnector, codes,
 };
@@ -81,7 +81,7 @@ async fn auth_required_persists_hitl_row_and_returns_auth_required_code() {
         &resolved,
         &perms,
         Some(&traceparent),
-        &ApprovalScope::Flow(trace_id.to_string()),
+        Some(trace_id),
     )
     .await;
 
@@ -135,7 +135,7 @@ async fn auth_required_falls_back_to_raw_trace_id_when_no_session_trace_exists()
         &resolved,
         &perms,
         Some(&traceparent),
-        &ApprovalScope::Flow(trace_id.to_string()),
+        Some(trace_id),
     )
     .await;
 
@@ -180,7 +180,7 @@ async fn repeated_calls_for_the_same_connector_and_conversation_reuse_the_same_h
         &resolved,
         &perms,
         Some(&traceparent),
-        &ApprovalScope::Flow(trace_id.to_string()),
+        Some(trace_id),
     )
     .await;
     let second = handle_tools_call(
@@ -191,7 +191,7 @@ async fn repeated_calls_for_the_same_connector_and_conversation_reuse_the_same_h
         &resolved,
         &perms,
         Some(&traceparent),
-        &ApprovalScope::Flow(trace_id.to_string()),
+        Some(trace_id),
     )
     .await;
 
@@ -229,7 +229,7 @@ async fn missing_credential_reason_never_persists_a_hitl_row() {
         &resolved,
         &perms,
         Some(&traceparent),
-        &ApprovalScope::Flow(trace_id.to_string()),
+        Some(trace_id),
     )
     .await;
 
@@ -360,7 +360,7 @@ async fn composio_tool_call_failure_with_inactive_connection_triggers_auth_requi
         &resolved,
         &perms,
         Some(&traceparent),
-        &ApprovalScope::Flow(trace_id.to_string()),
+        Some(trace_id),
     )
     .await;
 
@@ -457,7 +457,7 @@ async fn composio_tool_call_failure_with_active_connection_passes_through_unchan
         &resolved,
         &perms,
         None,
-        &ApprovalScope::None,
+        None,
     )
     .await;
 

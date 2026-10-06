@@ -48,7 +48,7 @@ pub mod validation;
 pub mod webhooks;
 
 pub use permissions::PermissionContext;
-pub use session::{ApprovalScope, ResolvedSession};
+pub use session::ResolvedSession;
 
 pub use authorizer::{ConnectorAuthorizer, OssConnectorAuthorizer};
 pub use config::McpConfig;

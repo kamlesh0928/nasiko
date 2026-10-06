@@ -13,9 +13,7 @@ use std::time::Duration;
 use nasiko_hitl::dispatcher::{self, DispatcherConfig};
 use nasiko_hitl::notifier::RuntimeResumeNotifier;
 use nasiko_hitl::repo::{self, NewAuthRequired, ResolveDecision};
-use nasiko_hitl::{
-    HitlKind, HitlStatus, NotifyError, ResumeNotifier, ResumeStatus, coding_agent_context_id,
-};
+use nasiko_hitl::{HitlKind, HitlStatus, NotifyError, ResumeNotifier, ResumeStatus};
 use nasiko_runtime::{ContainerId, ContainerRuntime, DeploymentSpec, SimulatedRuntime};
 use uuid::Uuid;
 
@@ -820,102 +818,6 @@ async fn resolved_row_delivery_carries_a_traceparent_matching_its_context_id() {
     // (a header mismatch in mockito is a silent non-match, not a request failure, so without
     // this the test would pass even if the traceparent were missing entirely).
     mock.assert_async().await;
-}
-
-/// A `tool_approval` row keyed to a coding-agent context (`coding:{agent_id}`) belongs to a
-/// CLI-bound local coding agent: no flow was ever opened for it and there is no A2A endpoint to
-/// nudge — the agent's own retry of the tool call is what picks the decision up (the gateway's
-/// retry match resolves the same synthetic context). The notifier must therefore treat the row as
-/// delivered with nothing to send: `Ok(())`, recorded as `completed`, with no HTTP request, no
-/// `flows`/`flow_participants` window opened for a trace id nobody holds, and no `session_traces`
-/// mapping — and never the permanent `ContextNotOwned` the `session_traces` ownership guard would
-/// otherwise raise for a context that names no chat session.
-#[tokio::test]
-async fn a_coding_agent_context_row_completes_without_any_nudge() {
-    let db = TestDb::new("hitl_coding_ctx").await;
-    let context_id = coding_agent_context_id(db.agent_id);
-    let created = repo::create_pending_tool_approval(
-        &db.pool,
-        repo::NewToolApproval {
-            agent_id: db.agent_id,
-            owner_user_id: db.owner_user_id,
-            connector_id: Uuid::new_v4(),
-            tool_name: "save_file".to_string(),
-            context_id: context_id.clone(),
-            question: serde_json::json!({"tool_name": "save_file"}),
-        },
-    )
-    .await
-    .expect("create pending tool_approval");
-    repo::resolve(
-        &db.pool,
-        created.id,
-        ResolveDecision::Approve,
-        db.owner_user_id,
-        serde_json::json!({"decision": "approve", "scope": "session"}),
-    )
-    .await
-    .expect("resolve")
-    .expect("row was pending");
-
-    let mut mock_server = mockito::Server::new_async().await;
-    // The agent must never be contacted: there is no paused A2A conversation to resume.
-    let mock = mock_server.mock("POST", "/").expect(0).create_async().await;
-    let runtime = Arc::new(SimulatedRuntime::new(mock_server.url()));
-    runtime
-        .deploy(&agent_spec(ContainerId::from_uuid(db.agent_id)))
-        .await
-        .expect("seed the simulated runtime's endpoint");
-
-    let notifier: Arc<dyn nasiko_hitl::ResumeNotifier> = Arc::new(RuntimeResumeNotifier::new(
-        db.pool.clone(),
-        runtime.clone(),
-        reqwest::Client::new(),
-        TEST_FLOW_TIMEOUT_SECS,
-    ));
-    let config = DispatcherConfig {
-        poll_interval: Duration::from_millis(20),
-        recovery_interval: Duration::from_secs(3600),
-        ..Default::default()
-    };
-    let handle = tokio::spawn(dispatcher::run(db.pool.clone(), notifier, config));
-
-    let mut finished = None;
-    for _ in 0..200 {
-        let status = db.resume_status_of(created.id).await;
-        if status != "not_started" {
-            finished = Some(status);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    handle.abort();
-
-    assert_eq!(
-        finished.as_deref(),
-        Some("completed"),
-        "a coding-agent context is terminal success with nothing to deliver — never failed/retrying"
-    );
-    mock.assert_async().await;
-
-    let row = repo::get_by_id(&db.pool, created.id)
-        .await
-        .expect("get_by_id")
-        .expect("row exists");
-    assert_eq!(row.resume_status, ResumeStatus::Completed);
-    assert_eq!(row.resume_dispatch_attempts, 1);
-    assert!(row.resume_last_error.is_none());
-
-    for table in ["flows", "flow_participants", "session_traces"] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
-            .fetch_one(&db.pool)
-            .await
-            .expect("count query");
-        assert_eq!(
-            count, 0,
-            "{table} must stay empty — a coding-agent context opens no flow and maps no trace"
-        );
-    }
 }
 
 // ─── BL4: the nudge must never register a window the gateway will reject ────

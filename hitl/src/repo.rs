@@ -585,16 +585,6 @@ pub async fn resolve_stable_session_context(
     agent_id: Uuid,
     current_context_id: &str,
 ) -> Result<Option<String>> {
-    // A coding-agent context (`coding:{agent_id}`, see `CODING_AGENT_CONTEXT_PREFIX`) is already
-    // the stable identity: the desk it names has no chat session at all, and it is the same value
-    // on every call that desk makes. Mapping it onto a `chat_sessions` row would key a grant to a
-    // conversation the coding agent never took part in — and the unambiguous fallback below could
-    // fire on the approve side and not on the retry side (or the reverse) if the owner's session
-    // count changed in between, so the grant write and the grant lookup would stop agreeing.
-    if crate::types::is_coding_agent_context(current_context_id) {
-        return Ok(Some(current_context_id.to_string()));
-    }
-
     let is_current_a_real_session: bool = sqlx::query_scalar(
         r#"
         SELECT EXISTS(

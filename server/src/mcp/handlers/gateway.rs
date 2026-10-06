@@ -19,7 +19,6 @@ use axum::{
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use nasiko_mcp_gateway::ApprovalScope;
 use nasiko_mcp_gateway::protocol;
 use nasiko_mcp_gateway::types::codes;
 
@@ -38,9 +37,7 @@ use crate::usage::TokenUsageBuilder;
 /// 3b. …unless the agent's row is a CLI-bound local coding agent
 ///     (`coding_agent_integration_id` set) — such a row is never
 ///     dispatched through a flow, so a flow-less `tools/call` resolves to its
-///     owner instead of 403 (`agent_owner`, below `dispatch`); its `ask`-stance
-///     approvals are keyed to the desk itself (`ApprovalScope::CodingAgent`,
-///     context `coding:{agent_id}`) and surface in the owner's pending list
+///     owner instead of 403 (`agent_owner`, below `dispatch`)
 /// 4. `tools/call` where the agent is not a recorded flow participant → 403
 /// 5. identity store unreachable → 403
 #[utoipa::path(
@@ -236,21 +233,19 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
     // one resolves, else the agent's owner (startup-time tool discovery
     // happens outside any flow).
     //
-    // The `ApprovalScope` travels alongside `user_id` (rather than being
-    // re-derived from `traceparent` further down) because it records the one
-    // thing this function actually verified against `flows`/
-    // `flow_participants` — the raw `traceparent` a caller sends is not proof
-    // of anything on its own. On the owner-fallback branches below, `user_id`
-    // did NOT come from a verified flow, so the scope carries no flow id even
-    // though `traceparent` may still be a well-formed (just unresolvable, or
-    // rejected) value: `protocol::handle_request` signs the scope's verified
-    // flow id, never `traceparent`, into the identity header it forwards to
-    // system backends, specifically so a caller can't launder an unverified
-    // trace id into a header a backend is told to trust unconditionally. The
-    // scope is also what every HITL `tool_approval` row is keyed on, so each
-    // variant is built in the one arm that establishes it and nowhere else.
-    let (user_id, scope) = match flow_user(state, traceparent, agent_id).await {
-        Ok((user_id, flow_id)) => (user_id, ApprovalScope::Flow(flow_id)),
+    // `verified_flow_id` travels alongside `user_id` (rather than being
+    // re-derived from `traceparent` further down) because it's the one thing
+    // this function actually verified against `flows`/`flow_participants` —
+    // the raw `traceparent` a caller sends is not proof of anything on its
+    // own. On the owner-fallback branch below, `user_id` did NOT come from a
+    // verified flow, so `verified_flow_id` must be `None` even though
+    // `traceparent` may still be a well-formed (just unresolvable, or
+    // rejected) value: `protocol::handle_request` signs `verified_flow_id`,
+    // never `traceparent`, into the identity header it forwards to system
+    // backends, specifically so a caller can't launder an unverified trace id
+    // into a header a backend is told to trust unconditionally.
+    let (user_id, verified_flow_id) = match flow_user(state, traceparent, agent_id).await {
+        Ok((user_id, flow_id)) => (user_id, Some(flow_id)),
         Err(denial) => match agent_owner(state, agent_id).await {
             // Deliberate policy (MCP_GATEWAY_AGENT_AUTH.md §5, rule 3b):
             // a local coding agent — a row the CLI bound with
@@ -266,20 +261,12 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
             // this fallback when one doesn't resolve. That difference is
             // unreachable today: a coding-agent row is never dispatched into,
             // so nothing ever has an endpoint of its own to route a flow to.
-            //
-            // This arm is the only constructor of `ApprovalScope::CodingAgent`:
-            // it exists exactly when the owner rule admitted the call, and it
-            // carries `agent_id` — the id the gateway credential authenticated
-            // (rule 1), never anything from a header — so a desk's HITL
-            // approvals are keyed to that desk (`coding:{agent_id}`) and no
-            // other.
-            Ok(Some((owner, true))) => (owner, ApprovalScope::CodingAgent(agent_id)),
+            Ok(Some((owner, true))) => (owner, None),
             // Every other flow-less `tools/call` stays denied (rules 3+4).
             Ok(_) if method == "tools/call" => return denial,
             // Read-only methods (rule 2): agent-only identity via the owner —
-            // unchanged from before the coding-agent policy existed. No scope:
-            // nothing on this path can produce an approval.
-            Ok(Some((owner, false))) => (owner, ApprovalScope::None),
+            // unchanged from before the coding-agent policy existed.
+            Ok(Some((owner, false))) => (owner, None),
             Ok(None) => {
                 return (
                     StatusCode::UNAUTHORIZED,
@@ -298,8 +285,15 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
     };
 
     let started = std::time::Instant::now();
-    let Some(result) =
-        protocol::handle_request(&state.mcp, user_id, agent_id, &body, traceparent, &scope).await
+    let Some(result) = protocol::handle_request(
+        &state.mcp,
+        user_id,
+        agent_id,
+        &body,
+        traceparent,
+        verified_flow_id.as_deref(),
+    )
+    .await
     else {
         return (StatusCode::ACCEPTED, Json(json!({}))).into_response();
     };
@@ -316,24 +310,17 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
             .and_then(|e| e.get("code"))
             .and_then(|c| c.as_i64())
             == Some(codes::TOOL_ASK)
-            // The scope's channel, never a re-parse of the raw `traceparent`:
-            // the owner-fallback path for a foreign/dead trace id hands back a
-            // flow-less scope specifically because nobody proved this call
-            // belongs to that flow. Re-parsing `traceparent` instead would
-            // let a coding-agent row — which resolves to its owner precisely
-            // because it has no flow of its own — name any OTHER user's live
-            // flow and land an approval card, naming an attacker-chosen
-            // server/tool, in that user's SSE stream (`a2a_dispatch.rs`
-            // forwards `FlowEventBus` events straight into the flow owner's
-            // chat). A flow publishes on its flow id; a coding desk publishes
-            // on its own `coding:{agent_id}` context — the same key its
-            // `hitl_requests` row carries — which no chat stream subscribes
-            // to, so the owner's `GET /api/hitl/pending` list (polled by the
-            // web UI) is where the ask surfaces; the bus keys channels by
-            // plain string and parses nothing, so the synthetic key costs
-            // nothing and is there for a per-desk subscriber. `None` scope
-            // (a deployed row's read-only fallback) publishes nothing.
-            && let Some(channel) = scope.event_channel()
+            // `verified_flow_id`, never a re-parse of the raw `traceparent`:
+            // the owner-fallback path (coding-agent row, or a foreign/dead
+            // trace id) hands back `None` here specifically because nobody
+            // proved this call belongs to that flow. Re-parsing `traceparent`
+            // instead would let a coding-agent row — which resolves to its
+            // owner precisely because it has no flow of its own — name any
+            // OTHER user's live flow and land an approval card, naming an
+            // attacker-chosen server/tool, in that user's SSE stream
+            // (`a2a_dispatch.rs` forwards `FlowEventBus` events straight into
+            // the flow owner's chat).
+            && let Some(flow_id) = verified_flow_id.as_deref()
         {
             // Prefer the connector name the protocol layer attached (tool prefixes
             // are opaque connector-id hex); fall back to the prefix, then composio.
@@ -352,7 +339,7 @@ async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Valu
             state
                 .flow_events
                 .publish(
-                    &channel,
+                    flow_id,
                     nasiko_flow::FlowEvent::ToolApprovalRequired {
                         agent_id: agent_id.to_string(),
                         server,
@@ -387,11 +374,11 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 /// Returns the flow id alongside the user on success — this is the only place
 /// that verifies a `traceparent`-named flow is live and this agent
 /// participates in it, so it's also the only place allowed to hand that flow
-/// id onward as trustworthy (`dispatch` wraps it as `ApprovalScope::Flow` for
-/// `protocol::handle_request`, which alone may be signed into the identity
-/// header sent to system backends). Callers on the owner-fallback path (this
-/// returns `Err`) must never substitute a raw, unverified `traceparent` in
-/// its place.
+/// id onward as trustworthy (`dispatch` forwards it to
+/// `protocol::handle_request` as `verified_flow_id`, which alone may be signed
+/// into the identity header sent to system backends). Callers on the
+/// owner-fallback path (this returns `Err`) must never substitute a raw,
+/// unverified `traceparent` in its place.
 #[allow(clippy::result_large_err)]
 async fn flow_user(
     state: &AppState,

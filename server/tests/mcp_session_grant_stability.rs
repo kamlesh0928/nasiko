@@ -46,7 +46,7 @@ use nasiko_mcp_gateway::permissions::{PermissionContext, PermissionRule};
 use nasiko_mcp_gateway::protocol::handle_tools_call;
 use nasiko_mcp_gateway::provider::{GenericMcpProvider, Providers};
 use nasiko_mcp_gateway::repo::McpConnector;
-use nasiko_mcp_gateway::session::{ApprovalScope, ResolvedSession};
+use nasiko_mcp_gateway::session::ResolvedSession;
 use nasiko_mcp_gateway::types::{
     AccessReason, MCPServerConfig, OrgGrantConsumer, ServerType, Stance, codes,
 };
@@ -324,7 +324,7 @@ async fn session_grant_spans_messages_in_the_only_chat_for_the_agent() {
         &resolved,
         &perms,
         Some(&msg1_trace),
-        &ApprovalScope::Flow("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
     )
     .await;
     assert_eq!(
@@ -362,7 +362,7 @@ async fn session_grant_spans_messages_in_the_only_chat_for_the_agent() {
         &resolved,
         &perms,
         Some(&msg2_trace),
-        &ApprovalScope::Flow("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
+        Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
     )
     .await;
     assert!(
@@ -433,7 +433,7 @@ async fn session_grant_is_not_attributed_to_a_more_recent_concurrent_chat_with_n
         &resolved,
         &perms,
         Some(&msg1_trace),
-        &ApprovalScope::Flow("d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1".to_string()),
+        Some("d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1"),
     )
     .await;
     let hitl_id = res1["error"]["data"]["hitl_request_id"]
@@ -544,7 +544,7 @@ async fn session_grant_never_leaks_across_concurrent_chats_even_when_the_other_i
         &resolved,
         &perms,
         Some(&traceparent(msg1_trace)),
-        &ApprovalScope::Flow(msg1_trace.to_string()),
+        Some(msg1_trace),
     )
     .await;
     let hitl_id = res1["error"]["data"]["hitl_request_id"]
@@ -587,7 +587,7 @@ async fn session_grant_never_leaks_across_concurrent_chats_even_when_the_other_i
         &resolved,
         &perms,
         Some(&traceparent(msg2_trace)),
-        &ApprovalScope::Flow(msg2_trace.to_string()),
+        Some(msg2_trace),
     )
     .await;
     assert!(
@@ -606,7 +606,7 @@ async fn session_grant_never_leaks_across_concurrent_chats_even_when_the_other_i
         &resolved,
         &perms,
         Some(&traceparent(msg3_trace)),
-        &ApprovalScope::Flow(msg3_trace.to_string()),
+        Some(msg3_trace),
     )
     .await;
     assert_eq!(
@@ -662,7 +662,7 @@ async fn session_grant_row_is_keyed_by_the_chat_session_id_not_the_trace_id() {
         &resolved,
         &perms,
         Some(&trace),
-        &ApprovalScope::Flow("ddddddddddddddddddddddddddddddd1".to_string()),
+        Some("ddddddddddddddddddddddddddddddd1"),
     )
     .await;
     let hitl_id = res["error"]["data"]["hitl_request_id"]
@@ -777,7 +777,7 @@ async fn session_grant_from_an_orchestrator_chat_does_not_leak_into_a_direct_cha
         &resolved,
         &perms,
         Some(&traceparent(msg1_trace)),
-        &ApprovalScope::Flow(msg1_trace.to_string()),
+        Some(msg1_trace),
     )
     .await;
     let hitl_id = res1["error"]["data"]["hitl_request_id"]
@@ -822,7 +822,7 @@ async fn session_grant_from_an_orchestrator_chat_does_not_leak_into_a_direct_cha
         &resolved,
         &perms,
         Some(&traceparent(msg2_trace)),
-        &ApprovalScope::Flow(msg2_trace.to_string()),
+        Some(msg2_trace),
     )
     .await;
     assert_eq!(
