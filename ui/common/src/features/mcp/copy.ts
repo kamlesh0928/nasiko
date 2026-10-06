@@ -257,6 +257,8 @@ export const copy = {
   agentMcpTitle: 'MCP servers',
   agentMcpSub:
     'MCP servers this agent may use. Set each tool to allow, ask or block. Ask pauses the agent mid-task and asks you to approve that call before it runs.',
+  agentMcpSubHarness:
+    'MCP servers this coding harness may use. Set each tool to allow or block. Approval before a call isn’t available for coding harnesses yet.',
   noAgentServers: 'No MCP servers available',
   noAgentServersFix: 'Connect servers on the MCP servers page to make their tools available here.',
   openCatalog: 'Open MCP servers',

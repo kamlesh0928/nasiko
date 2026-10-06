@@ -12,7 +12,7 @@ import type { AgentView } from '../normalize'
 
 /**
  * Token optimization (plans/feat-context-optimization.md eng E1): one switch, saved on flip (the MCP Enabled switch's
- * model), optimistic, rolled back with a toast. On the Settings tab, and on a coding harness's Overview (its only tab),
+ * model), optimistic, rolled back with a toast. On the Settings tab, and on a coding harness's Overview (it has no Settings tab),
  * since the owner's history compression counts every agent they own (eng E2, D10).
  */
 export function TokenOptimization({ agent }: { agent: AgentView }) {

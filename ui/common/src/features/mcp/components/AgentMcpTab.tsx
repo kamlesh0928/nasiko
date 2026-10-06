@@ -17,7 +17,7 @@ import { copy, reason } from '../copy'
 import { labelOf, unusable } from '../logic'
 import { ConnectorRules, UnavailableRow } from './ConnectorRules'
 
-export function AgentMcpTab({ agentId }: { agentId: string }) {
+export function AgentMcpTab({ agentId, harness = false }: { agentId: string; harness?: boolean }) {
   const list = useAgentConnectors(agentId, true)
   // A failed catalog read just means no row is greyed: the agent list itself still works.
   const servers = useConnectors()
@@ -26,7 +26,9 @@ export function AgentMcpTab({ agentId }: { agentId: string }) {
   const owned = new Set(servers.data?.created_by_you.map((c) => c.connector_id))
   return (
     <Section title={copy.agentMcpTitle}>
-      <p className="text-sm text-muted-foreground">{copy.agentMcpSub}</p>
+      <p className="text-sm text-muted-foreground">
+        {harness ? copy.agentMcpSubHarness : copy.agentMcpSub}
+      </p>
       {list.isPending || (servers.isPending && !servers.isError) ? (
         <PageLoader label={copy.loadingCatalog} inline className="min-h-64" />
       ) : list.isError ? (
@@ -72,7 +74,7 @@ export function AgentMcpTab({ agentId }: { agentId: string }) {
                     logs={owned.has(c.connector_id) || !!me?.is_superuser}
                   />
                 ) : (
-                  <ConnectorRules agentId={agentId} target={target} />
+                  <ConnectorRules agentId={agentId} target={target} noAsk={harness} />
                 )}
               </li>
             )

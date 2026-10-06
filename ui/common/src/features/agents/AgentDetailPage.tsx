@@ -146,7 +146,8 @@ function ResolveByName({ name, tab }: { name: string; tab?: string }) {
 }
 
 function tabsFor(agent: AgentView): DetailTab[] {
-  if (agent.isHarness) return ['overview']
+  // A harness is an ordinary agent id to the MCP gateway, so its manager gets the MCP tab too.
+  if (agent.isHarness) return agent.canManage ? ['overview', 'mcp'] : ['overview']
   return agent.canManage ? [...DETAIL_TABS] : ['overview', 'activity', 'versions']
 }
 
@@ -277,7 +278,7 @@ function AgentDetail({ id, tab }: { id: string; tab?: string }) {
         ) : null}
         {allowed.includes('mcp') ? (
           <TabsContent value="mcp" className="pt-3">
-            <AgentMcpTab agentId={agent.id} />
+            <AgentMcpTab agentId={agent.id} harness={agent.isHarness} />
           </TabsContent>
         ) : null}
         {allowed.includes('access') ? (
