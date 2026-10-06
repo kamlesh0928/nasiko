@@ -17,13 +17,14 @@ describe('nav items', () => {
     const now = NAV_ITEMS.map(({ to, label, shared }) => ({ to, label, shared }))
     for (const old of OLD_NAV) expect(now).toContainEqual(old)
     // Added since: the Overview (plans/feat-overview.md §3), Workflows (plans/feat-workflows.md §1), the LLM router
-    // (plans/feat-llm-router.md §4) and MCP servers (plans/feat-mcp.md §1). Deploy and Builds are Agents' sub-pages and
-    // Settings is a footer row (sidebar review 2026-10-01).
+    // (plans/feat-llm-router.md §4), MCP servers (plans/feat-mcp.md §1) and Optimization (plans/feat-optimization-page.md
+    // P7). Deploy and Builds are Agents' sub-pages and Settings is a footer row (sidebar review 2026-10-01).
     expect(now.filter((n) => !OLD_NAV.some((o) => o.to === n.to))).toEqual([
       { to: '/', label: 'Overview', shared: false },
       { to: '/workflows', label: 'Workflows', shared: false },
       { to: '/router', label: 'LLM router', shared: false },
       { to: '/mcp', label: 'MCP servers', shared: false },
+      { to: '/optimization', label: 'Optimization', shared: true },
     ])
   })
 
@@ -44,6 +45,7 @@ describe('nav items', () => {
       'MCP servers',
       'Sessions',
       'TokenOps',
+      'Optimization',
       'Harnesses',
     ])
     // Items of one group are contiguous and follow the group order.

@@ -9,12 +9,12 @@
 import type { HitlKind } from '@/features/chat/types'
 
 export type SourceId = 'requests' | 'agents' | 'budgets' | 'sessions'
-export type SourceState<T> =
+type SourceState<T> =
   { state: 'loading' } | { state: 'failed' } | { state: 'absent' } | { state: 'ok'; value: T }
 
 export type Severity = 'action' | 'watch' | 'waiting'
 
-export interface RequestChat {
+interface RequestChat {
   sessionId: string
   /** The oldest pending request (the card it opens on). */
   firstId: string

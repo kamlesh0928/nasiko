@@ -1,6 +1,7 @@
 /**
- * Settings (plan §7.3, managers only): display name and description, feature flags (prompt comments, token
- * optimization; minimal-code and self-review for agents whose card reads as code work), secrets (names only;
+ * Settings (plan §7.3, managers only): display name and description, feature flags (prompt comments; minimal-code and
+ * self-review for agents whose card reads as code work), Token optimization (TokenOptimization.tsx,
+ * plans/feat-context-optimization.md eng E1/E2: saves on flip, rolls back with a toast, harnesses too), secrets (names only;
  * values are write-only and cleared after submit), and delete (type the unique name).
  * Both forms are react-hook-form + zod (plan §2.4) and ask before a route change drops edits; switches save at once.
  */
@@ -29,12 +30,15 @@ import { DeleteAgentDialog } from '../components/dialogs'
 import { copy } from '../copy'
 import { withFeature, type AgentView } from '../normalize'
 import { SAVED_NOTE_MS } from '../tuning'
+import { TokenOptimization } from './TokenOptimization'
 
 export function SettingsTab({ agent }: { agent: AgentView }) {
   return (
     <div className="space-y-4">
       <DetailsForm agent={agent} />
-      {agent.isHarness ? null : (
+      {agent.isHarness ? (
+        <TokenOptimization agent={agent} />
+      ) : (
         <>
           <Features agent={agent} />
           <TokenOptimization agent={agent} />
@@ -263,26 +267,6 @@ function Features({ agent }: { agent: AgentView }) {
         onCheckedChange={(on) =>
           update.mutate({ metadata: withFeature(agent.metadata, 'prompt_comments', on) })
         }
-      />
-      {update.isError ? <ErrorNote error={update.error} context="manage" /> : null}
-    </Section>
-  )
-}
-
-function TokenOptimization({ agent }: { agent: AgentView }) {
-  const update = useUpdateAgent(agent.id)
-  return (
-    <Section
-      title={copy.tokenOptimization}
-      subtitle={copy.tokenOptimizationIntro}
-      action={<BetaBadge />}
-    >
-      <FlagRow
-        label={copy.tokenOptimization}
-        hint={copy.tokenOptimizationHint}
-        checked={shown(agent.compress, update.isPending)}
-        disabled={update.isPending}
-        onCheckedChange={(on) => update.mutate({ compress_enabled: on })}
       />
       {update.isError ? <ErrorNote error={update.error} context="manage" /> : null}
     </Section>

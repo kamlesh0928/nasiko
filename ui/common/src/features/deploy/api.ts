@@ -43,7 +43,7 @@ import type { BuildsFilter } from './search'
 import { isActive } from './steps'
 import { follow } from './follower'
 
-export const buildKeys = {
+const buildKeys = {
   list: (p: { status?: BuildStatus; q?: string; page: number }) => ['builds', 'list', p] as const,
   active: (status: 'queued' | 'building') => ['builds', 'active', status] as const,
   detail: (id: string) => ['builds', 'detail', id] as const,
@@ -62,7 +62,7 @@ function gated<T>(body: unknown, parse: (b: unknown) => T): Gated<T> {
 const listUrl = (p: { status?: BuildStatus; q?: string; offset: number; limit: number }) =>
   withQuery('/api/builds', { limit: p.limit, offset: p.offset, status: p.status, q: p.q?.trim() })
 
-export function buildsListQuery(p: { status?: BuildStatus; q?: string; page: number }) {
+function buildsListQuery(p: { status?: BuildStatus; q?: string; page: number }) {
   return queryOptions({
     queryKey: buildKeys.list(p),
     queryFn: async ({ signal }) =>
@@ -222,7 +222,7 @@ async function fetchUpload(id: string, signal: AbortSignal): Promise<UploadStatu
   }
 }
 
-export function uploadQuery(id: string) {
+function uploadQuery(id: string) {
   return queryOptions({
     queryKey: buildKeys.upload(id),
     queryFn: ({ signal }) => fetchUpload(id, signal),

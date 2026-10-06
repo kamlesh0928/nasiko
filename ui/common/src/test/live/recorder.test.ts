@@ -74,19 +74,23 @@ describe('crossed', () => {
 
 describe('contract server environment', () => {
   const example = parseEnvFile(
-    '# comment\nDATABASE_URL=postgres://x/nasiko_dev\nexport OPENAI_API_KEY="sk-live"\nTRACE_USAGE_SYNC_SECS=120\nCODING_AGENT_OTLP_ENDPOINT=http://localhost:4318\nnot a line\n',
+    '# comment\nDATABASE_URL=postgres://x/nasiko_dev\nexport OPENAI_API_KEY="sk-live"\nTRACE_USAGE_SYNC_SECS=120\nCODING_AGENT_OTLP_ENDPOINT=http://localhost:4318\nnot a line\nS3_ENDPOINT=http://localhost:9000        # any S3-compatible endpoint\nQUOTED="a # b"\nQUOTED_NOTE="x"  # note\n',
   )
   const overrides = contractOverrides({
     traces: true,
     admin: { username: 'admin', password: 'pw' },
   })
   const env = contractEnv(example, overrides)
-  it('parses env files, including export and quotes', () => {
+  it('parses env files, including export, quotes and inline comments', () => {
     expect(example).toEqual({
       DATABASE_URL: 'postgres://x/nasiko_dev',
       OPENAI_API_KEY: 'sk-live',
       TRACE_USAGE_SYNC_SECS: '120',
       CODING_AGENT_OTLP_ENDPOINT: 'http://localhost:4318',
+      // An inline comment ends an unquoted value; a quoted one keeps its #.
+      S3_ENDPOINT: 'http://localhost:9000',
+      QUOTED: 'a # b',
+      QUOTED_NOTE: 'x',
     })
   })
   it('points at the throwaway DB, a private Tempo and Redis DB 15, with the materializer and syncs off', () => {

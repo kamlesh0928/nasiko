@@ -36,6 +36,13 @@ export interface MockAgent {
   documentation_url: string | null
   is_public: boolean
   harness: string | null
+  /** `agents.compress_enabled` (catalog/models.rs, column default false): the Token optimization switch. */
+  compress: boolean
+  /**
+   * The switch as it was when the seed's requests ran: the savings mocks compress past requests by this, never by
+   * today's `compress`, so a bulk turn-on doesn't rewrite history (review: red team).
+   */
+  compressSeeded: boolean
   deleted: boolean
   versions: S['AgentVersion'][]
   deployment: S['DeploymentRow'] | null
@@ -46,7 +53,7 @@ export interface MockAgent {
   rollback: { at: number; to: string; build: string } | null
   /** Written by `PUT /api/agents/{id}`; absent reads as the column defaults (`metadataOf`, false, false). */
   metadata?: Record<string, unknown>
-  compress_enabled?: boolean
+  // Token optimization is `compress` above (seeded, read by the savings mocks), not a second optional copy.
   minimal_code_enabled?: boolean
 }
 
@@ -197,6 +204,9 @@ export function buildAgentsState(seed: Seed, hs: HarnessSeed, now: number): Agen
       documentation_url: i === 0 ? 'https://example.com/docs/support-bot' : null,
       is_public: i % 4 === 0,
       harness: null,
+      // Two of every three seed agents opted in, so the owner's compression line has agents to name (plan §3).
+      compress: i % 3 !== 1,
+      compressSeeded: i % 3 !== 1,
       deleted: a.deleted,
       versions,
       deployment: deployed
@@ -249,6 +259,8 @@ export function buildAgentsState(seed: Seed, hs: HarnessSeed, now: number): Agen
       documentation_url: null,
       is_public: false,
       harness: h.spoofed ? null : h.harness,
+      compress: true,
+      compressSeeded: true,
       deleted: h.deleted,
       versions: [],
       deployment: null,
@@ -289,8 +301,12 @@ const capabilities = (a: MockAgent) => ({
   ...a.capabilities,
 })
 
-export function listRow(a: MockAgent, now: number): S['Agent'] {
-  return {
+/** A full `Agent` row; the generated type predates `compress_enabled` (catalog/models.rs at 05f22246). */
+export function listRow(
+  a: MockAgent,
+  now: number,
+): S['Agent'] & { compress_enabled: boolean; minimal_code_enabled: boolean } {
+  const row = {
     id: a.id,
     name: a.name,
     display_name: a.display_name,
@@ -315,6 +331,12 @@ export function listRow(a: MockAgent, now: number): S['Agent'] {
     icon_url: a.icon_url,
     documentation_url: a.documentation_url,
   } satisfies S['Agent']
+  // models.rs `Agent` serializes both columns on list rows and the PUT reply.
+  return {
+    ...row,
+    compress_enabled: a.compress,
+    minimal_code_enabled: a.minimal_code_enabled ?? false,
+  }
 }
 
 /** `AgentDetailResponse`: camelCase except the renamed fields (catalog/routes.rs:616). Status NOT reconciled. */
@@ -358,7 +380,7 @@ export function detailBody(a: MockAgent, canManage: boolean) {
     can_manage: canManage,
     is_coding_agent: a.harness !== null,
     coding_agent_integration_id: a.harness,
-    compress_enabled: a.compress_enabled ?? false,
+    compress_enabled: a.compress,
     minimal_code_enabled: a.minimal_code_enabled ?? false,
     has_coding_skills: a.skills.some((k) =>
       [k.id, k.name, ...(k.tags ?? [])].some((t) => mentionsCoding(t)),

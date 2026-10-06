@@ -47,8 +47,8 @@ export function SavingsHighlight({
           </h3>
           <p className="text-xs text-muted-foreground">
             {fmtTokens(data.tokensSaved)} tokens never sent
-            {data.topCategory ? <> — mostly {data.topCategory.label.toLowerCase()}</> : null}.
-            Across {data.optimisedCount} of {data.totalAgents} agents.
+            {data.topCategory ? <> — mostly {inSentence(data.topCategory.label)}</> : null}. Across{' '}
+            {data.optimisedCount} of {data.totalAgents} agents.
           </p>
         </div>
       </div>
@@ -57,4 +57,9 @@ export function SavingsHighlight({
       </Button>
     </section>
   )
+}
+
+/** Lower-cases only the first letter, so a team name keeps its capital mid-sentence: "smaller prompts (Caveman)". */
+function inSentence(label: string) {
+  return label.charAt(0).toLowerCase() + label.slice(1)
 }

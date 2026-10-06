@@ -5,7 +5,7 @@
  */
 import type { TimelinePoint } from '@/features/tokenops/series'
 
-export interface StackSeries {
+interface StackSeries {
   /** The row field this series is drawn from: `s0`, `s1`, … */
   key: string
   id: string

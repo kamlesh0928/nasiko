@@ -6,7 +6,7 @@ import { act, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { strToU8, zipSync, type Zippable } from 'fflate'
 import { http, HttpResponse } from 'msw'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
 import { configureMocks, deployMockState } from '@/mocks/handlers'
 import { buildId, readMultipart } from '@/mocks/deploy'
 import { FIXED, now, seed, setupPinnedSeed } from '@/test/pinnedSeed'
@@ -25,6 +25,12 @@ afterEach(() => {
   prevXhr = null
   vi.setSystemTime(FIXED)
   configureMocks({ seed, now, loggedIn: true, variant: null, superuser: null })
+})
+// Sonner removes a dismissed toast 200 ms later on a timer (its TIME_BEFORE_UNMOUNT). Let that run while the DOM still
+// exists: after the file's environment is torn down it throws "window is not defined" (an unhandled error in CI).
+afterAll(async () => {
+  vi.useRealTimers()
+  await new Promise((r) => setTimeout(r, 300))
 })
 
 const T = { timeout: 5000 }

@@ -5,7 +5,7 @@
 
 import { checkCopy } from './checkCopy'
 
-export const NAME_MAX = 128
+const NAME_MAX = 128
 
 /** The problem with a name, in the server's terms, or null when it's valid. */
 export function nameProblem(name: string): string | null {

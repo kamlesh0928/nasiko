@@ -27,12 +27,12 @@ export interface AgentView {
   canManage: boolean
   isHarness: boolean
   integrationId: string | null
+  /** `compress_enabled` (catalog/routes.rs `AgentDetailResponse`): the Token optimization switch; absent reads as off. */
+  compressEnabled: boolean
   /** The raw `metadata` bag: a PUT replaces the whole column, so feature writes spread it (catalog/routes.rs). */
   metadata: Record<string, unknown>
   /** `metadata.features.prompt_comments === 'enabled'` (state.rs `agent_env` → `NASIKO_PROMPT_COMMENTS`). */
   promptComments: boolean
-  /** `compress_enabled`: token optimization across the stack. */
-  compress: boolean
   /** `minimal_code_enabled`, offered only when `has_coding_skills` (the server's own gate). */
   minimalCode: boolean
   codingSkills: boolean
@@ -122,9 +122,9 @@ export function normalizeDetail(d: AgentDetailResponse): AgentView {
       metadata: raw.metadata,
     }),
     integrationId: strOrNull(raw.coding_agent_integration_id),
+    compressEnabled: bool(raw.compress_enabled),
     metadata,
     promptComments: record(metadata.features).prompt_comments === 'enabled',
-    compress: bool(raw.compress_enabled),
     minimalCode: bool(raw.minimal_code_enabled),
     codingSkills: bool(raw.has_coding_skills),
     createdAt: str(raw.created_at),

@@ -25,7 +25,7 @@ import {
   fmtUtcTime,
 } from '@/lib/format'
 import { traceLink } from './links'
-import { isUnconfigured, summarizeOptimisation } from './optimisation'
+import { isUnconfigured, programName, summarizeOptimisation } from './optimisation'
 import type { Savings, SavingsData } from './types'
 import { isRealDate } from '@/lib/search'
 import { tokenopsSearchSchema } from './search'
@@ -825,6 +825,18 @@ function measured(over: Partial<Savings> = {}): Savings {
     ...over,
   }
 }
+
+describe('programName (ledger B12)', () => {
+  it('puts the internal name in brackets after the user-facing one', () => {
+    expect(programName('Smaller prompts', 'caveman')).toBe('Smaller prompts (Caveman)')
+    expect(programName('Less code written', 'ponytail')).toBe('Less code written (Ponytail)')
+  })
+  it('never repeats a name, and falls back to whichever one it has', () => {
+    expect(programName('Caveman', 'caveman')).toBe('Caveman')
+    expect(programName('', 'caveman')).toBe('Caveman')
+    expect(programName('Smaller prompts', '')).toBe('Smaller prompts')
+  })
+})
 
 describe('summarizeOptimisation', () => {
   /** A savings payload with one agent, shaped exactly as the server flattens it. */

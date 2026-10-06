@@ -300,7 +300,7 @@ export const providerCatalogSchema = z.looseObject({
  * optimisation section shows `SAMPLE_OPTIMISATION` (optimisation.ts) until one does. Lists only
  * agents with optimisation on; savings are input tokens the optimiser removed before the call.
  */
-export interface OptimisationAgentRow {
+interface OptimisationAgentRow {
   agent_id: string
   agent_name: string
   calls: number
@@ -310,6 +310,7 @@ export interface OptimisationAgentRow {
   est_cost_saved_usd: number
 }
 
+/** @public Synced from nasiko-cloud-rs (PR #28) with the savings types. */
 export interface OptimisationSummary {
   agents: OptimisationAgentRow[]
   total_agents: number
@@ -352,7 +353,7 @@ export interface Savings {
  */
 export type SavingsBasis = 'measured' | 'fixture' | 'seed_default' | 'mixed'
 
-export interface SavingsFactor {
+interface SavingsFactor {
   input_token_delta_pct: number
   output_token_delta_pct: number
   basis: string
@@ -366,7 +367,7 @@ export interface SavingsFactor {
   eligible_output_tokens: number
 }
 
-export interface LayerSavings extends Savings {
+interface LayerSavings extends Savings {
   layer: string
   factor?: SavingsFactor
 }
@@ -381,7 +382,7 @@ export interface ProgramSavings extends Savings {
   note?: string
 }
 
-export interface AgentSavingsRow extends Savings {
+interface AgentSavingsRow extends Savings {
   agent_id: string
   agent_name: string
   calls: number
@@ -389,14 +390,14 @@ export interface AgentSavingsRow extends Savings {
   input_tokens_after: number
 }
 
-export interface SessionSavingsRow extends Savings {
+interface SessionSavingsRow extends Savings {
   session_id: string
   started_at: string
   turn_count: number
   agent_names: string[]
 }
 
-export interface SavingsCoverage {
+interface SavingsCoverage {
   calls_in_window: number
   calls_with_any_layer_enabled: number
   agents_total: number

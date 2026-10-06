@@ -25,6 +25,7 @@ import { copy } from '../copy'
 import { exampleTexts, safeHttpUrl, type AgentView } from '../normalize'
 import type { DisplayStatus } from '../status'
 import { CRASH_LINES_SHOWN } from '../tuning'
+import { TokenOptimization } from './TokenOptimization'
 import { DeployAgentButton } from '@/features/deploy/components/DeployAgentButton'
 import { copy as deployCopy } from '@/features/deploy/copy'
 
@@ -207,6 +208,8 @@ export function OverviewTab({
       </div>
 
       {agent.isHarness ? null : <LiveCard id={agent.id} />}
+      {/* A harness has no Settings tab; its owner can still change the switch here (eng D10). */}
+      {agent.isHarness && agent.canManage ? <TokenOptimization agent={agent} /> : null}
       <ViewRaw id={agent.id} deployment={dep} />
     </div>
   )

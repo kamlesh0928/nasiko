@@ -102,7 +102,7 @@ interface ServerWindow {
  * Mirrors the server's `resolve_window` / `resolve_range_params`: range wins; hourly only
  * for 24h; default 30 days. (Named apart from the client's `resolveWindow` in window.ts.)
  */
-function resolveServerWindow(p: FilterParams, now: number): ServerWindow {
+export function resolveServerWindow(p: FilterParams, now: number): ServerWindow {
   const end = p.end_time ? Date.parse(p.end_time) : now
   if (p.range) {
     const hours = RANGE_HOURS[p.range]
@@ -119,14 +119,14 @@ function resolveServerWindow(p: FilterParams, now: number): ServerWindow {
  * Mirrors `resolve_agent_filter`: accepts a UUID or a raw name; unknown or soft-deleted
  * (`deleted_at IS NULL` server-side) → 400. Returns the raw name.
  */
-function resolveAgent(seed: Seed, ref: string | null | undefined): string | null {
+export function resolveAgent(seed: Seed, ref: string | null | undefined): string | null {
   if (!ref) return null
   const agent = seed.agents.find((a) => !a.deleted && (a.id === ref || a.name === ref))
   if (!agent) throw new MockHttpError(400, `unknown agent '${ref}'`)
   return agent.name
 }
 
-function inWindow(t: SeedTrace, start: number, end: number): boolean {
+export function inWindow(t: SeedTrace, start: number, end: number): boolean {
   return t.ts >= start && t.ts < end
 }
 
@@ -142,7 +142,7 @@ function groupBy<K>(rows: SeedTrace[], key: (t: SeedTrace) => K): Map<K, SeedTra
   return out
 }
 
-function matches(t: SeedTrace, agentName: string | null, p: FilterParams): boolean {
+export function matches(t: SeedTrace, agentName: string | null, p: FilterParams): boolean {
   if (agentName && t.agent_name !== agentName) return false
   if (p.model && t.model !== p.model) return false
   if (p.provider && t.provider !== p.provider) return false
@@ -387,7 +387,7 @@ export function dashboard(seed: Seed, p: FilterParams, now: number): FinopsDashb
   }
 }
 
-function bucketStart(ts: number, bucket: 'hour' | 'day'): number {
+export function bucketStart(ts: number, bucket: 'hour' | 'day'): number {
   const d = new Date(ts)
   return bucket === 'hour'
     ? Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCHours())

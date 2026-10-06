@@ -32,6 +32,7 @@ export const MOCKABLE = [
   'mcp',
   'workflows',
   'onboarding',
+  'optimization',
 ] as const
 export type Mockable = (typeof MOCKABLE)[number]
 
@@ -113,6 +114,15 @@ export function readEnv(
       '[ui-lab] VITE_NASIKO_MOCK: "workflows" needs "agents" too; ignoring "workflows" (use VITE_NASIKO_MOCK=workflows,agents).',
     )
     partialMocks = partialMocks.filter((s) => s !== 'workflows')
+  }
+
+  // The Optimization page's savings reads are built from the seed agents (their switches, names and chats), so without
+  // the agents mock they would describe agents the real server doesn't have (plans/feat-optimization-page.md review).
+  if (partialMocks.includes('optimization') && !partialMocks.includes('agents')) {
+    console.warn(
+      '[ui-lab] VITE_NASIKO_MOCK: "optimization" needs "agents" too; ignoring "optimization" (use VITE_NASIKO_MOCK=optimization,agents,observability; observability makes Biggest senders\' trace links open).',
+    )
+    partialMocks = partialMocks.filter((s) => s !== 'optimization')
   }
 
   // Dev defaults to the local OSS server; a production build defaults to its own origin

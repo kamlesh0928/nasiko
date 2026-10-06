@@ -14,6 +14,7 @@ import { Route as LoginRouteImport } from './../../common/src/routes/login'
 import { Route as AppIndexRouteImport } from './../../common/src/routes/_app/index'
 import { Route as AppDeployRouteImport } from './../../common/src/routes/_app/deploy'
 import { Route as AppHarnessesRouteImport } from './../../common/src/routes/_app/harnesses'
+import { Route as AppOptimizationRouteImport } from './../../common/src/routes/_app/optimization'
 import { Route as AppRouterRouteImport } from './../../common/src/routes/_app/router'
 import { Route as AppStatusRouteImport } from './../../common/src/routes/_app/status'
 import { Route as AppTokenopsRouteImport } from './../../common/src/routes/_app/tokenops'
@@ -31,6 +32,8 @@ import { Route as AppSessionsSessionIdRouteImport } from './../../common/src/rou
 import { Route as AppSettingsIndexRouteImport } from './../../common/src/routes/_app/settings.index'
 import { Route as AppSettingsAppearanceRouteImport } from './../../common/src/routes/_app/settings.appearance'
 import { Route as AppSettingsChatContextRouteImport } from './../../common/src/routes/_app/settings.chat-context'
+import { Route as AppSettingsOptimizationRouteImport } from './../../common/src/routes/_app/settings.optimization'
+import { Route as AppSettingsOptimizationTiersRouteImport } from './../../common/src/routes/_app/settings.optimization-tiers'
 import { Route as AppSettingsPasswordRouteImport } from './../../common/src/routes/_app/settings.password'
 import { Route as AppSettingsSecretsRouteImport } from './../../common/src/routes/_app/settings.secrets'
 import { Route as AppWorkflowsIndexRouteImport } from './../../common/src/routes/_app/workflows.index'
@@ -61,6 +64,11 @@ const AppDeployRoute = AppDeployRouteImport.update({
 const AppHarnessesRoute = AppHarnessesRouteImport.update({
   id: '/harnesses',
   path: '/harnesses',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppOptimizationRoute = AppOptimizationRouteImport.update({
+  id: '/optimization',
+  path: '/optimization',
   getParentRoute: () => AppRoute,
 } as any)
 const AppRouterRoute = AppRouterRouteImport.update({
@@ -148,6 +156,17 @@ const AppSettingsChatContextRoute = AppSettingsChatContextRouteImport.update({
   path: '/settings/chat-context',
   getParentRoute: () => AppRoute,
 } as any)
+const AppSettingsOptimizationRoute = AppSettingsOptimizationRouteImport.update({
+  id: '/settings/optimization',
+  path: '/settings/optimization',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSettingsOptimizationTiersRoute =
+  AppSettingsOptimizationTiersRouteImport.update({
+    id: '/settings/optimization-tiers',
+    path: '/settings/optimization-tiers',
+    getParentRoute: () => AppRoute,
+  } as any)
 const AppSettingsPasswordRoute = AppSettingsPasswordRouteImport.update({
   id: '/settings/password',
   path: '/settings/password',
@@ -189,6 +208,7 @@ export interface FileRoutesByFullPath {
   '/login': typeof LoginRoute
   '/deploy': typeof AppDeployRoute
   '/harnesses': typeof AppHarnessesRoute
+  '/optimization': typeof AppOptimizationRoute
   '/router': typeof AppRouterRoute
   '/status': typeof AppStatusRoute
   '/tokenops': typeof AppTokenopsRoute
@@ -200,6 +220,8 @@ export interface FileRoutesByFullPath {
   '/sessions/$sessionId': typeof AppSessionsSessionIdRoute
   '/settings/appearance': typeof AppSettingsAppearanceRoute
   '/settings/chat-context': typeof AppSettingsChatContextRoute
+  '/settings/optimization': typeof AppSettingsOptimizationRoute
+  '/settings/optimization-tiers': typeof AppSettingsOptimizationTiersRoute
   '/settings/password': typeof AppSettingsPasswordRoute
   '/settings/secrets': typeof AppSettingsSecretsRoute
   '/workflows/$workflowId': typeof AppWorkflowsWorkflowIdRoute
@@ -218,6 +240,7 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/deploy': typeof AppDeployRoute
   '/harnesses': typeof AppHarnessesRoute
+  '/optimization': typeof AppOptimizationRoute
   '/router': typeof AppRouterRoute
   '/status': typeof AppStatusRoute
   '/tokenops': typeof AppTokenopsRoute
@@ -230,6 +253,8 @@ export interface FileRoutesByTo {
   '/sessions/$sessionId': typeof AppSessionsSessionIdRoute
   '/settings/appearance': typeof AppSettingsAppearanceRoute
   '/settings/chat-context': typeof AppSettingsChatContextRoute
+  '/settings/optimization': typeof AppSettingsOptimizationRoute
+  '/settings/optimization-tiers': typeof AppSettingsOptimizationTiersRoute
   '/settings/password': typeof AppSettingsPasswordRoute
   '/settings/secrets': typeof AppSettingsSecretsRoute
   '/workflows/$workflowId': typeof AppWorkflowsWorkflowIdRoute
@@ -250,6 +275,7 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute
   '/_app/deploy': typeof AppDeployRoute
   '/_app/harnesses': typeof AppHarnessesRoute
+  '/_app/optimization': typeof AppOptimizationRoute
   '/_app/router': typeof AppRouterRoute
   '/_app/status': typeof AppStatusRoute
   '/_app/tokenops': typeof AppTokenopsRoute
@@ -262,6 +288,8 @@ export interface FileRoutesById {
   '/_app/sessions/$sessionId': typeof AppSessionsSessionIdRoute
   '/_app/settings/appearance': typeof AppSettingsAppearanceRoute
   '/_app/settings/chat-context': typeof AppSettingsChatContextRoute
+  '/_app/settings/optimization': typeof AppSettingsOptimizationRoute
+  '/_app/settings/optimization-tiers': typeof AppSettingsOptimizationTiersRoute
   '/_app/settings/password': typeof AppSettingsPasswordRoute
   '/_app/settings/secrets': typeof AppSettingsSecretsRoute
   '/_app/workflows/$workflowId': typeof AppWorkflowsWorkflowIdRoute
@@ -283,6 +311,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/deploy'
     | '/harnesses'
+    | '/optimization'
     | '/router'
     | '/status'
     | '/tokenops'
@@ -294,6 +323,8 @@ export interface FileRouteTypes {
     | '/sessions/$sessionId'
     | '/settings/appearance'
     | '/settings/chat-context'
+    | '/settings/optimization'
+    | '/settings/optimization-tiers'
     | '/settings/password'
     | '/settings/secrets'
     | '/workflows/$workflowId'
@@ -312,6 +343,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/deploy'
     | '/harnesses'
+    | '/optimization'
     | '/router'
     | '/status'
     | '/tokenops'
@@ -324,6 +356,8 @@ export interface FileRouteTypes {
     | '/sessions/$sessionId'
     | '/settings/appearance'
     | '/settings/chat-context'
+    | '/settings/optimization'
+    | '/settings/optimization-tiers'
     | '/settings/password'
     | '/settings/secrets'
     | '/workflows/$workflowId'
@@ -343,6 +377,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/_app/deploy'
     | '/_app/harnesses'
+    | '/_app/optimization'
     | '/_app/router'
     | '/_app/status'
     | '/_app/tokenops'
@@ -355,6 +390,8 @@ export interface FileRouteTypes {
     | '/_app/sessions/$sessionId'
     | '/_app/settings/appearance'
     | '/_app/settings/chat-context'
+    | '/_app/settings/optimization'
+    | '/_app/settings/optimization-tiers'
     | '/_app/settings/password'
     | '/_app/settings/secrets'
     | '/_app/workflows/$workflowId'
@@ -410,6 +447,13 @@ declare module '@tanstack/react-router' {
       path: '/harnesses'
       fullPath: '/harnesses'
       preLoaderRoute: typeof AppHarnessesRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/optimization': {
+      id: '/_app/optimization'
+      path: '/optimization'
+      fullPath: '/optimization'
+      preLoaderRoute: typeof AppOptimizationRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/router': {
@@ -531,6 +575,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppSettingsChatContextRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/settings/optimization': {
+      id: '/_app/settings/optimization'
+      path: '/settings/optimization'
+      fullPath: '/settings/optimization'
+      preLoaderRoute: typeof AppSettingsOptimizationRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/settings/optimization-tiers': {
+      id: '/_app/settings/optimization-tiers'
+      path: '/settings/optimization-tiers'
+      fullPath: '/settings/optimization-tiers'
+      preLoaderRoute: typeof AppSettingsOptimizationTiersRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/settings/password': {
       id: '/_app/settings/password'
       path: '/settings/password'
@@ -586,6 +644,7 @@ declare module '@tanstack/react-router' {
 interface AppRouteChildren {
   AppDeployRoute: typeof AppDeployRoute
   AppHarnessesRoute: typeof AppHarnessesRoute
+  AppOptimizationRoute: typeof AppOptimizationRoute
   AppRouterRoute: typeof AppRouterRoute
   AppStatusRoute: typeof AppStatusRoute
   AppTokenopsRoute: typeof AppTokenopsRoute
@@ -598,6 +657,8 @@ interface AppRouteChildren {
   AppSessionsSessionIdRoute: typeof AppSessionsSessionIdRoute
   AppSettingsAppearanceRoute: typeof AppSettingsAppearanceRoute
   AppSettingsChatContextRoute: typeof AppSettingsChatContextRoute
+  AppSettingsOptimizationRoute: typeof AppSettingsOptimizationRoute
+  AppSettingsOptimizationTiersRoute: typeof AppSettingsOptimizationTiersRoute
   AppSettingsPasswordRoute: typeof AppSettingsPasswordRoute
   AppSettingsSecretsRoute: typeof AppSettingsSecretsRoute
   AppWorkflowsWorkflowIdRoute: typeof AppWorkflowsWorkflowIdRoute
@@ -616,6 +677,7 @@ interface AppRouteChildren {
 const AppRouteChildren: AppRouteChildren = {
   AppDeployRoute: AppDeployRoute,
   AppHarnessesRoute: AppHarnessesRoute,
+  AppOptimizationRoute: AppOptimizationRoute,
   AppRouterRoute: AppRouterRoute,
   AppStatusRoute: AppStatusRoute,
   AppTokenopsRoute: AppTokenopsRoute,
@@ -628,6 +690,8 @@ const AppRouteChildren: AppRouteChildren = {
   AppSessionsSessionIdRoute: AppSessionsSessionIdRoute,
   AppSettingsAppearanceRoute: AppSettingsAppearanceRoute,
   AppSettingsChatContextRoute: AppSettingsChatContextRoute,
+  AppSettingsOptimizationRoute: AppSettingsOptimizationRoute,
+  AppSettingsOptimizationTiersRoute: AppSettingsOptimizationTiersRoute,
   AppSettingsPasswordRoute: AppSettingsPasswordRoute,
   AppSettingsSecretsRoute: AppSettingsSecretsRoute,
   AppWorkflowsWorkflowIdRoute: AppWorkflowsWorkflowIdRoute,

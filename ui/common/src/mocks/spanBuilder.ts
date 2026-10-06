@@ -519,7 +519,13 @@ export function generateSpans(seed: Seed, traceId: string): GenSpan[] {
             status: 'OK',
             inText: text('Run the race-condition suite on PR #481'),
             outText: text(c === calls - 1 ? 'Suite passed; 1 flaky test.' : 'Queued.'),
-            attrs: { 'gen_ai.operation.name': 'invoke_agent', 'agent.id': calleeId },
+            attrs: {
+              'gen_ai.operation.name': 'invoke_agent',
+              'agent.id': calleeId,
+              // The proposed CX-V1 context report (plans/feat-context-optimization.md §5): counts only, derived from the
+              // call index so no random draw moves the rest of the seed. The first call also carries compression.
+              ...contextReportAttrs(c),
+            },
           })
           spans.push(call)
           const qa = llm(
@@ -785,6 +791,22 @@ export function generateSpans(seed: Seed, traceId: string): GenSpan[] {
   }
   spanCache.set(key, spans)
   return spans
+}
+
+/** CX-V1 (proposed) `nasiko.context.*` attributes for the n-th proxied call: PACMS on Medium against its pool. */
+function contextReportAttrs(n: number): Record<string, number | string> {
+  const pool = 18 + n * 6
+  const kept = Math.min(pool, 12)
+  return {
+    'nasiko.context.strategy': 'pacms',
+    'nasiko.context.level': 'medium',
+    'nasiko.context.budget': 1000,
+    'nasiko.context.pool': pool,
+    'nasiko.context.pool_tokens': pool * 240,
+    'nasiko.context.kept': kept,
+    'nasiko.context.kept_tokens_est': kept * 80,
+    ...(n === 0 ? { 'nasiko.context.compressed_bytes_saved': 3174 } : {}),
+  }
 }
 
 // ─── span attributes (what the seed writes to Tempo, and what the mock's span detail un-flattens) ─────────────

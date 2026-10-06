@@ -49,9 +49,24 @@ const PUBLIC = {
   mcp: ['components/AgentMcpTab'],
   narrative: ['tokenops', 'trace', 'harness', 'overview'],
   onboarding: ['api', 'GuideCard', 'GuideHost', 'index', 'logic', 'types'],
+  // Context optimization (plans/feat-context-optimization.md eng D1): its rules, copy, the trace's Optimization block
+  // (M2) and the /optimization Workspace row (T7). TokenOps' own savings panel is main's (PR #28, /finops/savings).
+  optimization: [
+    'api',
+    'copy',
+    'logic',
+    'types',
+    'components/ContextBlock',
+    // The team-name tooltip (B12), on the agent Settings tab's Token optimization title too.
+    'components/Codename',
+    // The Workspace footer's row, so a layer's slot rows (EE Organization policy) line up with the core's.
+    'components/WorkspaceRow',
+  ],
   overview: ['api', 'copy'],
   observability: ['StateCard', 'tuning', 'types', 'spans', 'copy', 'sessions', 'limiter'],
   router: ['components/RoutingCard', 'api', 'types', 'budgets', 'routing'],
+  // The hairline rows every Settings page is built from (EE uses them too).
+  settings: ['components/SettingRow', 'components/Chosen', 'components/tileStyles'],
   sessions: ['api', 'search', 'LogDrawer'],
   tokenops: [
     'api',

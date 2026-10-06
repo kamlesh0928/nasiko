@@ -27,7 +27,7 @@ import { HarnessPanels, type PanelItem } from './HarnessPanels'
 import { ActivityStrip, ConnectPanel, SessionsList, TopModels } from './IndividualView'
 import { Trend } from './Trend'
 
-export function Summary({ sentences, callout }: { sentences: string[]; callout: string | null }) {
+function Summary({ sentences, callout }: { sentences: string[]; callout: string | null }) {
   return (
     <section aria-labelledby="harness-summary" className="flex flex-col gap-2">
       <h2 id="harness-summary" className="sr-only">

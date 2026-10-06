@@ -1,7 +1,9 @@
 /**
  * Span panel: Summary (status, timing, tokens, cost, ids), Prompt & response (always
  * rendered as TEXT, never HTML), Attributes (grouped by namespace, filterable, click to
- * copy). Per-span cost only exists on SpanDetail, so it is fetched on selection.
+ * copy). Per-span cost only exists on SpanDetail, so it is fetched on selection. The Summary carries the request's
+ * Optimization block on the span that holds its report, and a pointer to it on the request's LLM spans
+ * (plans/feat-context-optimization.md 1B); a trace without a report renders as before.
  * Patterns: Braintrust's span pane (previous/next span, key-value summary, collapsible
  * Input/Output with a view toggle) and Axiom's (span id with copy, tab counts, raw fields
  * grouped and filterable).
@@ -25,6 +27,9 @@ import {
 } from '@/features/observability/spans'
 import { CONTENT_PREVIEW_CHARS } from '@/features/observability/tuning'
 import { ErrorState } from '@/features/observability/StateCard'
+import { ContextBlock } from '@/features/optimization/components/ContextBlock'
+import { copy as optimizationCopy } from '@/features/optimization/copy'
+import { contextReport, orgPolicyApplied } from '@/features/optimization/logic'
 import type { ContentField } from '@/features/observability/types'
 import { fmtLatency, fmtMoney, fmtTokens } from '@/lib/format'
 import { useCopy } from '@/lib/useCopy'
@@ -55,6 +60,7 @@ export function SpanPanel({
   onPrev,
   onNext,
   onClose,
+  request,
 }: {
   traceId: string
   span: FlatSpan
@@ -66,12 +72,26 @@ export function SpanPanel({
   onPrev?: () => void
   onNext?: () => void
   onClose?: () => void
+  /** The `a2a.dispatch` / `a2a.proxy` span this one belongs to (itself included), and how to select it. */
+  request?: { span: FlatSpan; onSelect: () => void }
 }) {
   const setTab = onTabChange
   const detail = useSpanDetail(traceId, span.node.span_id)
   const d = detail.data
   const attrs = useMemo(() => flattenAttributes(d?.attributes), [d?.attributes])
   const attrCount = Object.keys(attrs).length
+  const isRequest = request?.span.node.id === span.node.id
+  const ownReport = isRequest && d ? contextReport(attrs) : null
+  // Ledger V3: the org-policy server records the flag without the counts; it still shows, as a Summary row.
+  const policyOnly = isRequest && !!d && !ownReport && orgPolicyApplied(attrs)
+  // An LLM span points at its request's block, only when that request carries a report (one cached read).
+  const pointTo = request && !isRequest && span.cls === 'llm' ? request : undefined
+  const requestDetail = useSpanDetail(traceId, pointTo?.span.node.span_id)
+  const requestAttrs = useMemo(
+    () => flattenAttributes(requestDetail.data?.attributes),
+    [requestDetail.data?.attributes],
+  )
+  const pointerShown = !!pointTo && !!requestDetail.data && contextReport(requestAttrs) !== null
   const atStart = !position || position.index <= 1
   const atEnd = !position || position.index >= position.of
 
@@ -178,63 +198,90 @@ export function SpanPanel({
 
         <TabsContent key={span.node.span_id} value={tab} className="min-w-0">
           {tab === 'summary' ? (
-            <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm">
-              <dt className="text-muted-foreground">Status</dt>
-              <dd className={isError(span.node) ? 'text-destructive' : ''}>
-                {statusText(span.node)}
-                {d?.status_message ? ` · ${d.status_message}` : ''}
-              </dd>
-              <dt className="text-muted-foreground">Start</dt>
-              <dd className="tabular-nums">
-                +{fmtLatency(span.startMs)}{' '}
-                <span className="text-muted-foreground">from trace start</span>
-              </dd>
-              <dt className="text-muted-foreground">Duration</dt>
-              <dd className="tabular-nums">{fmtLatency(span.durationMs)}</dd>
-              <dt className="text-muted-foreground">Tokens</dt>
-              <dd className="tabular-nums">
-                {fmtTokens(span.node.input_tokens)} in · {fmtTokens(span.node.output_tokens)} out
-                {span.node.cache_read_tokens
-                  ? ` · ${fmtTokens(span.node.cache_read_tokens)} cached`
-                  : ''}
-              </dd>
-              <dt className="text-muted-foreground">Cost</dt>
-              <dd className="tabular-nums">
-                {detail.isPending ? (
-                  <span className="text-muted-foreground">Loading…</span>
-                ) : detail.isError ? (
-                  <span className="text-muted-foreground">unavailable</span>
-                ) : (
-                  <span title={d ? `$${d.cost_summary.total.cost}` : undefined}>
-                    {fmtMoney(d?.cost_summary.total.cost)}
-                  </span>
-                )}
-              </dd>
-              <dt className="text-muted-foreground">Kind</dt>
-              <dd>
-                {CLASS_LABEL[span.cls]}{' '}
-                <span className="text-muted-foreground">({span.node.span_kind})</span>
-              </dd>
-              {span.node.model ? (
-                <>
-                  <dt className="text-muted-foreground">Model</dt>
-                  <dd className="font-mono text-xs leading-5">{span.node.model}</dd>
-                </>
-              ) : null}
-              {parentName ? (
-                <>
-                  <dt className="text-muted-foreground">Parent</dt>
-                  <dd className="truncate font-mono text-xs leading-5" title={parentName}>
-                    {parentName}
-                  </dd>
-                </>
-              ) : null}
-              {span.node.name === TRACE_TOTAL_SPAN ? (
-                <dd className="col-span-2 text-xs text-muted-foreground">
-                  This span carries the whole turn's usage; it isn't added to span totals.
+            <>
+              <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm">
+                <dt className="text-muted-foreground">Status</dt>
+                <dd className={isError(span.node) ? 'text-destructive' : ''}>
+                  {statusText(span.node)}
+                  {d?.status_message ? ` · ${d.status_message}` : ''}
                 </dd>
+                <dt className="text-muted-foreground">Start</dt>
+                <dd className="tabular-nums">
+                  +{fmtLatency(span.startMs)}{' '}
+                  <span className="text-muted-foreground">from trace start</span>
+                </dd>
+                <dt className="text-muted-foreground">Duration</dt>
+                <dd className="tabular-nums">{fmtLatency(span.durationMs)}</dd>
+                <dt className="text-muted-foreground">Tokens</dt>
+                <dd className="tabular-nums">
+                  {fmtTokens(span.node.input_tokens)} in · {fmtTokens(span.node.output_tokens)} out
+                  {span.node.cache_read_tokens
+                    ? ` · ${fmtTokens(span.node.cache_read_tokens)} cached`
+                    : ''}
+                </dd>
+                <dt className="text-muted-foreground">Cost</dt>
+                <dd className="tabular-nums">
+                  {detail.isPending ? (
+                    <span className="text-muted-foreground">Loading…</span>
+                  ) : detail.isError ? (
+                    <span className="text-muted-foreground">unavailable</span>
+                  ) : (
+                    <span title={d ? `$${d.cost_summary.total.cost}` : undefined}>
+                      {fmtMoney(d?.cost_summary.total.cost)}
+                    </span>
+                  )}
+                </dd>
+                <dt className="text-muted-foreground">Kind</dt>
+                <dd>
+                  {CLASS_LABEL[span.cls]}{' '}
+                  <span className="text-muted-foreground">({span.node.span_kind})</span>
+                </dd>
+                {span.node.model ? (
+                  <>
+                    <dt className="text-muted-foreground">Model</dt>
+                    <dd className="font-mono text-xs leading-5">{span.node.model}</dd>
+                  </>
+                ) : null}
+                {parentName ? (
+                  <>
+                    <dt className="text-muted-foreground">Parent</dt>
+                    <dd className="truncate font-mono text-xs leading-5" title={parentName}>
+                      {parentName}
+                    </dd>
+                  </>
+                ) : null}
+                {policyOnly ? (
+                  <>
+                    <dt className="text-muted-foreground">{optimizationCopy.trace.policy}</dt>
+                    <dd>{optimizationCopy.trace.policyApplied}</dd>
+                  </>
+                ) : null}
+                {span.node.name === TRACE_TOTAL_SPAN ? (
+                  <dd className="col-span-2 text-xs text-muted-foreground">
+                    This span carries the whole turn's usage; it isn't added to span totals.
+                  </dd>
+                ) : null}
+              </dl>
+              {ownReport ? (
+                <div className="mt-4">
+                  <ContextBlock report={ownReport} />
+                </div>
               ) : null}
-            </dl>
+              {pointerShown && pointTo ? (
+                <p className="mt-4 text-sm text-muted-foreground">
+                  {optimizationCopy.trace.pointer}{' '}
+                  <Button
+                    type="button"
+                    variant="link"
+                    size="sm"
+                    className="h-auto p-0 font-mono text-xs text-foreground underline underline-offset-4 pointer-coarse:min-h-11"
+                    onClick={pointTo.onSelect}
+                  >
+                    {pointTo.span.node.name}
+                  </Button>
+                </p>
+              ) : null}
+            </>
           ) : detail.isPending ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
           ) : detail.isError ? (

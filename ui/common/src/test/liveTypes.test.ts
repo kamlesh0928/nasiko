@@ -16,6 +16,7 @@ import type {
 } from '@/features/tokenops/types'
 import type { Me } from '@/lib/api/auth'
 import { ADMIN_ID } from '@/mocks/seed-harness'
+import { budgetBodySchema, strategyBodySchema } from '@/features/optimization/types'
 
 interface Fx {
   id: string
@@ -99,6 +100,9 @@ const envelope = <T extends z.ZodType>(data: T) => z.object({ data })
 const slice = z.object({ agent_name: z.string(), spend_usd: z.number() })
 const iso = z.string().min(1)
 const WIRE: Record<string, z.ZodType> = {
+  // Context optimization (context_selection.rs): bare JSON, not in the OpenAPI spec (CX-1).
+  '/api/me/context-strategy': strategyBodySchema,
+  '/api/me/pacms-budget': budgetBodySchema,
   '/api/me': z.object({
     sub: z.string(),
     username: z.string(),

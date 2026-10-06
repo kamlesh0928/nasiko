@@ -216,18 +216,26 @@ export const copy = {
   promptCommentsHint:
     'Lets the agent record, prune, and maintain workspace instructions with rationale annotations. Workspaces can opt out with',
   promptCommentsOptOut: '<!-- @prompt-comments disabled -->',
-  tokenOptimization: 'Token optimization',
-  tokenOptimizationIntro:
-    'One switch over the whole stack: shrinks large tool results (JSON, logs and diffs) before they reach the model, trims the reply instruction, and compresses what the Orchestrator keeps between turns. Errors and structure are kept, and a counted note is left wherever something was removed. Turning it off stops every part of it.',
-  tokenOptimizationHint: 'Off by default. Your own messages are never changed.',
   codingBehavior: 'Coding agent behavior',
-  minimalCode: 'Minimal-code mode',
+  minimalCode: 'Minimal-code mode (Ponytail)',
   minimalCodeHint:
     'Checks for existing code, the standard library, or an installed dependency before writing new code. Applies immediately, no restart needed.',
   selfReview: 'Self-review',
   selfReviewHint:
     'Adds a review turn that catches duplicated or unnecessary code — one extra model call per edit, so it is off until you ask for it. Needs Minimal-code mode. Restart the agent to apply.',
   dangerZone: 'Danger zone',
+  // plans/feat-context-optimization.md eng E1 (D3), E2 (D4): the switch does three things; the label says so. One switch
+  // (TokenOptimization.tsx); main's second copy in the feature flags was folded into it at the integration (2026-10-05).
+  // Named with the program it turns on (plans/feat-optimization-page.md B12).
+  tokenOptimization: 'Token optimization (Caveman)',
+  tokenOptimizationIntro:
+    'One switch over the whole stack: shrinks large tool results (JSON, logs and diffs) before they reach the model, trims the reply instruction, and compresses what the Orchestrator keeps between turns. Errors and structure are kept, and a counted note is left wherever something was removed. Turning it off stops every part of it.',
+  /** The switch's own label, so the section title isn't printed twice (review: design). */
+  tokenOptimizationSwitch: 'On for this agent',
+  tokenOptimizationHint:
+    "Compresses this agent's LLM requests and asks it for concise answers (through the LLM router). History compression also needs it on for all of an owner's agents.",
+  tokenOptimizationHarness: 'For a coding harness this only affects history compression.',
+  tokenOptimizationFailed: (reason: string) => `Couldn't change Token optimization: ${reason}`,
   deleteThisAgent: 'Delete this agent',
   deleteAgent: 'Delete agent',
   deleteTitle: (name: string) => `Delete ${name}?`,

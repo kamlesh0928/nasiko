@@ -233,6 +233,9 @@ const unauthorized = () =>
 const rpcError = (s: number, code: number, message: string) =>
   HttpResponse.json({ jsonrpc: '2.0', id: null, error: { code, message } }, { status: s })
 
+/** Seed the chats now (other mocks read them, e.g. the optimization preview's latest chat). */
+export const ensureChatSeed = (ctx: ChatMockContext) => seed(ctx)
+
 function seed(ctx: ChatMockContext) {
   if (seeded) return
   seeded = true

@@ -8,7 +8,7 @@ import { z } from 'zod'
 import type { components } from '@/lib/api/schema.gen'
 
 /** `build/mod.rs` `BuildStatus` (PG enum `build_status`). */
-export const BUILD_STATUSES = ['queued', 'building', 'success', 'failed'] as const
+const BUILD_STATUSES = ['queued', 'building', 'success', 'failed'] as const
 export type BuildStatus = (typeof BUILD_STATUSES)[number]
 
 /** `build/routes.rs` `BuildRecord`: `logs_url` is never written by the OSS server (D-3). */
@@ -28,6 +28,7 @@ export type BuildRecord = z.infer<typeof buildRecordSchema>
 
 /** `lib.rs` `Paginated<BuildRecord>`: `total` is the page length, not a count (D-6). */
 export const buildsPageSchema = z.object({ data: z.array(buildRecordSchema), total: z.number() })
+/** @public The /api/builds page wire type, kept with its schema. */
 export type BuildsPage = z.infer<typeof buildsPageSchema>
 
 /** `crate::unavailable()`: a 200 `{available:false}` for a caller without deploy rights (EE; OSS lets everyone deploy). */
@@ -63,6 +64,7 @@ export const githubUserSchema = z.object({
   configured: z.boolean().optional(),
   login: z.string().nullable().optional(),
 })
+/** @public The /api/github/user wire type, kept with its schema. */
 export type GithubUser = z.infer<typeof githubUserSchema>
 
 /**
@@ -77,7 +79,7 @@ export const githubTokenSchema = z.object({
 })
 
 /** `nasiko_github` `GitHubRepo`, via `GET /api/github/repositories` → `{repositories, total}` (the newest 100). */
-export const githubRepoSchema = z.object({
+const githubRepoSchema = z.object({
   id: z.number(),
   name: z.string(),
   full_name: z.string(),

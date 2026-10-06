@@ -611,7 +611,7 @@ export function useNeedsYou(now: Date, me: Me, fleet: FleetHealth, enabled = tru
   }
 }
 
-export interface HarnessLine {
+interface HarnessLine {
   id: string
   cost: number | null
   /** More than half the turns unpriced: the cost reads "unpriced" (the Harnesses page rule). */
@@ -698,6 +698,7 @@ export interface BudgetCard {
 }
 
 /** The Budgets card: the same list and status reads as Needs you and Fleet health (one fetch each). */
+/** @public Hidden until /api/budgets lands (R-L10); OverviewPage has the call commented out. */
 export function useBudgetCard(fleet: FleetHealth, enabled: boolean): BudgetCard {
   const budgets = useBudgets(enabled)
   const status = useBudgetStatus(enabled && budgets.isSuccess)

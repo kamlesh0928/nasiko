@@ -12,8 +12,8 @@ import type { BuildStatus, UploadStatus } from './types'
 
 export const STAGES = ['queued', 'building', 'deploying', 'running'] as const
 export type StageId = (typeof STAGES)[number]
-export type StageState = 'done' | 'current' | 'pending' | 'failed' | 'warning'
-export type Outcome = 'running' | 'failed' | 'notRunning'
+type StageState = 'done' | 'current' | 'pending' | 'failed' | 'warning'
+type Outcome = 'running' | 'failed' | 'notRunning'
 
 export interface Stage {
   id: StageId

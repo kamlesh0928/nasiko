@@ -68,6 +68,7 @@ import { DayPanel } from './components/DayPanel'
 import { Disclosure } from '@/components/shared/disclosure'
 import { KpiStrip } from './components/KpiStrip'
 import { MonthHero } from './components/MonthHero'
+import { copy as optimizationCopy } from '@/features/optimization/copy'
 import { OptimisationPanel } from './components/OptimisationPanel'
 import { SavingsHighlight } from './components/SavingsHighlight'
 import { summarizeOptimisation } from './optimisation'
@@ -624,7 +625,18 @@ export function TokenopsPage({
                   {savings.error instanceof Error ? savings.error.message : 'Request failed.'}
                 </StateCard>
               ) : optimisation ? (
-                <OptimisationPanel data={optimisation} />
+                <>
+                  <OptimisationPanel data={optimisation} />
+                  {/* P3 (plans/feat-optimization-page.md): the trend, the agents and the fixes live on Optimization,
+                      opened on this window (R7A: the two pages share the window keys). */}
+                  <Link
+                    to="/optimization"
+                    search={{ preset: search.preset, from: search.from, to: search.to }}
+                    className="mt-3 inline-block text-xs underline underline-offset-4 hover:text-primary-text pointer-coarse:py-3"
+                  >
+                    {optimizationCopy.savings.more}
+                  </Link>
+                </>
               ) : (
                 <div className="h-48 animate-pulse rounded-md bg-muted" aria-busy />
               )}

@@ -29,6 +29,17 @@ function agentRows(s: SavingsData) {
 }
 
 /**
+ * A program as the team names it too (user decision 2026-10-05, plans/feat-optimization-page.md B12): the user-facing
+ * label with the internal name in brackets, capitalised as a name: "Smaller prompts (Caveman)".
+ */
+export function programName(label: string, program: string): string {
+  const codename = program.charAt(0).toUpperCase() + program.slice(1)
+  return label && program && label.toLowerCase() !== program.toLowerCase()
+    ? `${label} (${codename})`
+    : label || codename
+}
+
+/**
  * Category rows — "Caveman saved this much, Ponytail saved this much".
  *
  * Programs with no eligible traffic are kept rather than filtered out: a zero that explains itself
@@ -38,7 +49,7 @@ function agentRows(s: SavingsData) {
 function categoryRows(s: SavingsData) {
   const rows = s.by_program.map((p: ProgramSavings) => ({
     program: p.program,
-    label: p.label,
+    label: programName(p.label, p.program),
     savedTokens: p.saved_tokens,
     savedCost: p.saved_cost_usd,
     tokenPct: p.token_reduction_pct,
@@ -105,8 +116,10 @@ export function summarizeOptimisation(s: SavingsData) {
     topUnoptimised: c.top_unoptimized ?? null,
     /** Per-layer adoption: which switch is under-used, not just how many agents have something on. */
     adoption: [
-      { label: 'Compression', on: c.agents_with_compress_enabled },
-      { label: 'Minimal code', on: c.agents_with_minimal_code_enabled },
+      // The switches by the programs they turn on (B12).
+      // Named as the switches they count (agents copy `tokenOptimization`, `minimalCode`; user, 2026-10-05).
+      { label: 'Token optimization (Caveman)', on: c.agents_with_compress_enabled },
+      { label: 'Minimal-code mode (Ponytail)', on: c.agents_with_minimal_code_enabled },
       { label: 'Prompt comments', on: c.agents_with_prompt_comments },
     ],
     /** The biggest contributor, for the one-line headline. */

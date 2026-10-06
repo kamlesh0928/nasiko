@@ -13,11 +13,11 @@ import { parseVersion } from './version'
 
 export const MAX_ZIP_BYTES = 100 * 1024 * 1024
 export const MAX_FILES = 1_000
-export const MAX_UNZIPPED_BYTES = 200 * 1024 * 1024
+const MAX_UNZIPPED_BYTES = 200 * 1024 * 1024
 export const ENTRY_CAP = 64 * 1024
 const ENTRYPOINTS = ['main.py', 'src/main.py', '__main__.py', 'src/__main__.py'] as const
 
-export type ItemState = 'pass' | 'fail' | 'unknown'
+type ItemState = 'pass' | 'fail' | 'unknown'
 /** The checklist's order (design review 4). */
 export const CHECKLIST_ITEMS: readonly ChecklistItem[] = [
   'dockerfile',

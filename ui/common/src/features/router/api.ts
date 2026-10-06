@@ -452,6 +452,7 @@ export function useBudgetStatus(enabled: boolean) {
   })
 }
 
+/** @public Hidden until /api/budgets lands (R-L10); RouterPage has the call commented out. */
 export function useBudgetAlerts(enabled: boolean) {
   return useQuery({
     queryKey: routerKeys.budgetAlerts,

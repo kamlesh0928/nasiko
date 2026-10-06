@@ -40,8 +40,8 @@ describe('TokenOps page', () => {
     expect(within(panel).getAllByText('11.0%')).toHaveLength(2)
 
     // The category split — "what did Caveman save vs Ponytail" — answered directly.
-    expect(within(panel).getByText('Smaller prompts')).toBeInTheDocument()
-    expect(within(panel).getByText('Less code written')).toBeInTheDocument()
+    expect(within(panel).getByText('Smaller prompts (Caveman)')).toBeInTheDocument()
+    expect(within(panel).getByText('Less code written (Ponytail)')).toBeInTheDocument()
 
     // A zero category stays visible and says why, so it reads as "nobody turned it on" rather
     // than "this feature does nothing".

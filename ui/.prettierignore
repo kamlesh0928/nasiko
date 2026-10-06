@@ -21,3 +21,5 @@ common/src/test/__live__/
 common/src/components/ui/
 # Vendored verbatim from nasiko-cloud-rs (ee/web/src/weave/core/README.md).
 ee/web/src/weave/core/
+# Written by msw on install (package.json "msw.workerDirectory"); CI's npm ci regenerates it unformatted.
+public/mockServiceWorker.js

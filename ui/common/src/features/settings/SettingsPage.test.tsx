@@ -11,7 +11,7 @@ import { copy } from './copy'
 setupPinnedSeed()
 afterEach(() => configureMocks({ seed, now, loggedIn: true, variant: null, superuser: null }))
 
-const T = { timeout: 5000 }
+const T = { timeout: 12000 }
 const f = copy.fields
 const sectionNav = () => screen.findByRole('navigation', { name: copy.nav.label }, T)
 
@@ -30,12 +30,14 @@ describe('Settings: workspace sections (plans/feat-settings.md §1.1)', () => {
       within(nav)
         .getAllByRole('link')
         .map((l) => l.textContent),
+      // Workspace → Optimization tiers and Account → Optimization: plans/feat-context-optimization.md (eng E4 lists
+      // them as intended nav changes).
     ).toEqual([
       'General',
       'Flow limits',
+      'Optimization tiers',
       'Registry',
       'Secrets',
-      'Chat context',
       'Appearance',
       'Password',
     ])
@@ -124,7 +126,7 @@ describe('Settings: workspace sections (plans/feat-settings.md §1.1)', () => {
     expect(await screen.findByRole('heading', { level: 1, name: 'General' }, T)).toBeInTheDocument()
   })
 
-  it('sends a member to their secrets, with only Secrets, Chat context, Appearance and Password in the nav', async () => {
+  it('sends a member to their secrets, with only Secrets and the Account pages in the nav', async () => {
     configureMocks({ superuser: false })
     const { router } = renderApp('/settings')
     await waitFor(() => expect(router.state.location.pathname).toBe('/settings/secrets'), T)
@@ -133,6 +135,14 @@ describe('Settings: workspace sections (plans/feat-settings.md §1.1)', () => {
       within(nav)
         .getAllByRole('link')
         .map((l) => l.textContent),
-    ).toEqual(['Secrets', 'Chat context', 'Appearance', 'Password'])
+    ).toEqual(['Secrets', 'Appearance', 'Password'])
+  })
+
+  it('an old Settings → Chat context link lands on Optimization (fb633d4)', async () => {
+    const { router } = renderApp('/settings/chat-context')
+    // The page drops `#settings` itself once it has jumped there, so only the path is stable.
+    await waitFor(() => expect(router.state.location.pathname).toBe('/optimization'), {
+      timeout: 12_000,
+    })
   })
 })

@@ -102,6 +102,8 @@ export const agentDetailSchema = z.looseObject({
   can_manage: z.boolean(),
   is_coding_agent: z.boolean(),
   coding_agent_integration_id: z.string().nullish(),
+  // Newer than the generated spec (catalog/routes.rs at 05f22246); optional so an older server still parses.
+  compress_enabled: z.boolean().optional(),
   tags: z.array(z.string()),
   skills: z.array(z.unknown()),
 }) satisfies z.ZodType<WireSubset<AgentDetailResponse>>

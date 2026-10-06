@@ -4,12 +4,12 @@
  * rail does: the same nav in a full-height column beside the rail from 1024 px, a sheet opened from above the page
  * below that. The page scrolls in its own column (the shell fills the viewport on /settings, as on /chat). The rows
  * are nasiko-cloud-rs (`origin/development` a4853db4) `ui/oss/navigation.js` `MODULE_NAVS.settings` plus
- * whatever an edition layer appends:
- * - Workspace: General, (EE: Orchestrator), Flow limits, Registry. `/settings?section=`.
- * - Security: (EE: Single sign-on), Secrets (`/settings/secrets`), Chat context (`/settings/chat-context`; nasiko-cloud-rs
- *   `35c749af`, every user's own).
+ * the EE layer's `nav-ext-ee.js`:
+ * - Workspace: General, (EE: Orchestrator), Flow limits, Optimization tiers (`/settings/optimization-tiers`), Registry.
+ *   `/settings?section=` for the sections of the one form.
+ * - Security: (EE: Single sign-on), Secrets (`/settings/secrets`).
  * - Account: Appearance (`/settings/appearance`; the lab's, this browser's mode and theme), Password
- *   (`/settings/password`; Change password).
+ *   (`/settings/password`; Change password). Optimization moved to /optimization (plans/feat-optimization-page.md P2).
  * A layer's rows come from the `settingsSections` slot, placed after the row they name. A member sees Secrets and
  * Account: the workspace sections are superuser-gated on the API.
  */
@@ -42,8 +42,8 @@ interface Row {
   to:
     | '/settings'
     | '/settings/secrets'
-    | '/settings/chat-context'
     | '/settings/appearance'
+    | '/settings/optimization-tiers'
     | '/settings/password'
   section?: string
 }
@@ -76,13 +76,25 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
             key: 'workspace',
             label: copy.nav.workspace,
             rows: withLayer(
-              CORE_SECTIONS.map((k): Row => ({
-                key: k,
-                label: copy.sections[k].label,
-                to: '/settings',
-                // General is the default: its link carries no section.
-                section: k === 'general' ? undefined : k,
-              })),
+              CORE_SECTIONS.flatMap((k): Row[] => [
+                {
+                  key: k,
+                  label: copy.sections[k].label,
+                  to: '/settings',
+                  // General is the default: its link carries no section.
+                  section: k === 'general' ? undefined : k,
+                },
+                // A sub-page after Flow limits (plans/feat-context-optimization.md F4): its own route and read.
+                ...(k === 'limits'
+                  ? [
+                      {
+                        key: 'optimization-tiers',
+                        label: copy.optimizationTiers.label,
+                        to: '/settings/optimization-tiers' as const,
+                      },
+                    ]
+                  : []),
+              ]),
               inGroup('workspace'),
             ),
           },
@@ -94,7 +106,6 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
       rows: [
         ...withLayer([], admin ? inGroup('security') : []),
         { key: 'secrets', label: copy.secrets.title, to: '/settings/secrets' },
-        { key: 'chat-context', label: copy.chatContext.label, to: '/settings/chat-context' },
       ],
     },
     {
@@ -108,7 +119,7 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
   ]
   const known = new Set(groups.flatMap((g) => g.rows.map((r) => r.key)))
   const raw = (location.search as { section?: unknown }).section
-  // A sub-page (Secrets, Chat context, Appearance, Password) is current by its path; the workspace page by `?section=`.
+  // A sub-page (Secrets, Appearance, Password) is current by its path; the workspace page by `?section=`.
   const page = groups
     .flatMap((g) => g.rows)
     .find((r) => r.to === location.pathname && r.to !== '/settings')
@@ -150,7 +161,9 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
               </SheetContent>
             </Sheet>
           )}
-          <div className="@container min-h-0 min-w-0 flex-1 overflow-y-auto px-4 py-4">
+          {/* `relative`: the scroll box is the positioning context, so an absolutely placed child (Radix's hidden form
+              input behind a Switch) scrolls inside it instead of stretching the document and moving the shell. */}
+          <div className="@container relative min-h-0 min-w-0 flex-1 overflow-y-auto px-4 py-4">
             <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 @[768px]:pt-6">
               {inSidebar || wide ? null : (
                 <Button

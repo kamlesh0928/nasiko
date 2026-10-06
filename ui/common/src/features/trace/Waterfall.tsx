@@ -219,7 +219,8 @@ export function Waterfall({
               className={cn(
                 'grid cursor-pointer grid-cols-[minmax(10rem,38%)_1fr] items-center gap-x-3 rounded-md px-2 py-1 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring',
                 selected ? 'bg-accent ring-2 ring-ring' : 'hover:bg-accent/60',
-                lit && !selected && 'bg-primary/10',
+                // 8%, not 10%: muted text on a lit row stays at 4.5:1 in Carbon light (axe, e2e demo).
+                lit && !selected && 'bg-primary/8',
                 dim && 'opacity-50',
               )}
             >

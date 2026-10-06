@@ -907,6 +907,7 @@ function plan(description: string, agents: MockAgent[]) {
 }
 
 /** For tests: the runs as the server would report them now. */
+/** @public For tests and the mock clock. */
 export const viewRun = (st: WorkflowsState, id: string, now: number) => {
   const r = st.runs.find((x) => x.id === id)
   return r ? deriveRun(r, now, st) : null

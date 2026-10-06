@@ -3,12 +3,12 @@
  * page's polite announcer (plan §4.7). Labels are never colour-only.
  */
 import { AlertTriangle, Building2, KeyRound } from 'lucide-react'
-import { useCallback, useState, type ComponentProps, type ReactNode } from 'react'
+import type { ComponentProps, ReactNode } from 'react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
-import { AnnounceContext } from '../announce'
+import { Announcer as SharedAnnouncer } from '@/components/shared/announcer'
 import { copy } from '../copy'
 import { sourceLabel } from '../format'
 import type { KeySource, Sentence } from '../routing'
@@ -112,20 +112,7 @@ export function LinkButton({ className, ...props }: ComponentProps<typeof Button
 
 // ─── the page's one polite live region ──────────────────────────────────────
 
-/** Wraps the page: one `aria-live="polite"` region, and `useAnnounce()` for every save outcome and fallback move. */
+/** Wraps the page: the shared one polite live region, with the id the router's tests read. */
 export function Announcer({ children }: { children: ReactNode }) {
-  const [msg, setMsg] = useState('')
-  const announce = useCallback((m: string) => {
-    // Clear first so the same message twice is read twice.
-    setMsg('')
-    queueMicrotask(() => setMsg(m))
-  }, [])
-  return (
-    <AnnounceContext.Provider value={announce}>
-      {children}
-      <p className="sr-only" aria-live="polite" role="status" data-testid="router-announcer">
-        {msg}
-      </p>
-    </AnnounceContext.Provider>
-  )
+  return <SharedAnnouncer testId="router-announcer">{children}</SharedAnnouncer>
 }

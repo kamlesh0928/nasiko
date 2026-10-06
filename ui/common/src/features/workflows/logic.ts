@@ -23,7 +23,7 @@ import type {
 /** A missing status counts as deployed (`main` has no drafts). */
 export const isDeployed = (wf: Pick<Workflow, 'status'>) => (wf.status ?? 'active') !== 'draft'
 
-export const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
 
 export const stepsOf = (wf: WorkflowRow) => wf.step_count ?? wf.maf_json?.steps?.length ?? 0
 export const descriptionOf = (wf: Workflow) => wf.description || wf.maf_json?.description || ''

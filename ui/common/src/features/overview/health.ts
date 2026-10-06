@@ -29,10 +29,10 @@ import {
 } from './tuning'
 
 export type Rating = 'healthy' | 'watch' | 'action' | 'unknown'
-export type Level = 'watch' | 'action'
-export type Dimension = 'reliability' | 'cost' | 'activity' | 'latency'
+type Level = 'watch' | 'action'
+type Dimension = 'reliability' | 'cost' | 'activity' | 'latency'
 
-export interface Reason {
+interface Reason {
   dimension: Dimension
   level: Level
   text: string

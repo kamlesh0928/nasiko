@@ -9,6 +9,7 @@
 import {
   Bot,
   DollarSign,
+  Gauge,
   LayoutDashboard,
   ListTree,
   MessageSquare,
@@ -42,6 +43,7 @@ export interface NavItem {
     | '/workflows'
     | '/sessions'
     | '/tokenops'
+    | '/optimization'
     | '/harnesses'
   label: string
   icon: LucideIcon
@@ -70,6 +72,15 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { to: '/mcp', label: copy.nav.mcp, icon: Plug, group: 'connect', shared: false },
   { to: '/sessions', label: copy.nav.sessions, icon: ListTree, group: 'observe', shared: true },
   { to: '/tokenops', label: copy.nav.tokenops, icon: DollarSign, group: 'observe', shared: true },
+  // What context optimization saves and your settings for it (plans/feat-optimization-page.md P7, P2).
+  {
+    to: '/optimization',
+    label: copy.nav.optimization,
+    icon: Gauge,
+    group: 'observe',
+    shared: true,
+    also: ['/settings/optimization'],
+  },
   {
     to: '/harnesses',
     label: copy.nav.harnesses,

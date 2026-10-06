@@ -1,14 +1,9 @@
-import { createFileRoute } from '@tanstack/react-router'
-import { ChatContextPage } from '@/features/settings/ChatContextPage'
-import { SettingsLayout } from '@/features/settings/SettingsLayout'
+import { createFileRoute, redirect } from '@tanstack/react-router'
 
-// Every user's own preference: no superuser gate, unlike the workspace sections.
-export const Route = createFileRoute('/_app/settings/chat-context')({ component: ChatContextRoute })
-
-function ChatContextRoute() {
-  return (
-    <SettingsLayout>
-      <ChatContextPage />
-    </SettingsLayout>
-  )
-}
+// Settings → Security → Chat context (main, PR #27) was a second editor for the same two preferences: they live on
+// /optimization's Your settings (plans/feat-optimization-page.md P2), so old links land there (integration 2026-10-05).
+export const Route = createFileRoute('/_app/settings/chat-context')({
+  beforeLoad: () => {
+    throw redirect({ to: '/optimization', hash: 'settings', replace: true })
+  },
+})

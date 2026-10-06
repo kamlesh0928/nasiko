@@ -323,7 +323,11 @@ function BasisMark({ basis, notes }: { basis: SavingsBasis; notes?: string }) {
   return (
     <Tooltip>
       <TooltipTrigger asChild>
+        {/* An icon with a name (axe: aria-label needs a role), focusable so keyboard users can open its tooltip. */}
         <span
+          role="img"
+          // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- focusable only to open the tooltip; it has no action
+          tabIndex={0}
           className="inline-flex text-muted-foreground"
           aria-label={basis === 'fixture' ? 'Measured by holdout' : 'Estimated'}
         >

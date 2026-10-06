@@ -1,6 +1,6 @@
 /** Every Overview tuning number (plans/feat-overview.md §5.2): thresholds are relative to each agent's own history. */
 
-export const HOUR = 3_600_000
+const HOUR = 3_600_000
 export const DAY = 24 * HOUR
 
 /** Cost: 7-day spend up more than this vs the previous 7 days is Watch. */

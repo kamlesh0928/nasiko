@@ -3,12 +3,14 @@ import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { copy } from '@/features/observability/copy'
+import { copy as optimizationCopy } from '@/features/optimization/copy'
 import { configureMocks } from '@/mocks/handlers'
 import {
   generateSpans,
   observabilityData,
   sessionDetail,
   SHOWCASE_SESSION,
+  spanDetail,
 } from '@/mocks/observability'
 import { seed, setupPinnedSeed } from '@/test/pinnedSeed'
 import { renderApp } from '@/test/renderApp'
@@ -206,5 +208,95 @@ describe('Session trace', () => {
       await screen.findByRole('tab', { name: 'Prompt & response' }, { timeout: 8000 }),
     )
     expect((await screen.findAllByText(copy.captureOff)).length).toBe(2)
+  })
+})
+
+// plans/feat-context-optimization.md M2 (1B, 2A, 5A, F2; eng E4 assertion 1).
+describe('Session trace: the Optimization block', () => {
+  const proxy = () => showcaseSpans().find((s) => s.name === 'a2a.proxy')!
+  const qa = () =>
+    showcaseSpans().find((s) => s.name === 'llm.qa_summary' && s.parentHex === proxy().hex)!
+  const open = (hex: string) =>
+    renderApp(`/sessions/${SHOWCASE_SESSION}?trace=${data.showcaseTraceId}&span=${hex}`)
+
+  it('the request span shows what it carried against the baseline, savings in neutral text', async () => {
+    open(proxy().hex)
+    const block = await screen.findByRole(
+      'table',
+      { name: optimizationCopy.trace.label },
+      { timeout: 5000 },
+    )
+    expect(within(block).getByText(optimizationCopy.preview.without)).toBeInTheDocument()
+    expect(within(block).getByText('Medium · PACMS')).toBeInTheDocument()
+    expect(within(block).getByText(optimizationCopy.trace.compressed)).toBeInTheDocument()
+    // 5A: the delta is muted, never the success colour.
+    const delta = within(block).getByText(/^\s*−\d+%$/)
+    expect(delta.className).toMatch(/text-muted-foreground/)
+    expect(delta.className).not.toMatch(/success/)
+    // F2: no org-policy row without the flag.
+    expect(within(block).queryByText(optimizationCopy.trace.policyApplied)).toBeNull()
+  })
+
+  it('an LLM span inside the request points at it, and the pointer selects it', async () => {
+    const { router } = open(qa().hex)
+    const pointer = await screen.findByRole('button', { name: 'a2a.proxy' }, { timeout: 5000 })
+    expect(screen.queryByRole('table', { name: optimizationCopy.trace.label })).toBeNull()
+    await userEvent.click(pointer)
+    await waitFor(() =>
+      expect((router.state.location.search as { span?: string }).span).toBe(proxy().hex),
+    )
+    expect(
+      await screen.findByRole('table', { name: optimizationCopy.trace.label }, { timeout: 5000 }),
+    ).toBeInTheDocument()
+  })
+
+  /** The proxy span's detail with these attributes instead of its report (every other span unchanged). */
+  const proxyAttributes = (attributes: Record<string, unknown>) =>
+    server.use(
+      http.get('/api/observability/span/:traceId/:spanId', ({ params }) => {
+        const d = spanDetail(seed, String(params.traceId), String(params.spanId))
+        if (!d || d.span_id !== proxy().hex) return undefined
+        return HttpResponse.json({ data: { span: { ...d, attributes } } })
+      }),
+    )
+  const summaryLoaded = async () => {
+    await screen.findByText('Kind', {}, { timeout: 5000 })
+    await waitFor(() => expect(screen.queryByText('Loading…')).toBeNull())
+  }
+
+  it('a request span without a report, and its LLM spans, are as before (E4 assertion 1)', async () => {
+    proxyAttributes({ agent: { id: 'qa' } })
+    open(proxy().hex)
+    await summaryLoaded()
+    expect(screen.queryByRole('table', { name: optimizationCopy.trace.label })).toBeNull()
+    expect(screen.queryByText(optimizationCopy.trace.policyApplied)).toBeNull()
+  })
+
+  it('an LLM span under a request without a report gets no pointer', async () => {
+    proxyAttributes({ agent: { id: 'qa' } })
+    open(qa().hex)
+    await summaryLoaded()
+    // The request's detail is read for the pointer; wait for it before asserting there is none.
+    await waitFor(() => expect(screen.queryByText('Loading…')).toBeNull())
+    expect(screen.queryByText(optimizationCopy.trace.pointer)).toBeNull()
+  })
+
+  it('the org-policy flag alone (the l0 server, no counts) shows a Policy row (ledger V3)', async () => {
+    proxyAttributes({ nasiko: { prompt_context: { org_applied: true } } })
+    open(proxy().hex)
+    expect(
+      await screen.findByText(optimizationCopy.trace.policyApplied, {}, { timeout: 5000 }),
+    ).toBeInTheDocument()
+    expect(screen.queryByRole('table', { name: optimizationCopy.trace.label })).toBeNull()
+  })
+
+  it('a span outside any request is as before: no block, no pointer (E4 assertion 1)', async () => {
+    const plan = showcaseSpans().find((s) => s.name === 'llm.plan')!
+    open(plan.hex)
+    // The Summary has loaded (its cost row resolves from the span detail).
+    await screen.findByText('Kind', {}, { timeout: 5000 })
+    await waitFor(() => expect(screen.queryByText('Loading…')).toBeNull())
+    expect(screen.queryByRole('table', { name: optimizationCopy.trace.label })).toBeNull()
+    expect(screen.queryByText(optimizationCopy.trace.pointer)).toBeNull()
   })
 })

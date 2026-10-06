@@ -17,7 +17,7 @@
       "additionalProperties": false,
       "properties": {
         "id": { "type": "string", "pattern": "^[a-z0-9]+(\\.[a-z0-9-]+)+$", "description": "feature.name; also the fixture file name" },
-        "feature": { "enum": ["shell", "tokenops", "sessions", "agents", "chat", "harnesses", "router", "mcp", "ee", "errors"] },
+        "feature": { "enum": ["shell", "tokenops", "sessions", "agents", "chat", "harnesses", "router", "mcp", "optimization", "ee", "errors"] },
         "method": { "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"] },
         "path": { "type": "string", "pattern": "^/", "description": "may contain {tokens} resolved from the seed (see tokens() in scripts/record-live.ts)" },
         "query": { "type": "object", "additionalProperties": { "type": "string" } },

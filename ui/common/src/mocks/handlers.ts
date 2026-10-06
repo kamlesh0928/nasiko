@@ -45,6 +45,8 @@ import {
   traceDetail,
 } from './observability'
 import { generateSeed, SEED_MODELS, type Seed } from './seed'
+import { contextSavings, contextSavingsAgents, topRequests } from './contextSavings'
+import { hash as hashString } from './spanBuilder'
 import {
   fleetUnpriced,
   myAgentDashboardRows,
@@ -91,7 +93,14 @@ import {
   usageByAgent,
   type RouterState,
 } from './router'
-import { chatHandlers, chatMockRows, resetChatMock } from './chatStore'
+import {
+  chatHandlers,
+  chatMockMessages,
+  chatMockRows,
+  ensureChatSeed,
+  resetChatMock,
+  type ChatMockContext,
+} from './chatStore'
 import {
   advanceBuild,
   buildDeployState,
@@ -107,6 +116,7 @@ import {
   type MockBuild,
 } from './deploy'
 import { buildMcpState, mcpHandlers, type McpState } from './mcp'
+import { optimizationHandlers, resetOptimizationMock } from './optimization'
 import { buildWorkflowsState, workflowHandlers, type WorkflowsState } from './workflows'
 import { checkZip, MAX_ZIP_BYTES } from '@/features/deploy/zipcheck'
 import { nameProblem } from '@/features/deploy/name'
@@ -230,6 +240,13 @@ export const MOCK_VARIANTS = [
   // /api/me/onboarding (bare 404), or a user who already picked a persona.
   'onboarding-absent',
   'onboarding-done',
+  // Context optimization (plans/feat-context-optimization.md §3): answers as today's server (no off switch, no tier
+  // values, no last-chat preview: the proposed CX-5, CX-T1 and CX-6 are bare 404s or absent).
+  'optimization-classic',
+  // The Optimization page's states (plans/feat-optimization-page.md §7, T6): requests ran but none reported (R2E(1)),
+  // or every savings read fails (R2C; the agent lists and your settings still work).
+  'optimization-no-reports',
+  'optimization-down',
   ...CHAT_PAGE_VARIANTS,
   ...ROUTER_PAGE_VARIANTS,
 ] as const
@@ -402,9 +419,6 @@ let settingsRow: Record<string, unknown> | null = null
 // Secret values the mock was sent (the router state keeps names only); a seed secret reads as a fake key.
 let secretValues = new Map<string, string>()
 let mockPassword: string | null = null
-// context_selection.rs: the viewer's chat-context preferences, at the migrations' defaults (0038, 0039).
-const CHAT_CONTEXT_DEFAULTS = { strategy: 'pacms', level: 'medium' }
-let chatContext = { ...CHAT_CONTEXT_DEFAULTS }
 /** settings.rs `get_settings` with no row: its hard-coded defaults (not the env's, ST-1). */
 const SETTINGS_DEFAULTS = {
   router_model: 'deepseek-v4-pro',
@@ -476,8 +490,8 @@ export function resetAgentsMock() {
   settingsRow = null
   secretValues = new Map()
   mockPassword = null
-  chatContext = { ...CHAT_CONTEXT_DEFAULTS }
   onboardingRow = ONBOARDED
+  resetOptimizationMock()
   resetChatMock()
   // The chat knobs tests can turn (v1c DX3).
   fixedSuperuser = null
@@ -618,6 +632,85 @@ function sseStream(lines: string[], closeMessage: string): ReadableStream<Uint8A
 }
 
 export const handlerGroups: Record<Mockable, HttpHandler[]> = {
+  // plans/feat-context-optimization.md: the merged /api/me routes plus the proposed CX-5/CX-T1/CX-6 (optimization.ts).
+  optimization: optimizationHandlers({
+    loggedIn: () => loggedIn,
+    me: () => sessionUser(),
+    classic: () => hasVariant('optimization-classic'),
+    now: () => nowFn(),
+    chats: () => {
+      ensureChatSeed(chatCtx)
+      return chatMockRows()
+    },
+    messages: chatMockMessages,
+    text: (body, status) => text(body, status),
+    unauthorized: () => unauthorized(),
+  }).concat([
+    // CX-V3 / V3a / V3b / V3c (proposed): context savings, its series, per agent and top requests
+    // (plans/feat-optimization-page.md eng E1, C2–C4; mocks/contextSavings.ts). Today's server has none of them.
+    // From the agent seed only: coding-harness turns are recorded from local CLIs and never run selection.
+    ...(['', '/agents', '/top-requests'] as const).map((sub) =>
+      http.get(`${FINOPS}/context-savings${sub}`, ({ request }) => {
+        if (hasVariant('optimization-classic'))
+          return loggedIn ? new HttpResponse(null, { status: 404 }) : unauthorized()
+        if (hasVariant('optimization-down'))
+          return loggedIn ? text('internal error', 500) : unauthorized()
+        return respond(() => {
+          const q = params(request)
+          const url = new URL(request.url)
+          const agents = getAgents().agents
+          const byId = new Map(agents.map((a) => [a.id, a]))
+          const opts = {
+            now: nowFn(),
+            compressOf: (id: string) => byId.get(id)?.compress ?? false,
+            compressedOf: (id: string) => byId.get(id)?.compressSeeded ?? false,
+            noReports: hasVariant('optimization-no-reports'),
+            // ACL-scoped like the dashboard (review: adversarial): the agents mock's own access rule.
+            visible: (id: string) => {
+              const a = byId.get(id)
+              const v = sessionUser()
+              return (
+                !!a &&
+                (v.is_superuser ||
+                  a.owner_id === v.id ||
+                  a.is_public ||
+                  a.userGrants.includes(v.id))
+              )
+            },
+          }
+          if (sub === '')
+            return contextSavings(getSeed(), { ...q, series: url.searchParams.get('series') }, opts)
+          if (sub === '/agents')
+            return contextSavingsAgents(getSeed(), q, {
+              ...opts,
+              nameOf: (id, raw) => byId.get(id)?.display_name ?? raw,
+            })
+          const me = sessionUser()
+          // Requests group into chats as Sessions shows them (one per agent per day), so a row's title and link match.
+          const obs = observabilityData(getSeed()).traceById
+          return topRequests(
+            getSeed(),
+            {
+              ...q,
+              from: url.searchParams.get('from'),
+              to: url.searchParams.get('to'),
+              limit: url.searchParams.get('limit'),
+            },
+            {
+              ...opts,
+              viewer: { id: me.id, superuser: me.is_superuser },
+              sessionOf: (traceId) => {
+                const s = obs.get(traceId)?.session
+                return s ? { id: s.session_id, title: s.title } : null
+              },
+              // Mock rule: one chat in three belongs to another user, so a member sees redacted rows (C4).
+              ownerOf: (sid) => (hashString(sid) % 3 === 0 ? 'another-user' : me.id),
+            },
+          )
+        })
+      }),
+    ),
+  ]),
   // nasiko-cloud-rs 41f776ae `onboarding.rs`: bare JSON; a persona outside the enum is Axum's 422 Json rejection.
   onboarding: [
     http.get('/api/me/onboarding', () => {
@@ -745,6 +838,7 @@ export const handlerGroups: Record<Mockable, HttpHandler[]> = {
     http.put('/api/agents/:id', async ({ params: prm, request }) => {
       const a = managed(String(prm.id))
       if (a instanceof Response) return a
+      // catalog/routes.rs `update`: every field is COALESCE, so an absent one is left as it was.
       const body = (await request.json().catch(() => ({}))) as {
         display_name?: string
         description?: string
@@ -756,7 +850,7 @@ export const handlerGroups: Record<Mockable, HttpHandler[]> = {
       if (typeof body.display_name === 'string') a.display_name = body.display_name
       if (typeof body.description === 'string') a.description = body.description
       if (body.metadata && typeof body.metadata === 'object') a.metadata = body.metadata
-      if (typeof body.compress_enabled === 'boolean') a.compress_enabled = body.compress_enabled
+      if (typeof body.compress_enabled === 'boolean') a.compress = body.compress_enabled
       if (typeof body.minimal_code_enabled === 'boolean')
         a.minimal_code_enabled = body.minimal_code_enabled
       a.updated_at = new Date(nowFn()).toISOString()
@@ -1138,7 +1232,31 @@ export const handlerGroups: Record<Mockable, HttpHandler[]> = {
       respond(() => topTraces(getFinopsSeed(), params(request), nowFn())),
     ),
   ],
-  savings: [http.get(`${FINOPS}/savings`, () => respond(() => savings()))],
+  savings: [
+    http.get(`${FINOPS}/savings`, () =>
+      respond(() => {
+        // savings.rs `coverage`: counted over every live agent (no ACL), from the agents mock, so the Optimization
+        // page's Mechanisms counts follow the same switches as its other blocks. The rest is the fixed sample.
+        const s = savings()
+        const live = getAgents().agents.filter((a) => !a.deleted)
+        const comments = (a: (typeof live)[number]) =>
+          (a.metadata?.features as Record<string, unknown> | undefined)?.prompt_comments ===
+          'enabled'
+        const minimal = (a: (typeof live)[number]) => a.minimal_code_enabled === true
+        return {
+          ...s,
+          coverage: {
+            ...s.coverage,
+            agents_total: live.length,
+            agents_with_compress_enabled: live.filter((a) => a.compress).length,
+            agents_with_minimal_code_enabled: live.filter(minimal).length,
+            agents_with_prompt_comments: live.filter(comments).length,
+            agents_optimized: live.filter((a) => a.compress || minimal(a) || comments(a)).length,
+          },
+        }
+      }),
+    ),
+  ],
   observability: [
     // `owner=` lists are the Harnesses live fallback's (harnesses group): pass them through, so
     // VITE_NASIKO_MOCK=observability alone never answers them from the harness seed.
@@ -1603,29 +1721,6 @@ export const handlerGroups: Record<Mockable, HttpHandler[]> = {
       )
       return HttpResponse.json(settingsRow)
     }),
-    // context_selection.rs (nasiko-cloud-rs 1a305a63): bare objects, any signed-in user, the caller's own. A value
-    // outside the enum never reaches the handler: Axum's Json extractor answers a plain-text 422.
-    ...(
-      [
-        ['/api/me/context-strategy', 'strategy', ['pacms', 'topk', 'lastk']],
-        ['/api/me/pacms-budget', 'level', ['low', 'medium', 'high']],
-      ] as const
-    ).flatMap(([path, key, values]) => [
-      http.get(path, () =>
-        loggedIn ? HttpResponse.json({ [key]: chatContext[key] }) : unauthorized(),
-      ),
-      http.patch(path, async ({ request }) => {
-        if (!loggedIn) return unauthorized()
-        const v = ((await request.json().catch(() => ({}))) as Record<string, unknown>)[key]
-        if (typeof v !== 'string' || !(values as readonly string[]).includes(v))
-          return text(
-            `Failed to deserialize the JSON body into the target type: ${key}: unknown variant`,
-            422,
-          )
-        chatContext[key] = v
-        return HttpResponse.json({ [key]: v })
-      }),
-    ]),
   ],
 }
 
@@ -1836,7 +1931,7 @@ function chatScenario(): ChatScenario | null {
   )
 }
 
-handlerGroups.chat = chatHandlers({
+const chatCtx: ChatMockContext = {
   loggedIn: () => loggedIn,
   userId: () => ADMIN_ID,
   now: () => nowFn(),
@@ -1860,7 +1955,8 @@ handlerGroups.chat = chatHandlers({
   hasVariant: (v) =>
     (CHAT_PAGE_VARIANTS as readonly string[]).includes(v) && hasVariant(v as MockVariant),
   superuser,
-})
+}
+handlerGroups.chat = chatHandlers(chatCtx)
 
 /**
  * Deploy group (plans/feat-deploy.md §9). ACL as the server: a superuser sees every build and upload, anyone else only
