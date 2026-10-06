@@ -55,8 +55,6 @@ _to_delete/
 # out; `--compare` takes any directory of .dsl files.
 ui/tests/fixtures/runs/
 
-# Private React/Next migration workspace; do not force-add before release approval.
-/react/
 
 # Local git worktrees (superpowers workflow)
 .worktrees/
