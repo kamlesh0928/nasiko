@@ -60,7 +60,11 @@ pub fn parse_request(body: &Value) -> Result<ResponsesRequest, GatewayError> {
         Some(_) => return Err(bad("input must be a string or an array")),
     }
 
-    let (tools, tool_kinds) = parse_tools(object.get("tools"))?;
+    let ParsedTools {
+        defs: tools,
+        kinds: tool_kinds,
+        dropped_hosted,
+    } = parse_tools(object.get("tools"))?;
     let tool_choice = parse_tool_choice(object.get("tool_choice"))?;
     let temperature = optional_number(object, "temperature")?;
     let max_tokens = optional_i64(object, "max_output_tokens")?;
@@ -72,6 +76,9 @@ pub fn parse_request(body: &Value) -> Result<ResponsesRequest, GatewayError> {
     }
     if has_custom_grammar(object.get("tools")) {
         advisory_fields.push("custom_tool.format.grammar");
+    }
+    if dropped_hosted {
+        advisory_fields.push(HOSTED_TOOLS_ADVISORY);
     }
     Ok(ResponsesRequest {
         chat: ChatRequest {
@@ -93,9 +100,16 @@ pub fn parse_request(body: &Value) -> Result<ResponsesRequest, GatewayError> {
     })
 }
 
+/// Fields the parser knows about. Anything else is rejected rather than dropped, so a control
+/// that would silently change the answer can't slip through — but a field that *cannot* reach
+/// generation belongs here and is then simply ignored, as `metadata`, `user` and
+/// `safety_identifier` already are. `client_metadata` is that kind: Codex attaches its own
+/// CLI/terminal telemetry to every request, and rejecting it fails the whole session over a
+/// field no provider would have read.
 fn reject_top_level(object: &Map<String, Value>) -> Result<(), GatewayError> {
     const ACCEPTED_FIELDS: &[&str] = &[
         "background",
+        "client_metadata",
         "compaction",
         "context_management",
         "conversation",
@@ -343,83 +357,160 @@ fn value_text(value: &Value) -> Result<String, GatewayError> {
     }
 }
 
-fn parse_tools(
-    value: Option<&Value>,
-) -> Result<(Vec<ToolDef>, HashMap<String, ToolKind>), GatewayError> {
+/// Tool types the *provider's own backend* executes. Nothing downstream can run them —
+/// Bedrock and Anthropic have no equivalent — so they are dropped rather than rejected:
+/// a tool that isn't advertised simply never gets called, which strands nothing, whereas
+/// a 400 takes the whole turn down over a capability the model can live without. The drop
+/// is reported through [`ResponsesRequest::advisory_fields`], the same way `reasoning` and
+/// `include` are, so the response still carries the lossy-translation header.
+const HOSTED_TOOL_TYPES: &[&str] = &[
+    "web_search",
+    "web_search_preview",
+    "image_generation",
+    "computer",
+    "computer_use_preview",
+    "local_shell",
+    "shell",
+    "mcp",
+    "tool_search",
+];
+
+/// Marker pushed onto `advisory_fields` when a hosted tool was dropped.
+pub(crate) const HOSTED_TOOLS_ADVISORY: &str = "tools.hosted";
+
+/// The flat tool list a request translates to, plus whether anything was dropped reaching it.
+#[derive(Default)]
+struct ParsedTools {
+    defs: Vec<ToolDef>,
+    kinds: HashMap<String, ToolKind>,
+    dropped_hosted: bool,
+}
+
+/// [`ParsedTools`] under construction. `signatures` is scratch for the duplicate check and
+/// does not outlive collection.
+#[derive(Default)]
+struct ToolAccumulator {
+    parsed: ParsedTools,
+    signatures: HashMap<String, Value>,
+}
+
+fn parse_tools(value: Option<&Value>) -> Result<ParsedTools, GatewayError> {
     let Some(value) = value.filter(|v| !v.is_null()) else {
-        return Ok((Vec::new(), HashMap::new()));
+        return Ok(ParsedTools::default());
     };
     let tools = value
         .as_array()
         .ok_or_else(|| bad("tools must be an array"))?;
-    let mut defs = Vec::new();
-    let mut kinds = HashMap::new();
-    let mut signatures: HashMap<String, Value> = HashMap::new();
+    let mut acc = ToolAccumulator::default();
     for tool in tools {
-        let kind = required_str(tool, "type", "tool")?;
-        let tool_kind = match kind {
-            "function" => ToolKind::Function,
-            "custom" => ToolKind::Custom,
-            "web_search"
-            | "web_search_preview"
-            | "image_generation"
-            | "computer"
-            | "computer_use_preview"
-            | "local_shell"
-            | "shell"
-            | "mcp"
-            | "tool_search" => {
-                return Err(bad(&format!(
-                    "hosted tool type '{kind}' is not supported for cross-provider Responses"
-                )));
-            }
-            _ => {
-                return Err(bad(&format!(
-                    "tool type '{kind}' is not supported for cross-provider Responses"
-                )));
-            }
-        };
-        if tool_kind == ToolKind::Custom {
-            validate_custom_format(tool.get("format"))?;
-        } else if let Some(strict) = tool.get("strict").filter(|value| !value.is_null()) {
-            let strict = strict
-                .as_bool()
-                .ok_or_else(|| bad("function tool strict must be a boolean"))?;
-            if strict {
-                return Err(bad(
-                    "strict function tools are not supported for cross-provider Responses",
-                ));
-            }
-        }
-        let name = required_str(tool, "name", "tool")?.to_string();
-        if let Some(previous) = signatures.get(&name) {
-            if previous != tool {
-                return Err(bad(&format!(
-                    "duplicate tool '{name}' has conflicting definitions"
-                )));
-            }
-            continue;
-        }
-        signatures.insert(name.clone(), tool.clone());
-        kinds.insert(name.clone(), tool_kind);
-        let parameters = if tool_kind == ToolKind::Custom {
-            json!({"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false})
-        } else {
-            tool.get("parameters")
-                .cloned()
-                .unwrap_or_else(|| json!({"type":"object","properties":{}}))
-        };
-        defs.push(ToolDef {
-            kind: "function".into(),
-            function: FunctionDef {
-                name,
-                description: custom_tool_description(tool, tool_kind),
-                parameters: Some(parameters),
-            },
-            extra: Map::new(),
-        });
+        collect_tool(tool, true, &mut acc)?;
     }
-    Ok((defs, kinds))
+    Ok(acc.parsed)
+}
+
+/// Translate one entry of the `tools` array into the accumulator.
+///
+/// `namespaces_allowed` is false while recursing into a namespace's members, so a nested
+/// namespace is reported rather than silently flattened — Codex only ever emits one level
+/// (`{"type":"namespace","name":…,"description":…,"tools":[…function tools…]}`), and a
+/// deeper shape would be a format we have not seen.
+fn collect_tool(
+    tool: &Value,
+    namespaces_allowed: bool,
+    acc: &mut ToolAccumulator,
+) -> Result<(), GatewayError> {
+    let kind = required_str(tool, "type", "tool")?;
+    let tool_kind = match kind {
+        "function" => ToolKind::Function,
+        "custom" => ToolKind::Custom,
+        // A grouping wrapper, not a tool: Codex packages a whole MCP server's tools under
+        // one namespace. The chat IR and every provider's tool format are flat, so the
+        // members are hoisted out and treated as ordinary function tools. Their bare names
+        // are kept — that is what the model sees and calls, and the duplicate check below
+        // turns a collision between two namespaces into an error rather than a mis-route.
+        "namespace" if namespaces_allowed => return collect_namespace(tool, acc),
+        "namespace" => {
+            return Err(bad(
+                "nested tool namespaces are not supported for cross-provider Responses",
+            ));
+        }
+        hosted if HOSTED_TOOL_TYPES.contains(&hosted) => {
+            tracing::info!(
+                tool_type = %hosted,
+                "dropping provider-hosted tool for cross-provider Responses"
+            );
+            acc.parsed.dropped_hosted = true;
+            return Ok(());
+        }
+        _ => {
+            // A type this parser has never seen — a newer client, or a Responses feature
+            // added since. Unlike a hosted tool, we can't know it is safe to drop, so it
+            // is rejected; the client only learns the name, so log the tool's structure
+            // here, since that is what a translation for it has to be written against.
+            // Keys only, never values — a tool's description and schema are the caller's
+            // content, not ours to log.
+            tracing::warn!(
+                tool_type = %kind,
+                fields = ?object_keys(tool),
+                "unknown Responses tool type rejected"
+            );
+            return Err(bad(&format!(
+                "tool type '{kind}' is not supported for cross-provider Responses"
+            )));
+        }
+    };
+    if tool_kind == ToolKind::Custom {
+        validate_custom_format(tool.get("format"))?;
+    } else if let Some(strict) = tool.get("strict").filter(|value| !value.is_null()) {
+        let strict = strict
+            .as_bool()
+            .ok_or_else(|| bad("function tool strict must be a boolean"))?;
+        if strict {
+            return Err(bad(
+                "strict function tools are not supported for cross-provider Responses",
+            ));
+        }
+    }
+    let name = required_str(tool, "name", "tool")?.to_string();
+    if let Some(previous) = acc.signatures.get(&name) {
+        if previous != tool {
+            return Err(bad(&format!(
+                "duplicate tool '{name}' has conflicting definitions"
+            )));
+        }
+        return Ok(());
+    }
+    acc.signatures.insert(name.clone(), tool.clone());
+    acc.parsed.kinds.insert(name.clone(), tool_kind);
+    let parameters = if tool_kind == ToolKind::Custom {
+        json!({"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false})
+    } else {
+        tool.get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({"type":"object","properties":{}}))
+    };
+    acc.parsed.defs.push(ToolDef {
+        kind: "function".into(),
+        function: FunctionDef {
+            name,
+            description: custom_tool_description(tool, tool_kind),
+            parameters: Some(parameters),
+        },
+        extra: Map::new(),
+    });
+    Ok(())
+}
+
+/// Hoist a namespace's member tools up to the flat tool list.
+fn collect_namespace(tool: &Value, acc: &mut ToolAccumulator) -> Result<(), GatewayError> {
+    let members = tool
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| bad("tool namespace must carry a 'tools' array"))?;
+    for member in members {
+        collect_tool(member, false, acc)?;
+    }
+    Ok(())
 }
 
 fn has_custom_grammar(tools: Option<&Value>) -> bool {
@@ -1036,6 +1127,14 @@ fn item_id(prefix: &str) -> String {
 fn bad(message: &str) -> GatewayError {
     GatewayError::BadRequest(message.to_string())
 }
+/// The field names of a JSON object, for diagnostics that must describe a payload's
+/// shape without logging its contents. Empty for anything that isn't an object.
+fn object_keys(value: &Value) -> Vec<&str> {
+    value
+        .as_object()
+        .map(|object| object.keys().map(String::as_str).collect())
+        .unwrap_or_default()
+}
 fn required_str<'a>(value: &'a Value, key: &str, context: &str) -> Result<&'a str, GatewayError> {
     value
         .get(key)
@@ -1143,12 +1242,15 @@ mod tests {
     fn rejects_unsupported_content_tools_and_malformed_arguments() {
         for body in [
             json!({"input":[{"role":"user","content":[{"type":"input_image","image_url":"x"}]}]}),
-            json!({"input":[],"tools":[{"type":"web_search"}]}),
             json!({"input":[{"type":"function_call","call_id":"c","name":"f","arguments":"{"}]}),
             json!({"input":[],"text":{"format":{"type":"json_schema"}}}),
         ] {
             assert!(parse_request(&body).is_err(), "accepted {body}");
         }
+        // `{"type":"web_search"}` used to belong on that list. It is now dropped instead —
+        // Codex sends it on every request, and a provider-hosted tool nothing downstream can
+        // execute is not worth failing a turn over. See
+        // `codex_namespaces_flatten_and_hosted_tools_drop_without_failing_the_turn`.
     }
 
     #[test]
@@ -1262,6 +1364,110 @@ mod tests {
                 .all(|item| item["type"] != "reasoning")
         );
         assert!(!rendered.to_string().contains("encrypted_content"));
+    }
+
+    /// Shaped exactly like a real Codex 0.160 request (captured off the wire): one
+    /// namespace per MCP server plus Codex's own built-in groups, members carrying
+    /// `strict: false`, and a hosted `web_search` with no name at all.
+    #[test]
+    fn codex_namespaces_flatten_and_hosted_tools_drop_without_failing_the_turn() {
+        let parsed = parse_request(&json!({
+            "input": "hi",
+            "tools": [
+                {"type":"function","name":"exec_command","description":"run",
+                 "parameters":{"type":"object"},"strict":false},
+                {"type":"namespace","name":"mcp__nasiko","description":"Nasiko gateway","tools":[
+                    {"type":"function","name":"nasiko_search_tools","description":"search",
+                     "parameters":{"type":"object"},"strict":false},
+                    {"type":"function","name":"nasiko_call_tool","description":"call",
+                     "parameters":{"type":"object"},"strict":false}
+                ]},
+                {"type":"namespace","name":"multi_agent_v1","description":"agents","tools":[
+                    {"type":"function","name":"spawn_agent","description":"spawn",
+                     "parameters":{"type":"object"},"strict":false}
+                ]},
+                {"type":"web_search"}
+            ]
+        }))
+        .unwrap();
+
+        // Members are hoisted under their bare names — what the model sees and calls —
+        // and the namespace wrapper itself never reaches the provider.
+        let names: Vec<&str> = parsed
+            .chat
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "exec_command",
+                "nasiko_search_tools",
+                "nasiko_call_tool",
+                "spawn_agent"
+            ]
+        );
+        assert_eq!(parsed.tool_kinds["nasiko_call_tool"], ToolKind::Function);
+        assert!(!parsed.tool_kinds.contains_key("mcp__nasiko"));
+
+        // The hosted tool is dropped, not rejected — but the turn is marked lossy.
+        assert_eq!(parsed.advisory_fields, [HOSTED_TOOLS_ADVISORY]);
+    }
+
+    #[test]
+    fn a_namespace_collision_is_an_error_rather_than_a_silent_mis_route() {
+        // Two namespaces exposing the same member name would flatten onto one tool, and a
+        // call could not be attributed back. Identical definitions are harmless (the
+        // existing duplicate rule); conflicting ones must fail.
+        let conflicting = json!({
+            "input": "hi",
+            "tools": [
+                {"type":"namespace","name":"a","tools":[
+                    {"type":"function","name":"send","description":"one","parameters":{"type":"object"}}
+                ]},
+                {"type":"namespace","name":"b","tools":[
+                    {"type":"function","name":"send","description":"two","parameters":{"type":"object"}}
+                ]}
+            ]
+        });
+        let error = parse_request(&conflicting).unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate tool 'send'"),
+            "{error}"
+        );
+
+        // A namespace must actually carry members, and may not nest.
+        assert!(
+            parse_request(&json!({"input":"hi","tools":[{"type":"namespace","name":"a"}]}))
+                .is_err()
+        );
+        assert!(
+            parse_request(&json!({"input":"hi","tools":[
+                {"type":"namespace","name":"a","tools":[{"type":"namespace","name":"b","tools":[]}]}
+            ]}))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn client_telemetry_is_ignored_while_unknown_controls_still_fail_loud() {
+        // Codex attaches `client_metadata` to every request. It cannot reach generation, so
+        // it is dropped rather than 400'd — the same treatment `metadata` already gets.
+        let parsed = parse_request(&json!({
+            "input": "hi",
+            "client_metadata": {"cli_version": "0.48.0", "terminal_type": "iTerm.app"},
+        }))
+        .unwrap();
+        assert_eq!(parsed.chat.messages.len(), 1);
+        assert!(parsed.chat.extra.is_empty());
+        assert!(parsed.advisory_fields.is_empty());
+
+        // Widening the allowlist must not turn the parser permissive: a field that could
+        // change the answer is still a hard error.
+        assert!(parse_request(&json!({"input": "hi", "unknown_control": true})).is_err());
     }
 
     #[test]

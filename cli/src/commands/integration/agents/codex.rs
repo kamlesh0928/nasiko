@@ -556,8 +556,19 @@ fn usage_delta(start: Option<TokenUsage>, end: Option<TokenUsage>) -> TokenUsage
     }
 }
 
+/// Cumulative session usage as of now, or `None` when the transcript could not
+/// be read at all.
+///
+/// A transcript that reads fine but carries no `token_count` event yet is
+/// `Some(zero)`, not `None` — it is a definite "nothing spent so far", which is
+/// exactly the state at a session's first `UserPromptSubmit`: Codex writes its
+/// first `token_count` only after the first model reply, so the event that opens
+/// a turn routinely precedes any usage line. Collapsing that into `None` made
+/// [`usage_delta`] take its "unknown" branch and report the whole first turn as
+/// costing nothing, which is what a single-turn session shows end to end.
 fn parse_token_usage(path: &Path) -> Option<TokenUsage> {
-    parse_token_usage_lines(&std::fs::read_to_string(path).ok()?)
+    let content = std::fs::read_to_string(path).ok()?;
+    Some(parse_token_usage_lines(&content).unwrap_or_default())
 }
 
 fn parse_token_usage_lines(content: &str) -> Option<TokenUsage> {
@@ -888,6 +899,54 @@ not-json
                 cache_read: 8
             })
         );
+    }
+
+    #[test]
+    fn a_first_turn_reports_its_full_usage_rather_than_nothing() {
+        // Codex writes its first `token_count` only after the first model
+        // reply, so at the opening `UserPromptSubmit` the transcript is
+        // readable but carries no usage line. That is "nothing spent yet",
+        // not "unknown": reading it as unknown zeroed the entire first turn,
+        // and a single-turn session therefore reported no cost at all.
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("rollout.jsonl");
+
+        // Shape taken from a real rollout: session_meta and the user prompt
+        // land before any token_count event.
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"session_meta\",\"payload\":{}}\n\
+             {\"type\":\"response_item\",\"payload\":{\"role\":\"user\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_token_usage(&transcript),
+            Some(TokenUsage::default()),
+            "a readable transcript with no usage yet is zero, not unknown"
+        );
+
+        // After the reply, the cumulative total appears.
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"session_meta\",\"payload\":{}}\n\
+             {\"type\":\"response_item\",\"payload\":{\"role\":\"user\"}}\n\
+             {\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":37929,\"cached_input_tokens\":0,\"output_tokens\":496}}}}\n",
+        )
+        .unwrap();
+        let end = parse_token_usage(&transcript).unwrap();
+        assert_eq!(
+            usage_delta(Some(TokenUsage::default()), Some(end)),
+            TokenUsage {
+                input: 37929,
+                output: 496,
+                cache_read: 0
+            }
+        );
+
+        // An unreadable transcript stays unknown — the delta must not claim a
+        // whole session's cumulative total as one turn's spend.
+        assert_eq!(parse_token_usage(&dir.path().join("absent.jsonl")), None);
+        assert_eq!(usage_delta(None, Some(end)), TokenUsage::default());
     }
 
     #[test]

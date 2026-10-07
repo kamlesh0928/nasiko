@@ -430,6 +430,35 @@ impl Client {
         Ok(resp.body_mut().read_json()?)
     }
 
+    // ─── LLM router surface (no /api prefix, agent-scoped credential) ───────
+
+    /// POST a JSON body to a non-`/api` path with an explicit bearer token, returning the
+    /// HTTP status and the raw body without treating a non-2xx as an error. The LLM
+    /// router's `/v1/*` routes authenticate an agent's own routing credential rather than
+    /// the user session (`server/src/lib.rs:388`), and the only caller — the coding-agent
+    /// connect preflight — needs the status itself to tell a rejected configuration apart
+    /// from an unreachable upstream.
+    pub(crate) fn post_raw_with_token<B: Serialize>(
+        &self,
+        path: &str,
+        token: &str,
+        body: &B,
+    ) -> Result<(u16, String)> {
+        let url = self.raw_url(path);
+        let mut resp = self
+            .agent
+            .post(&url)
+            .header("Authorization", &format!("Bearer {token}"))
+            .send_json(body)
+            .context("cannot reach control plane")?;
+        let status = resp.status().as_u16();
+        let body = resp
+            .body_mut()
+            .read_to_string()
+            .with_context(|| format!("unreadable response body from {url}"))?;
+        Ok((status, body))
+    }
+
     pub fn health_check(url: &str) -> Result<()> {
         let agent = Agent::new_with_config(
             ureq::config::Config::builder()

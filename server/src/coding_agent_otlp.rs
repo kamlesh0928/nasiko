@@ -62,6 +62,7 @@ pub async fn export_once(
         };
         let mut event = event;
         event.session.id = row.session_id.clone();
+        relabel_from_router(db, &mut event).await;
         let delivery = async {
             if row.otlp_trace_delivered_at.is_none() {
                 post_json(
@@ -132,6 +133,81 @@ async fn claim_batch(db: &PgPool) -> Result<Vec<ClaimedEvent>, sqlx::Error> {
     .await?;
     tx.commit().await?;
     Ok(claimed)
+}
+
+/// How far outside a turn's own window a router call may sit and still be taken as
+/// part of that turn. The turn's bounds are stamped by the coding agent's hook on the
+/// developer's machine, while `token_usage` is stamped by the server, so the two clocks
+/// can disagree slightly. Kept far below the gap between consecutive turns, so a
+/// neighbouring turn's calls are never pulled in.
+const ROUTER_MATCH_TOLERANCE: chrono::Duration = chrono::Duration::seconds(5);
+
+/// Replace each reported LLM call's `provider`/`model` with what the router actually
+/// used, when the control plane served this turn.
+///
+/// A coding agent's hook can only report what its own config names, and that is wrong
+/// twice over for a routed agent: the provider is guessed from the model string (a
+/// Bedrock-style `anthropic.claude-*` id falls through to `openai`), and tier routing
+/// means the model the client names is often not the one that served the call — a turn
+/// configured for `claude-opus-4-7` is routinely answered by `claude-sonnet-4-6`.
+/// Pricing a sonnet call at opus rates, against the wrong provider's book, is wrong in
+/// both directions.
+///
+/// `token_usage` is the authoritative record: the router writes one row per call with
+/// the provider and model that really served it. When no row matches, the agent did not
+/// route through us (reporting-only install), so the reported labels are left alone.
+async fn relabel_from_router(db: &PgPool, event: &mut CodingAgentEventV1) {
+    if event.turn.llm_calls.is_empty() {
+        return;
+    }
+    let routed = match routed_labels(db, event).await {
+        Ok(routed) => routed,
+        Err(error) => {
+            // Labels are cosmetic next to delivering the span at all; a lookup
+            // failure must not fail the export.
+            tracing::warn!(error = %error, "router relabel lookup failed");
+            return;
+        }
+    };
+    let Some((provider, model)) = routed else {
+        return;
+    };
+    apply_routed_labels(event, &provider, &model);
+}
+
+/// Stamp one `(provider, model)` pair onto every LLM call of a turn.
+fn apply_routed_labels(event: &mut CodingAgentEventV1, provider: &str, model: &str) {
+    for call in &mut event.turn.llm_calls {
+        call.provider = provider.to_string();
+        call.model = model.to_string();
+    }
+}
+
+/// The `(provider, model)` the router used most often within this turn's window.
+///
+/// Modal rather than first: a turn can span several calls, and tier routing may move
+/// between models inside one turn. The event carries a single synthesized LLM call, so
+/// the pair that served most of the turn is the honest single label for it.
+async fn routed_labels(
+    db: &PgPool,
+    event: &CodingAgentEventV1,
+) -> Result<Option<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        r#"SELECT tu.provider, tu.model
+           FROM chat_sessions cs
+           JOIN token_usage tu ON tu.agent_id = cs.agent_id
+           WHERE cs.session_id = $1
+             AND tu.created_at >= $2
+             AND tu.created_at <= $3
+           GROUP BY tu.provider, tu.model
+           ORDER BY count(*) DESC, max(tu.created_at) DESC
+           LIMIT 1"#,
+    )
+    .bind(&event.session.id)
+    .bind(event.turn.started_at - ROUTER_MATCH_TOLERANCE)
+    .bind(event.turn.ended_at + ROUTER_MATCH_TOLERANCE)
+    .fetch_optional(db)
+    .await
 }
 
 async fn mark_trace_delivered(db: &PgPool, row: &ClaimedEvent) -> Result<bool, sqlx::Error> {
@@ -675,6 +751,46 @@ mod tests {
             },
             capture_policy: policy,
         }
+    }
+
+    #[test]
+    fn router_labels_replace_what_the_client_guessed() {
+        // What a routed Codex turn actually reports: the provider guessed from a
+        // Bedrock-style model id (`anthropic.claude-*` falls through to "openai"),
+        // and the model the client is configured for rather than the one tier
+        // routing picked.
+        let mut event = event(CapturePolicy::Content);
+        for call in &mut event.turn.llm_calls {
+            call.provider = "openai".into();
+            call.model = "anthropic.claude-opus-4-7".into();
+        }
+
+        apply_routed_labels(
+            &mut event,
+            "bedrock-provider",
+            "anthropic.claude-sonnet-4-6",
+        );
+
+        for call in &event.turn.llm_calls {
+            assert_eq!(call.provider, "bedrock-provider");
+            assert_eq!(call.model, "anthropic.claude-sonnet-4-6");
+        }
+
+        // The corrected pair is what reaches the span, so the session view prices
+        // against the book that actually served the call.
+        let payload = trace_payload(&event);
+        let chat = spans(&payload)
+            .iter()
+            .find(|span| span["name"].as_str() == Some("chat anthropic.claude-sonnet-4-6"))
+            .expect("chat span carries the routed model");
+        assert_eq!(
+            attr(&chat["attributes"], "gen_ai.provider.name").unwrap()["stringValue"],
+            "bedrock-provider"
+        );
+        assert_eq!(
+            attr(&chat["attributes"], "gen_ai.request.model").unwrap()["stringValue"],
+            "anthropic.claude-sonnet-4-6"
+        );
     }
 
     fn spans(payload: &Value) -> &Vec<Value> {
