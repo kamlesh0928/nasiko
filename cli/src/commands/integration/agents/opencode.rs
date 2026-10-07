@@ -14,7 +14,7 @@ use super::super::catalog::{AgentSpec, Support};
 use super::super::launcher;
 use super::super::model::{LlmCall, SessionSnapshot, ToolCall, Turn};
 
-pub const INSTALL_VERSION: u32 = 4;
+pub const INSTALL_VERSION: u32 = 6;
 pub const SPEC: AgentSpec = AgentSpec {
     id: "opencode",
     display_name: "OpenCode",
@@ -28,7 +28,7 @@ const PLUGIN_NAME: &str = "nasiko-session-report.js";
 #[derive(Debug, Deserialize)]
 struct HookPayload {
     session_id: String,
-    messages: Vec<Message>,
+    messages: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,10 +142,11 @@ pub fn snapshot(raw: &str) -> Result<SessionSnapshot> {
             raw.chars().take(200).collect::<String>()
         )
     })?;
+    let messages = normalize_messages(payload.messages)?;
     Ok(SessionSnapshot {
         session_id: payload.session_id,
         title: None,
-        turns: turns_from_messages(&payload.messages),
+        turns: turns_from_messages(&messages),
     })
 }
 
@@ -166,26 +167,38 @@ fn plugin_body(script: &Path) -> String {
     let script = serde_json::to_string(&script.to_string_lossy()).expect("serializable path");
     format!(
         r#"// Managed by nasiko - do not edit. nasiko-hook-version: {INSTALL_VERSION}
-export const NasikoSessionReporter = async ({{ client }}) => ({{
-  event: async ({{ event }}) => {{
-    if (event.type !== "session.idle") return
-    try {{
-      const response = await client.session.messages({{ path: {{ id: event.properties.sessionID }} }})
-      if (!response.data) return
-      const payload = JSON.stringify({{ session_id: event.properties.sessionID, messages: response.data }})
-      const process = Bun.spawn([{script}], {{
-        stdin: new TextEncoder().encode(payload), stdout: "ignore", stderr: "ignore",
-      }})
-      const completed = await Promise.race([
-        process.exited.then(() => true),
-        Bun.sleep(8000).then(() => false),
-      ])
-      if (!completed) process.unref()
-    }} catch {{
-      // Telemetry must never interrupt the coding session.
-    }}
+export default {{
+  id: "nasiko.session-report",
+  setup(ctx) {{
+    const controller = new AbortController()
+    void (async () => {{
+      try {{
+        for await (const event of ctx.event.subscribe({{ signal: controller.signal }})) {{
+          if (event.type !== "session.idle" && event.type !== "session.step.ended") continue
+          const sessionID = event.data?.sessionID
+          if (!sessionID) continue
+          try {{
+            const messages = await ctx.session.context({{ sessionID }})
+            const payload = JSON.stringify({{ session_id: sessionID, messages }})
+            const process = Bun.spawn([{script}], {{
+              stdin: new TextEncoder().encode(payload), stdout: "ignore", stderr: "ignore",
+            }})
+            const completed = await Promise.race([
+              process.exited.then(() => true),
+              Bun.sleep(8000).then(() => false),
+            ])
+            if (!completed) process.unref()
+          }} catch {{
+            // Telemetry must never interrupt the coding session.
+          }}
+        }}
+      }} catch {{
+        // Aborting the subscription during unload is expected.
+      }}
+    }})()
+    return () => controller.abort()
   }},
-}})
+}}
 "#
     )
 }
@@ -193,6 +206,144 @@ export const NasikoSessionReporter = async ({{ client }}) => ({{
 fn plugin_targets_script(body: &str, script: &Path) -> bool {
     let script = serde_json::to_string(&script.to_string_lossy()).expect("serializable path");
     body.contains(&format!("Bun.spawn([{script}]"))
+}
+
+fn normalize_messages(mut values: Vec<Value>) -> Result<Vec<Message>> {
+    // V2's session context is newest-first, while turn ownership is established
+    // by encountering the user message before its assistant responses.
+    values.sort_by_key(|value| {
+        value
+            .pointer("/info/time/created")
+            .or_else(|| value.pointer("/time/created"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default()
+    });
+    let mut messages = Vec::new();
+    let mut parent_id = None;
+    for value in values {
+        if value.get("info").is_some() {
+            let message: Message = serde_json::from_value(value)
+                .context("OpenCode V1 session message has an unexpected shape")?;
+            if message.info.role == "user" {
+                parent_id = Some(message.info.id.clone());
+            }
+            messages.push(message);
+            continue;
+        }
+
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        match kind {
+            "user" => {
+                parent_id = Some(id.clone());
+                messages.push(Message {
+                    info: MessageInfo {
+                        id,
+                        role: "user".into(),
+                        parent_id: None,
+                        provider_id: None,
+                        model_id: None,
+                        finish: None,
+                        summary: None,
+                        error: None,
+                        time: serde_json::from_value(value["time"].clone()).unwrap_or_default(),
+                        tokens: Tokens::default(),
+                    },
+                    parts: vec![Part {
+                        kind: "text".into(),
+                        text: value.get("text").and_then(Value::as_str).map(str::to_owned),
+                        ignored: false,
+                        synthetic: false,
+                        call_id: None,
+                        tool: None,
+                        name: None,
+                        message_id: None,
+                        state: None,
+                    }],
+                });
+            }
+            "assistant" => {
+                let parts = value
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                        Some("text") => Some(Part {
+                            kind: "text".into(),
+                            text: part.get("text").and_then(Value::as_str).map(str::to_owned),
+                            ignored: false,
+                            synthetic: false,
+                            call_id: None,
+                            tool: None,
+                            name: None,
+                            message_id: None,
+                            state: None,
+                        }),
+                        Some("tool") => {
+                            let mut state = part.get("state").cloned().unwrap_or(Value::Null);
+                            if let (Some(state), Some(content)) = (
+                                state.as_object_mut(),
+                                part.get("state").and_then(|s| s.get("content")),
+                            ) {
+                                state.entry("output").or_insert_with(|| content.clone());
+                            }
+                            if let (Some(state), Some(time)) =
+                                (state.as_object_mut(), part.get("time"))
+                            {
+                                state.entry("time").or_insert_with(|| time.clone());
+                            }
+                            Some(Part {
+                                kind: "tool".into(),
+                                text: None,
+                                ignored: false,
+                                synthetic: false,
+                                call_id: part.get("id").and_then(Value::as_str).map(str::to_owned),
+                                tool: part.get("name").and_then(Value::as_str).map(str::to_owned),
+                                name: None,
+                                message_id: Some(id.clone()),
+                                state: Some(state),
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                messages.push(Message {
+                    info: MessageInfo {
+                        id,
+                        role: "assistant".into(),
+                        parent_id: parent_id.clone(),
+                        provider_id: value
+                            .pointer("/model/providerID")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        model_id: value
+                            .pointer("/model/id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        finish: value
+                            .get("finish")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        summary: None,
+                        error: value.get("error").cloned(),
+                        time: serde_json::from_value(value["time"].clone()).unwrap_or_default(),
+                        tokens: serde_json::from_value(value["tokens"].clone()).unwrap_or_default(),
+                    },
+                    parts,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(messages)
 }
 
 fn turns_from_messages(messages: &[Message]) -> Vec<Turn> {
@@ -413,7 +564,12 @@ mod tests {
     #[test]
     fn plugin_bounds_its_wait_for_the_reporter() {
         let body = plugin_body(Path::new("/tmp/report script"));
+        assert!(body.contains("export default"));
+        assert!(body.contains("id: \"nasiko.session-report\""));
+        assert!(body.contains("setup(ctx)"));
         assert!(body.contains("session.idle"));
+        assert!(body.contains("session.step.ended"));
+        assert!(body.contains("ctx.session.context"));
         assert!(body.contains("process.exited.then"));
         assert_eq!(launcher::version_marker(&body), Some(INSTALL_VERSION));
         assert!(body.contains("Bun.sleep(8000)"));
@@ -423,6 +579,22 @@ mod tests {
             Path::new("/tmp/report script")
         ));
         assert!(!plugin_targets_script(&body, Path::new("/tmp/old script")));
+    }
+
+    #[test]
+    fn parses_v2_session_context() {
+        let payload = r#"{"session_id":"s","messages":[
+          {"id":"msg_a","type":"assistant","time":{"created":1100,"completed":1500},"agent":"build","model":{"providerID":"openai","id":"gpt-5"},"finish":"stop","tokens":{"input":10,"output":4,"reasoning":1,"cache":{"read":2,"write":3}},"content":[
+            {"type":"tool","id":"call-1","name":"shell","time":{"created":1200,"completed":1300},"state":{"status":"completed","input":{"command":"redacted"},"content":[{"type":"text","text":"ok"}]}},
+            {"type":"text","text":"Done"}
+          ]},
+          {"id":"msg_u","type":"user","time":{"created":1000},"text":"Do it"}
+        ]}"#;
+        let snapshot = snapshot(payload).unwrap();
+        assert_eq!(snapshot.turns.len(), 1);
+        assert_eq!(snapshot.turns[0].response.as_deref(), Some("Done"));
+        assert_eq!(snapshot.turns[0].calls[0].output_tokens, 5);
+        assert_eq!(snapshot.turns[0].tool_calls[0].id, "call-1");
     }
 
     #[test]
