@@ -30,10 +30,13 @@ describe('Sessions', () => {
     )
   }
 
+  // The agent link ("Open <agent>"), not the row's Open chat / Open flow links (plans/feat-flows.md F19).
+  const AGENT_LINK = /^Open (?!chat$|flow$|latest flow$)/
+
   it('an expanded row links to its agent', async () => {
     renderApp('/sessions?live=paused')
     await expandFirst()
-    const link = await screen.findByRole('link', { name: /^Open / })
+    const link = await screen.findByRole('link', { name: AGENT_LINK })
     expect(link.getAttribute('href')).toMatch(/^\/agents\/[0-9a-f-]{36}$/)
   })
 
@@ -42,7 +45,7 @@ describe('Sessions', () => {
     renderApp('/sessions?live=paused')
     await expandFirst()
     await screen.findByRole('button', { name: /logs$/ })
-    expect(screen.queryByRole('link', { name: /^Open / })).toBeNull()
+    expect(screen.queryByRole('link', { name: AGENT_LINK })).toBeNull()
   })
 })
 

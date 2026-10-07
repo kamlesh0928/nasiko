@@ -23,6 +23,8 @@ export const MOCKABLE = [
   'providers',
   'top-traces',
   'savings',
+  // Before observability and chat: it answers its own flows' traces and flow ids, and passes the rest on.
+  'flows',
   'observability',
   'harnesses',
   'chat',
@@ -114,6 +116,15 @@ export function readEnv(
       '[ui-lab] VITE_NASIKO_MOCK: "workflows" needs "agents" too; ignoring "workflows" (use VITE_NASIKO_MOCK=workflows,agents).',
     )
     partialMocks = partialMocks.filter((s) => s !== 'workflows')
+  }
+
+  // Flows name seed agents and their traces carry seed agent ids (plans/feat-flows.md): without the agents mock the
+  // lanes and Open agent links would point at agents the real server doesn't have.
+  if (partialMocks.includes('flows') && !partialMocks.includes('agents')) {
+    console.warn(
+      '[ui-lab] VITE_NASIKO_MOCK: "flows" needs "agents" too; ignoring "flows" (use VITE_NASIKO_MOCK=flows,agents).',
+    )
+    partialMocks = partialMocks.filter((s) => s !== 'flows')
   }
 
   // The Optimization page's savings reads are built from the seed agents (their switches, names and chats), so without

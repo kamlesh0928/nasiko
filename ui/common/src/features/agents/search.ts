@@ -1,5 +1,5 @@
-import { z } from 'zod'
-import { flag, text } from '@/lib/search'
+import { z } from 'zod/mini'
+import { flag, opt, text } from '@/lib/search'
 
 /**
  * URL state for the agent pages (plan §7). Junk values fall back instead of throwing, so a
@@ -7,12 +7,12 @@ import { flag, text } from '@/lib/search'
  */
 export const catalogSearchSchema = z.object({
   /** Untrimmed while typing (trimming here would eat the space between words); matching trims. */
-  q: z.string().max(200).optional().catch(undefined),
-  tag: text.optional().catch(undefined),
-  harnesses: flag.optional().catch(undefined),
-  yours: flag.optional().catch(undefined),
+  q: opt(z.string().check(z.maxLength(200))),
+  tag: opt(text),
+  harnesses: opt(flag),
+  yours: opt(flag),
   /** The Overview's Fleet health count links here (overview design 15A, 16B); computed by `useFleetHealth` (eng R1). */
-  health: z.enum(['healthy', 'watch', 'action', 'unknown']).optional().catch(undefined),
+  health: opt(z.enum(['healthy', 'watch', 'action', 'unknown'])),
 })
 export type CatalogSearch = z.infer<typeof catalogSearchSchema>
 
@@ -25,10 +25,10 @@ export const MINE_TABS = [
   'harnesses',
 ] as const
 export const mineSearchSchema = z.object({
-  tab: z.enum(MINE_TABS).optional().catch(undefined),
-  harnesses: flag.optional().catch(undefined),
+  tab: opt(z.enum(MINE_TABS)),
+  harnesses: opt(flag),
   /** Superusers only: whose agents to list (a UUID). */
-  owner: z.string().uuid().optional().catch(undefined),
+  owner: opt(z.uuid()),
 })
 export type MineSearch = z.infer<typeof mineSearchSchema>
 
@@ -44,7 +44,7 @@ export const DETAIL_TABS = [
 export type DetailTab = (typeof DETAIL_TABS)[number]
 /** Unknown tab values are kept as strings so the page can fall back to Overview with replace-history. */
 export const detailSearchSchema = z.object({
-  tab: z.string().trim().max(40).optional().catch(undefined),
+  tab: opt(z.string().check(z.trim(), z.maxLength(40))),
 })
 
 /**

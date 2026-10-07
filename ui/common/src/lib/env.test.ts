@@ -82,6 +82,19 @@ describe('env', () => {
         .partialMocks,
     ).not.toContain('chat')
   })
+  it('the flows mock needs the agents mock (its lanes and links name seed agents)', () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    expect(
+      readEnv({ VITE_NASIKO_API_MODE: 'live', VITE_NASIKO_MOCK: 'flows', DEV: true }).partialMocks,
+    ).toEqual([])
+    expect(
+      readEnv({
+        VITE_NASIKO_API_MODE: 'live',
+        VITE_NASIKO_MOCK: 'flows,agents',
+        DEV: true,
+      }).partialMocks.sort(),
+    ).toEqual(['agents', 'flows'])
+  })
   it('the optimization mock needs the agents mock (its savings describe seed agents)', () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {})
     expect(

@@ -1,5 +1,5 @@
-import { z } from 'zod'
-import { flag, isoDate, PRESETS } from '@/lib/search'
+import { z } from 'zod/mini'
+import { fallback, flag, isoDate, opt, PRESETS } from '@/lib/search'
 
 /**
  * Harnesses URL state (plan §3): the core's keys. Junk values fall back instead of throwing, so a stale link still
@@ -45,6 +45,8 @@ export const HARNESS_MOCK_VARIANTS = [
   'optimization-classic',
   'optimization-no-reports',
   'optimization-down',
+  'flows-empty',
+  'flows-absent',
   // Chat page variants (v1c DX1); harmless here, listed so the lists stay equal.
   'no-agents',
   'many-chats',
@@ -68,16 +70,16 @@ export const HARNESS_MOCK_VARIANTS = [
   'router-budgets-fail',
 ] as const
 
-const id = z.string().trim().min(1).max(100)
+const id = z.string().check(z.trim(), z.minLength(1), z.maxLength(100))
 
 export const harnessesSearchSchema = z.looseObject({
-  preset: z.enum(PRESETS).default('30d').catch('30d'),
-  from: isoDate.optional().catch(undefined),
-  to: isoDate.optional().catch(undefined),
-  compare: flag.optional().catch(undefined),
-  harness: id.optional().catch(undefined),
-  anchor: isoDate.optional().catch(undefined),
-  mock: z.enum(HARNESS_MOCK_VARIANTS).optional().catch(undefined),
+  preset: fallback(z.enum(PRESETS), '30d'),
+  from: opt(isoDate),
+  to: opt(isoDate),
+  compare: opt(flag),
+  harness: opt(id),
+  anchor: opt(isoDate),
+  mock: opt(z.enum(HARNESS_MOCK_VARIANTS)),
 })
 
 export type HarnessesSearch = z.infer<typeof harnessesSearchSchema>

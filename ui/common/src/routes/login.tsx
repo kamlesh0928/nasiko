@@ -4,7 +4,7 @@ import { ArrowRight, CircleAlert, Eye, EyeOff } from 'lucide-react'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
-import { z } from 'zod'
+import { z } from 'zod/mini'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Field, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field'
@@ -40,23 +40,24 @@ import {
   withSessionLock,
 } from '@/lib/session'
 import { env } from '@/lib/env'
+import { opt } from '@/lib/search'
 
 export const Route = createFileRoute('/login')({
   validateSearch: z.object({
-    redirect: z.string().optional().catch(undefined),
-    expired: z.union([z.boolean(), z.string()]).optional().catch(undefined),
+    redirect: opt(z.string()),
+    expired: opt(z.union([z.boolean(), z.string()])),
     // Set by sign out when the logout call failed or timed out (plans/feat-app-shell.md eng D6).
-    signout: z.literal('failed').optional().catch(undefined),
+    signout: opt(z.literal('failed')),
     // Set by Settings when a password change came back without a new session (plans/feat-settings.md §1.1).
-    password: z.literal('changed').optional().catch(undefined),
+    password: opt(z.literal('changed')),
   }),
   component: LoginPage,
 })
 
 /** The login form. No LeaveGuard: it navigates on success, and a half-typed password isn't worth guarding. */
 const loginSchema = z.object({
-  username: z.string().min(1, copy.login.usernameRequired),
-  password: z.string().min(1, copy.login.passwordRequired),
+  username: z.string().check(z.minLength(1, copy.login.usernameRequired)),
+  password: z.string().check(z.minLength(1, copy.login.passwordRequired)),
 })
 type LoginValues = z.infer<typeof loginSchema>
 

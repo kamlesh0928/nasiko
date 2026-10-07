@@ -17,14 +17,17 @@ describe('nav items', () => {
     const now = NAV_ITEMS.map(({ to, label, shared }) => ({ to, label, shared }))
     for (const old of OLD_NAV) expect(now).toContainEqual(old)
     // Added since: the Overview (plans/feat-overview.md §3), Workflows (plans/feat-workflows.md §1), the LLM router
-    // (plans/feat-llm-router.md §4), MCP servers (plans/feat-mcp.md §1) and Optimization (plans/feat-optimization-page.md
-    // P7). Deploy and Builds are Agents' sub-pages and Settings is a footer row (sidebar review 2026-10-01).
+    // (plans/feat-llm-router.md §4), MCP servers (plans/feat-mcp.md §1), Flows (plans/feat-flows.md F1) and Optimization
+    // (plans/feat-optimization-page.md P7). Deploy and Builds are Agents' sub-pages. The workspace's Settings is the
+    // Organization group's item; the account's own settings (/account) open from the account menu.
     expect(now.filter((n) => !OLD_NAV.some((o) => o.to === n.to))).toEqual([
       { to: '/', label: 'Overview', shared: false },
       { to: '/workflows', label: 'Workflows', shared: false },
       { to: '/router', label: 'LLM router', shared: false },
       { to: '/mcp', label: 'MCP servers', shared: false },
+      { to: '/flows', label: 'Flows', shared: false },
       { to: '/optimization', label: 'Optimization', shared: true },
+      { to: '/settings', label: 'Settings', shared: false },
     ])
   })
 
@@ -34,6 +37,7 @@ describe('nav items', () => {
       ['fleet', 'Fleet'],
       ['connect', 'Connect'],
       ['observe', 'Observe'],
+      ['org', 'Organization'],
       ['lab', 'Lab'],
     ])
     expect(NAV_ITEMS.map((n) => n.label)).toEqual([
@@ -44,9 +48,11 @@ describe('nav items', () => {
       'LLM router',
       'MCP servers',
       'Sessions',
+      'Flows',
       'TokenOps',
       'Optimization',
       'Harnesses',
+      'Settings',
     ])
     // Items of one group are contiguous and follow the group order.
     const order = NAV_ITEMS.map((n) => NAV_GROUPS.findIndex((g) => g.id === n.group))
@@ -83,12 +89,13 @@ describe('nav items', () => {
     expect(activeItem('/')?.label).toBe('Overview')
     expect(activeItem('/status')).toBeUndefined()
     expect(activeItem('/chatter')).toBeUndefined()
-    // Agents owns Deploy and Builds (its sub-nav); Settings is the footer's row, not a nav item.
+    // Agents owns Deploy and Builds (its sub-nav); account settings are the account menu's, not a nav item.
     expect(activeItem('/deploy')?.label).toBe('Agents')
     expect(activeItem('/builds')?.label).toBe('Agents')
     expect(activeItem('/builds/5eed000b-0000-4000-8000-000000000001')?.label).toBe('Agents')
     expect(activeItem('/buildsx')).toBeUndefined()
-    expect(activeItem('/settings/secrets')).toBeUndefined()
+    expect(activeItem('/settings/secrets')?.label).toBe('Settings')
+    expect(activeItem('/account/password')).toBeUndefined()
   })
 
   it('Back from a panel goes to the newest page outside its module, search and all', () => {

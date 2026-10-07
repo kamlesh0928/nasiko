@@ -1,7 +1,7 @@
 /**
  * The app's left sidebar (plans/feat-app-shell.md §3–§4): the header (OpenRuntime home link, collapse), the nav groups
  * from `nav.ts` or a page's drill-in panel (`SidebarPanel`: Chat's history, Settings' sections), and the footer
- * (status in local builds, account; Settings opens from the account menu). Built on shadcn's sidebar primitive.
+ * (status in local builds, account; account settings open from the account menu). Built on shadcn's sidebar primitive.
  */
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate, useRouter, useRouterState } from '@tanstack/react-router'
@@ -213,9 +213,9 @@ export function AppSidebar({
 /** Over a page's panel: the way back to the app nav (the panel itself is the slot below it). */
 const TRAIL_LENGTH = 20
 
-/** The page's name for "Back to …": its nav item, or Settings / Status (account menu, footer row); null when it has none. */
+/** The page's name for "Back to …": its nav item, or Account settings / Status (account menu, footer row); null when it has none. */
 function labelFor(path: string, items: readonly AnyNavItem[]): string | null {
-  if (moduleOf(path) === 'settings') return copy.nav.settings
+  if (moduleOf(path) === 'account') return copy.account.settings
   if (path === '/status') return copy.statusPage
   return activeItem(path, items)?.label ?? null
 }
@@ -570,13 +570,13 @@ function AccountMenu({ onPick }: { onPick(): void }) {
               <RotateCw aria-hidden /> {copy.account.retry}
             </DropdownMenuItem>
           ) : null}
-          {/* The quick switch; Settings → Account → Appearance has the same choices with previews. */}
+          {/* The quick switch; Account settings → Appearance has the same choices with previews. */}
           <ThemeSubmenu />
           <DropdownMenuSeparator />
-          {/* Change password lives in Settings → Account. */}
+          {/* Appearance and Change password live in account settings (/account). */}
           <DropdownMenuItem asChild>
             <Link
-              to="/settings"
+              to="/account/appearance"
               onClick={() => {
                 navigated.current = true
                 setOpenMobile(false)

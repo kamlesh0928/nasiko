@@ -1,6 +1,6 @@
-import { z } from 'zod'
+import { z } from 'zod/mini'
 import { sharedSearchSchema } from '@/app/shell/context'
-import { flag, isoDate } from '@/lib/search'
+import { fallback, flag, isoDate, opt } from '@/lib/search'
 
 /**
  * Everything the TokenOps page shows is driven by these URL search params
@@ -40,21 +40,22 @@ export function toggleOpen(open: string | undefined, id: Disclosure): string | u
 }
 
 /** The shared context (app/shell/context.ts) plus TokenOps' own keys. */
-export const tokenopsSearchSchema = sharedSearchSchema.extend({
-  view: z.enum(['agent', 'workflow']).default('agent').catch('agent'),
-  sort: z.enum(SORTS).default('cost').catch('cost'),
+export const tokenopsSearchSchema = z.extend(sharedSearchSchema, {
+  view: fallback(z.enum(['agent', 'workflow']), 'agent'),
+  sort: fallback(z.enum(SORTS), 'cost'),
   /** Truncated, never discarded: a long query must not clear the box while typing. */
-  q: z
-    .string()
-    .transform((s) => s.slice(0, 200))
-    .optional()
-    .catch(undefined),
+  q: opt(
+    z.pipe(
+      z.string(),
+      z.transform((s) => s.slice(0, 200)),
+    ),
+  ),
   /** Selected day for the day panel (UTC date). */
-  day: isoDate.optional().catch(undefined),
-  traces: flag.optional().catch(undefined),
-  more: flag.optional().catch(undefined),
+  day: opt(isoDate),
+  traces: opt(flag),
+  more: opt(flag),
   /** Open disclosures: CSV of DISCLOSURES, or `all`. Unknown ids are dropped. */
-  open: z.string().transform(parseOpen).optional().catch(undefined),
+  open: opt(z.pipe(z.string(), z.transform(parseOpen))),
 })
 
 export type TokenopsSearch = z.infer<typeof tokenopsSearchSchema>

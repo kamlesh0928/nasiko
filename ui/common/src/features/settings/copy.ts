@@ -6,7 +6,9 @@
 import type { SecretNameProblem } from './logic'
 
 export const copy = {
-  title: 'Settings',
+  title: 'Organization settings',
+  // The account menu's Settings (/account): Appearance and Password.
+  accountTitle: 'Account settings',
   nav: {
     label: 'Settings sections',
     workspace: 'Workspace',
@@ -23,7 +25,7 @@ export const copy = {
   required: 'Enter a value.',
   positiveInt: 'Enter a whole number of 1 or more.',
 
-  // Settings → Account → Appearance (/settings/appearance): every user, stored in this browser only (theme.ts).
+  // Account settings → Appearance (/account/appearance): every user, stored in this browser only (theme.ts).
   appearance: {
     label: 'Appearance',
     sub: 'How Nasiko looks in this browser.',
@@ -35,7 +37,7 @@ export const copy = {
 
   // Settings → Workspace → Optimization tiers (/settings/optimization-tiers): its words are in features/optimization.
   optimizationTiers: { label: 'Optimization tiers' },
-  // Settings → Account → Password (/settings/password), worded as nasiko-cloud-rs `43833316`
+  // Account settings → Password (/account/password), worded as nasiko-cloud-rs `43833316`
   // ui/common/features/change-password-modal.js.
   password: {
     label: 'Password',

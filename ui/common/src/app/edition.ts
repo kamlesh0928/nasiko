@@ -69,7 +69,25 @@ export interface Slots {
    * plans/feat-optimization-page.md R5B). Superusers only, like the footer. Each renders a `WorkspaceRow` or nothing.
    */
   optimizationWorkspace: ComponentType | null
+  /** Sidebar items to hide for this viewer (EE: Access control below `can_read_org`). */
+  navHidden: NavHidden | null
 }
+
+/**
+ * One query and the items to hide given its data (`undefined` while it loads). The shell runs the query from its lazy
+ * route chunk, so a layer's entry code needs no query hooks (they'd cost the EE shell ~3 KB gz). Build it with
+ * `navHidden()`, which pairs the query's data type with `hidden`.
+ */
+export interface NavHidden<T = unknown> {
+  query: {
+    queryKey: readonly unknown[]
+    queryFn: (ctx: { signal: AbortSignal }) => Promise<T>
+    staleTime?: number
+  }
+  hidden: (data: T | undefined) => readonly string[]
+}
+
+export const navHidden = <T>(n: NavHidden<T>) => n as NavHidden
 
 /** The core's answer for every slot: an OSS build renders exactly this. */
 export const OSS_SLOTS: Slots = {
@@ -81,6 +99,7 @@ export const OSS_SLOTS: Slots = {
   topbarStart: null,
   shellEnd: null,
   optimizationWorkspace: null,
+  navHidden: null,
 }
 
 /** A layer's own sidebar item: any path its routes serve. */
@@ -124,6 +143,7 @@ export function resolveSlots(layers: readonly EditionLayer[]): Slots {
     if (s.topbarStart !== undefined) out.topbarStart = s.topbarStart
     if (s.shellEnd !== undefined) out.shellEnd = s.shellEnd
     if (s.optimizationWorkspace !== undefined) out.optimizationWorkspace = s.optimizationWorkspace
+    if (s.navHidden !== undefined) out.navHidden = s.navHidden
   }
   return out
 }

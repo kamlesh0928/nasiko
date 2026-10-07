@@ -1,14 +1,8 @@
-import { createFileRoute } from '@tanstack/react-router'
-import { PasswordPage } from '@/features/settings/PasswordPage'
-import { SettingsLayout } from '@/features/settings/SettingsLayout'
+import { createFileRoute, redirect } from '@tanstack/react-router'
 
-// Every user's own account: no superuser gate, unlike the workspace sections.
-export const Route = createFileRoute('/_app/settings/password')({ component: PasswordRoute })
-
-function PasswordRoute() {
-  return (
-    <SettingsLayout>
-      <PasswordPage />
-    </SettingsLayout>
-  )
-}
+// Account settings moved out of the workspace's Settings to /account (account menu → Settings): old links land there.
+export const Route = createFileRoute('/_app/settings/password')({
+  beforeLoad: () => {
+    throw redirect({ to: '/account/password', replace: true })
+  },
+})

@@ -1,4 +1,5 @@
-import { z } from 'zod'
+import { z } from 'zod/mini'
+import { opt } from '@/lib/search'
 
 /**
  * URL state for the router page (plan §4.1): the open tab (Agents when absent) and the summary tiles' filter. A junk
@@ -11,7 +12,7 @@ export const ROUTER_TABS = ['agents', 'configs', 'providers'] as const
 export type RouterTab = (typeof ROUTER_TABS)[number]
 
 export const routerSearchSchema = z.object({
-  tab: z.enum(['configs', 'providers']).optional().catch(undefined),
-  source: z.enum(ROUTER_SOURCES).optional().catch(undefined),
+  tab: opt(z.enum(['configs', 'providers'])),
+  source: opt(z.enum(ROUTER_SOURCES)),
 })
 export type RouterSearch = z.infer<typeof routerSearchSchema>

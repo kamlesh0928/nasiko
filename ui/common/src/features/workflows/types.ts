@@ -75,6 +75,8 @@ const stepResultSchema = z.looseObject({
   extracted_info: nullableString,
   tokens_used: z.number().optional(),
   latency_ms: z.number().optional(),
+  /** The step's trace, which is its flow's id (`maf/types.rs` `StepResult.trace_id`; plans/feat-flows.md O2). */
+  trace_id: nullableString,
 })
 export type StepResult = z.infer<typeof stepResultSchema>
 

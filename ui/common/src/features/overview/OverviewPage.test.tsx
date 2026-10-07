@@ -7,6 +7,7 @@ import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { afterEach, describe, expect, it } from 'vitest'
 import { clearChatRegistry } from '@/features/chat/registry'
+import { apiFetch } from '@/lib/api/client'
 import { configureMocks } from '@/mocks/handlers'
 import { configureChatMock } from '@/mocks/chatStore'
 import { now, seed, setupPinnedSeed } from '@/test/pinnedSeed'
@@ -159,6 +160,65 @@ describe('Needs you', () => {
     expect(screen.getByTestId('headline-attention')).toHaveTextContent(
       new RegExp(`${waiting} requests? (is|are) waiting for you`),
     )
+  })
+
+  it('a request row links its chat’s paused flow, without a second row (plans/feat-flows.md O2)', async () => {
+    configureChatMock({ waiting: true })
+    // The paused flows, one per chat with a pending request (as the server would have for those pauses).
+    server.use(
+      http.get('/api/flows', async ({ request }) => {
+        if (new URL(request.url).searchParams.get('status') !== 'paused') return undefined
+        const pending = await apiFetch<{
+          data?: { execution: { chat_session_id: string | null } }[]
+        }>('/api/hitl/pending')
+        const chats = [
+          ...new Set((pending.data ?? []).flatMap((r) => r.execution.chat_session_id ?? [])),
+        ]
+        return HttpResponse.json({
+          data: chats.map((c, i) => ({
+            flow_id: `5eedf00000000000000000000000${String(i).padStart(4, '0')}`,
+            status: 'paused',
+            root_agent_name: 'orchestrator',
+            metadata: { context_id: c },
+            created_at: '2026-03-20T14:00:00Z',
+          })),
+          total: chats.length,
+        })
+      }),
+    )
+    renderApp('/')
+    await settled()
+    const rows = within(needs())
+      .getAllByRole('listitem')
+      .filter((li) => li.querySelector('[data-kind="request"]'))
+    expect(rows.length).toBeGreaterThan(0)
+    await waitFor(() =>
+      expect(within(rows[0]!).getByRole('link', { name: 'Open flow' })).toHaveAttribute(
+        'href',
+        expect.stringMatching(/^\/flows\/5eedf/),
+      ),
+    )
+    // Still one row per chat: no paused-flow rows of their own.
+    expect(needs().querySelectorAll('[data-kind="flow"]')).toHaveLength(0)
+  })
+
+  it('a failed paused-flows read only means no flow links: the inbox still shows (O2a)', async () => {
+    configureChatMock({ waiting: true })
+    server.use(
+      http.get('/api/flows', ({ request }) =>
+        new URL(request.url).searchParams.get('status') === 'paused'
+          ? new HttpResponse('internal error', { status: 500 })
+          : undefined,
+      ),
+    )
+    renderApp('/')
+    await settled()
+    const rows = within(needs())
+      .getAllByRole('listitem')
+      .filter((li) => li.querySelector('[data-kind="request"]'))
+    expect(rows.length).toBeGreaterThan(0)
+    expect(within(needs()).queryByRole('link', { name: 'Open flow' })).toBeNull()
+    expect(within(needs()).queryByText(/flows/i)).toBeNull()
   })
 
   it('a normal user gets one "outside Chat" row for requests no chat claims (eng R5)', async () => {

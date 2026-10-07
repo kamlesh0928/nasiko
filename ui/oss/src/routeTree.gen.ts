@@ -18,6 +18,8 @@ import { Route as AppOptimizationRouteImport } from './../../common/src/routes/_
 import { Route as AppRouterRouteImport } from './../../common/src/routes/_app/router'
 import { Route as AppStatusRouteImport } from './../../common/src/routes/_app/status'
 import { Route as AppTokenopsRouteImport } from './../../common/src/routes/_app/tokenops'
+import { Route as AppAccountAppearanceRouteImport } from './../../common/src/routes/_app/account.appearance'
+import { Route as AppAccountPasswordRouteImport } from './../../common/src/routes/_app/account.password'
 import { Route as AppAgentsIndexRouteImport } from './../../common/src/routes/_app/agents.index'
 import { Route as AppAgentsAgentIdRouteImport } from './../../common/src/routes/_app/agents.$agentId'
 import { Route as AppAgentsMineRouteImport } from './../../common/src/routes/_app/agents.mine'
@@ -25,6 +27,8 @@ import { Route as AppBuildsIndexRouteImport } from './../../common/src/routes/_a
 import { Route as AppBuildsBuildIdRouteImport } from './../../common/src/routes/_app/builds.$buildId'
 import { Route as AppChatIndexRouteImport } from './../../common/src/routes/_app/chat.index'
 import { Route as AppChatSessionIdRouteImport } from './../../common/src/routes/_app/chat.$sessionId'
+import { Route as AppFlowsIndexRouteImport } from './../../common/src/routes/_app/flows.index'
+import { Route as AppFlowsFlowIdRouteImport } from './../../common/src/routes/_app/flows.$flowId'
 import { Route as AppMcpIndexRouteImport } from './../../common/src/routes/_app/mcp.index'
 import { Route as AppMcpConnectorIdRouteImport } from './../../common/src/routes/_app/mcp.$connectorId'
 import { Route as AppSessionsIndexRouteImport } from './../../common/src/routes/_app/sessions.index'
@@ -86,6 +90,16 @@ const AppTokenopsRoute = AppTokenopsRouteImport.update({
   path: '/tokenops',
   getParentRoute: () => AppRoute,
 } as any)
+const AppAccountAppearanceRoute = AppAccountAppearanceRouteImport.update({
+  id: '/account/appearance',
+  path: '/account/appearance',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppAccountPasswordRoute = AppAccountPasswordRouteImport.update({
+  id: '/account/password',
+  path: '/account/password',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppAgentsIndexRoute = AppAgentsIndexRouteImport.update({
   id: '/agents/',
   path: '/agents/',
@@ -119,6 +133,16 @@ const AppChatIndexRoute = AppChatIndexRouteImport.update({
 const AppChatSessionIdRoute = AppChatSessionIdRouteImport.update({
   id: '/chat/$sessionId',
   path: '/chat/$sessionId',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppFlowsIndexRoute = AppFlowsIndexRouteImport.update({
+  id: '/flows/',
+  path: '/flows/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppFlowsFlowIdRoute = AppFlowsFlowIdRouteImport.update({
+  id: '/flows/$flowId',
+  path: '/flows/$flowId',
   getParentRoute: () => AppRoute,
 } as any)
 const AppMcpIndexRoute = AppMcpIndexRouteImport.update({
@@ -212,10 +236,13 @@ export interface FileRoutesByFullPath {
   '/router': typeof AppRouterRoute
   '/status': typeof AppStatusRoute
   '/tokenops': typeof AppTokenopsRoute
+  '/account/appearance': typeof AppAccountAppearanceRoute
+  '/account/password': typeof AppAccountPasswordRoute
   '/agents/$agentId': typeof AppAgentsAgentIdRoute
   '/agents/mine': typeof AppAgentsMineRoute
   '/builds/$buildId': typeof AppBuildsBuildIdRoute
   '/chat/$sessionId': typeof AppChatSessionIdRoute
+  '/flows/$flowId': typeof AppFlowsFlowIdRoute
   '/mcp/$connectorId': typeof AppMcpConnectorIdRoute
   '/sessions/$sessionId': typeof AppSessionsSessionIdRoute
   '/settings/appearance': typeof AppSettingsAppearanceRoute
@@ -231,6 +258,7 @@ export interface FileRoutesByFullPath {
   '/agents/': typeof AppAgentsIndexRoute
   '/builds/': typeof AppBuildsIndexRoute
   '/chat/': typeof AppChatIndexRoute
+  '/flows/': typeof AppFlowsIndexRoute
   '/mcp/': typeof AppMcpIndexRoute
   '/sessions/': typeof AppSessionsIndexRoute
   '/settings/': typeof AppSettingsIndexRoute
@@ -245,10 +273,13 @@ export interface FileRoutesByTo {
   '/status': typeof AppStatusRoute
   '/tokenops': typeof AppTokenopsRoute
   '/': typeof AppIndexRoute
+  '/account/appearance': typeof AppAccountAppearanceRoute
+  '/account/password': typeof AppAccountPasswordRoute
   '/agents/$agentId': typeof AppAgentsAgentIdRoute
   '/agents/mine': typeof AppAgentsMineRoute
   '/builds/$buildId': typeof AppBuildsBuildIdRoute
   '/chat/$sessionId': typeof AppChatSessionIdRoute
+  '/flows/$flowId': typeof AppFlowsFlowIdRoute
   '/mcp/$connectorId': typeof AppMcpConnectorIdRoute
   '/sessions/$sessionId': typeof AppSessionsSessionIdRoute
   '/settings/appearance': typeof AppSettingsAppearanceRoute
@@ -264,6 +295,7 @@ export interface FileRoutesByTo {
   '/agents': typeof AppAgentsIndexRoute
   '/builds': typeof AppBuildsIndexRoute
   '/chat': typeof AppChatIndexRoute
+  '/flows': typeof AppFlowsIndexRoute
   '/mcp': typeof AppMcpIndexRoute
   '/sessions': typeof AppSessionsIndexRoute
   '/settings': typeof AppSettingsIndexRoute
@@ -280,10 +312,13 @@ export interface FileRoutesById {
   '/_app/status': typeof AppStatusRoute
   '/_app/tokenops': typeof AppTokenopsRoute
   '/_app/': typeof AppIndexRoute
+  '/_app/account/appearance': typeof AppAccountAppearanceRoute
+  '/_app/account/password': typeof AppAccountPasswordRoute
   '/_app/agents/$agentId': typeof AppAgentsAgentIdRoute
   '/_app/agents/mine': typeof AppAgentsMineRoute
   '/_app/builds/$buildId': typeof AppBuildsBuildIdRoute
   '/_app/chat/$sessionId': typeof AppChatSessionIdRoute
+  '/_app/flows/$flowId': typeof AppFlowsFlowIdRoute
   '/_app/mcp/$connectorId': typeof AppMcpConnectorIdRoute
   '/_app/sessions/$sessionId': typeof AppSessionsSessionIdRoute
   '/_app/settings/appearance': typeof AppSettingsAppearanceRoute
@@ -299,6 +334,7 @@ export interface FileRoutesById {
   '/_app/agents/': typeof AppAgentsIndexRoute
   '/_app/builds/': typeof AppBuildsIndexRoute
   '/_app/chat/': typeof AppChatIndexRoute
+  '/_app/flows/': typeof AppFlowsIndexRoute
   '/_app/mcp/': typeof AppMcpIndexRoute
   '/_app/sessions/': typeof AppSessionsIndexRoute
   '/_app/settings/': typeof AppSettingsIndexRoute
@@ -315,10 +351,13 @@ export interface FileRouteTypes {
     | '/router'
     | '/status'
     | '/tokenops'
+    | '/account/appearance'
+    | '/account/password'
     | '/agents/$agentId'
     | '/agents/mine'
     | '/builds/$buildId'
     | '/chat/$sessionId'
+    | '/flows/$flowId'
     | '/mcp/$connectorId'
     | '/sessions/$sessionId'
     | '/settings/appearance'
@@ -334,6 +373,7 @@ export interface FileRouteTypes {
     | '/agents/'
     | '/builds/'
     | '/chat/'
+    | '/flows/'
     | '/mcp/'
     | '/sessions/'
     | '/settings/'
@@ -348,10 +388,13 @@ export interface FileRouteTypes {
     | '/status'
     | '/tokenops'
     | '/'
+    | '/account/appearance'
+    | '/account/password'
     | '/agents/$agentId'
     | '/agents/mine'
     | '/builds/$buildId'
     | '/chat/$sessionId'
+    | '/flows/$flowId'
     | '/mcp/$connectorId'
     | '/sessions/$sessionId'
     | '/settings/appearance'
@@ -367,6 +410,7 @@ export interface FileRouteTypes {
     | '/agents'
     | '/builds'
     | '/chat'
+    | '/flows'
     | '/mcp'
     | '/sessions'
     | '/settings'
@@ -382,10 +426,13 @@ export interface FileRouteTypes {
     | '/_app/status'
     | '/_app/tokenops'
     | '/_app/'
+    | '/_app/account/appearance'
+    | '/_app/account/password'
     | '/_app/agents/$agentId'
     | '/_app/agents/mine'
     | '/_app/builds/$buildId'
     | '/_app/chat/$sessionId'
+    | '/_app/flows/$flowId'
     | '/_app/mcp/$connectorId'
     | '/_app/sessions/$sessionId'
     | '/_app/settings/appearance'
@@ -401,6 +448,7 @@ export interface FileRouteTypes {
     | '/_app/agents/'
     | '/_app/builds/'
     | '/_app/chat/'
+    | '/_app/flows/'
     | '/_app/mcp/'
     | '/_app/sessions/'
     | '/_app/settings/'
@@ -477,6 +525,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppTokenopsRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/account/appearance': {
+      id: '/_app/account/appearance'
+      path: '/account/appearance'
+      fullPath: '/account/appearance'
+      preLoaderRoute: typeof AppAccountAppearanceRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/account/password': {
+      id: '/_app/account/password'
+      path: '/account/password'
+      fullPath: '/account/password'
+      preLoaderRoute: typeof AppAccountPasswordRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/agents/': {
       id: '/_app/agents/'
       path: '/agents'
@@ -524,6 +586,20 @@ declare module '@tanstack/react-router' {
       path: '/chat/$sessionId'
       fullPath: '/chat/$sessionId'
       preLoaderRoute: typeof AppChatSessionIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/flows/': {
+      id: '/_app/flows/'
+      path: '/flows'
+      fullPath: '/flows/'
+      preLoaderRoute: typeof AppFlowsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/flows/$flowId': {
+      id: '/_app/flows/$flowId'
+      path: '/flows/$flowId'
+      fullPath: '/flows/$flowId'
+      preLoaderRoute: typeof AppFlowsFlowIdRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/mcp/': {
@@ -649,10 +725,13 @@ interface AppRouteChildren {
   AppStatusRoute: typeof AppStatusRoute
   AppTokenopsRoute: typeof AppTokenopsRoute
   AppIndexRoute: typeof AppIndexRoute
+  AppAccountAppearanceRoute: typeof AppAccountAppearanceRoute
+  AppAccountPasswordRoute: typeof AppAccountPasswordRoute
   AppAgentsAgentIdRoute: typeof AppAgentsAgentIdRoute
   AppAgentsMineRoute: typeof AppAgentsMineRoute
   AppBuildsBuildIdRoute: typeof AppBuildsBuildIdRoute
   AppChatSessionIdRoute: typeof AppChatSessionIdRoute
+  AppFlowsFlowIdRoute: typeof AppFlowsFlowIdRoute
   AppMcpConnectorIdRoute: typeof AppMcpConnectorIdRoute
   AppSessionsSessionIdRoute: typeof AppSessionsSessionIdRoute
   AppSettingsAppearanceRoute: typeof AppSettingsAppearanceRoute
@@ -668,6 +747,7 @@ interface AppRouteChildren {
   AppAgentsIndexRoute: typeof AppAgentsIndexRoute
   AppBuildsIndexRoute: typeof AppBuildsIndexRoute
   AppChatIndexRoute: typeof AppChatIndexRoute
+  AppFlowsIndexRoute: typeof AppFlowsIndexRoute
   AppMcpIndexRoute: typeof AppMcpIndexRoute
   AppSessionsIndexRoute: typeof AppSessionsIndexRoute
   AppSettingsIndexRoute: typeof AppSettingsIndexRoute
@@ -682,10 +762,13 @@ const AppRouteChildren: AppRouteChildren = {
   AppStatusRoute: AppStatusRoute,
   AppTokenopsRoute: AppTokenopsRoute,
   AppIndexRoute: AppIndexRoute,
+  AppAccountAppearanceRoute: AppAccountAppearanceRoute,
+  AppAccountPasswordRoute: AppAccountPasswordRoute,
   AppAgentsAgentIdRoute: AppAgentsAgentIdRoute,
   AppAgentsMineRoute: AppAgentsMineRoute,
   AppBuildsBuildIdRoute: AppBuildsBuildIdRoute,
   AppChatSessionIdRoute: AppChatSessionIdRoute,
+  AppFlowsFlowIdRoute: AppFlowsFlowIdRoute,
   AppMcpConnectorIdRoute: AppMcpConnectorIdRoute,
   AppSessionsSessionIdRoute: AppSessionsSessionIdRoute,
   AppSettingsAppearanceRoute: AppSettingsAppearanceRoute,
@@ -701,6 +784,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppAgentsIndexRoute: AppAgentsIndexRoute,
   AppBuildsIndexRoute: AppBuildsIndexRoute,
   AppChatIndexRoute: AppChatIndexRoute,
+  AppFlowsIndexRoute: AppFlowsIndexRoute,
   AppMcpIndexRoute: AppMcpIndexRoute,
   AppSessionsIndexRoute: AppSessionsIndexRoute,
   AppSettingsIndexRoute: AppSettingsIndexRoute,

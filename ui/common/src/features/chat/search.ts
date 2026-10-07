@@ -1,4 +1,5 @@
-import { z } from 'zod'
+import { z } from 'zod/mini'
+import { opt } from '@/lib/search'
 import { CHAT_PAGE_VARIANT_KEYS, CHAT_SCENARIO_KEYS } from './scenarioKeys'
 
 /**
@@ -10,14 +11,11 @@ import { CHAT_PAGE_VARIANT_KEYS, CHAT_SCENARIO_KEYS } from './scenarioKeys'
  * `mock` and `debug` are dev/mock aids; they survive the create and opt-in navigations (DX-A2).
  */
 export const chatSearchSchema = z.object({
-  agent: z.unknown().optional(),
-  auto: z
-    .union([z.literal(1), z.literal('1')])
-    .optional()
-    .catch(undefined),
+  agent: z.optional(z.unknown()),
+  auto: opt(z.union([z.literal(1), z.literal('1')])),
   // Kept raw so an unknown value can be named in the dev banner (DX-7); isChatScenario checks it.
-  mock: z.string().max(200).optional().catch(undefined),
-  debug: z.literal('turn').optional().catch(undefined),
+  mock: opt(z.string().check(z.maxLength(200))),
+  debug: opt(z.literal('turn')),
 })
 export type ChatSearch = z.infer<typeof chatSearchSchema>
 /** The dev aids every chat link carries (DX-A2). */

@@ -25,6 +25,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Toggle } from '@/components/ui/toggle'
 import { OpenChatLink } from '@/features/chat/components/OpenChatLink'
+import { OpenFlowLink } from '@/features/flows/components/OpenFlowLink'
 import {
   Select,
   SelectContent,
@@ -338,6 +339,8 @@ export function SessionTracePage({
         actions={
           <>
             <OpenChatLink sessionId={sessionId} />
+            {/* The selected trace's flow: a flow's id is its trace id (plans/feat-flows.md F19). */}
+            {traceId ? <OpenFlowLink flowId={traceId} /> : null}
             {firstStart ? (
               <Button asChild variant="outline" size="sm">
                 <Link

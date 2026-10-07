@@ -12,8 +12,8 @@ import { copy } from './copy'
 import { SidebarPanelContext } from './panelSlot'
 import { widthDefaultOpen, readSidebarCookie } from './sidebarState'
 
-/** Chat and Settings own their scrolling (their section column stays put): the page fills the viewport (plan §7.1, EN20). */
-const FULL_HEIGHT = /^\/(chat|settings)(\/|$)/
+/** Chat, Settings and Account own their scrolling (their section column stays put): the page fills the viewport (plan §7.1, EN20). */
+const FULL_HEIGHT = /^\/(chat|settings|account)(\/|$)/
 
 /**
  * `end` and `badges` come from the `_app` route, which may import features (the shell never does): Deploy's build

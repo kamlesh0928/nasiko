@@ -84,6 +84,8 @@ let counter = 0
 let createDelayMs: number | null = null
 /** `GET /api/flows/{trace_id}` steps, per routed turn (flows.rs). */
 let flows = new Map<string, FlowStep[]>()
+/** When each routed turn's flow started and its chat, for the server's `{flow, steps}` shape (flows.rs `Flow`). */
+let flowMeta = new Map<string, { at: number; sessionId: string; title: string | null }>()
 let continuations = new Map<string, Continuation>()
 /** Every reconnect a test made, by hitl id. */
 let reconnects: string[] = []
@@ -106,6 +108,7 @@ export function resetChatMock() {
   counter = 0
   createDelayMs = null
   flows = new Map()
+  flowMeta = new Map()
   continuations = new Map()
   reconnects = []
   manyChats = false
@@ -891,7 +894,7 @@ export function chatHandlers(ctx: ChatMockContext): HttpHandler[] {
   const guard = () => (ctx.loggedIn() ? null : unauthorized())
 
   /** A routed dispatch: the orchestrator's stream, with the assistant row saved server-side at Done (§2.3). */
-  const routedDispatch = (sessionId: string) => {
+  const routedDispatch = (sessionId: string, message: string) => {
     const picked = fixedScenario ?? ctx.scenario()
     const scenario: ChatScenario = isRoutedScenario(picked) ? picked : 'routed-plain'
     // Pre-stream errors (a2a_dispatch.rs:2204-2242); 429 is plain text with no Retry-After.
@@ -927,6 +930,8 @@ export function chatHandlers(ctx: ChatMockContext): HttpHandler[] {
       }
     }
     flows.set(traceId, flowSteps(frames))
+    // a2a_dispatch.rs titles a routed flow with the user's message.
+    flowMeta.set(traceId, { at: Date.now(), sessionId, title: message })
     return sseResponse(
       frames.map((f, i) => (i === 0 ? f : { ...f, delayMs: f.delayMs ?? 15 })),
       {
@@ -1107,11 +1112,36 @@ export function chatHandlers(ctx: ChatMockContext): HttpHandler[] {
     http.get('/api/flows/:id', ({ params }) => {
       const denied = guard()
       if (denied) return denied
-      const steps = flows.get(String(params.id))
+      const id = String(params.id)
+      const steps = flows.get(id)
       if (!steps) return new HttpResponse(null, { status: 404 })
+      // The server's full shape (flows.rs `Flow`, `FlowStep`), so the Flows page can open it too: one step per
+      // call, a second and a half apart, the flow done when its last step is.
+      const meta = flowMeta.get(id) ?? { at: Date.now(), sessionId: '', title: null }
+      const iso = (ms: number) => new Date(ms).toISOString()
+      const sorted = [...steps].sort((a, b) => a.step_order - b.step_order)
+      const open = (st: FlowStep) => st.status === 'running' || st.status === 'awaiting_human'
+      const end = meta.at + sorted.length * 1_500
       return HttpResponse.json({
-        flow: { flow_id: String(params.id), status: 'completed', root_agent_name: 'orchestrator' },
-        steps: [...steps].sort((a, b) => a.step_order - b.step_order),
+        flow: {
+          flow_id: id,
+          status: sorted.some((st) => st.status === 'awaiting_human')
+            ? 'paused'
+            : sorted.some((st) => st.status === 'failed')
+              ? 'failed'
+              : 'completed',
+          root_agent_name: 'orchestrator',
+          title: meta.title,
+          metadata: { context_id: meta.sessionId },
+          created_at: iso(meta.at),
+          completed_at: sorted.some(open) ? null : iso(end),
+        },
+        steps: sorted.map((st, i) => ({
+          ...st,
+          id: `${id}-step-${i + 1}`,
+          created_at: iso(meta.at + i * 1_500 + 100),
+          completed_at: open(st) ? null : iso(meta.at + i * 1_500 + 1_300),
+        })),
       })
     }),
 
@@ -1238,6 +1268,7 @@ export function chatHandlers(ctx: ChatMockContext): HttpHandler[] {
           c.hitl.push(next)
         } else {
           flows.set(traceId, flowSteps(frames))
+          flowMeta.set(traceId, { at: Date.now(), sessionId: c.row.session_id, title: null })
           persistRouted(ctx, c, frames, traceId)
         }
         h.resume_status = 'completed'
@@ -1342,7 +1373,7 @@ export function chatHandlers(ctx: ChatMockContext): HttpHandler[] {
       const text0 = (body.params?.message?.parts ?? []).map((p) => p.text ?? '').join('')
       if (!text0.trim()) return rpcError(400, -32602, 'message has no text')
       // No agent_id (or "orchestrator"): the ReAct orchestrator (a2a_dispatch.rs:199, 584-592).
-      if (!agentId || agentId === 'orchestrator') return routedDispatch(sessionId)
+      if (!agentId || agentId === 'orchestrator') return routedDispatch(sessionId, text0)
       // resolve_agent filters on status = 'running' (a2a_dispatch.rs:1067-1074): a stopped agent is AgentNotFound too.
       const agent = ctx.agents().find((a) => (a.id === agentId || a.name === agentId) && a.running)
       if (!agent) return rpcError(404, -32604, `agent '${agentId}' not found or not running`)

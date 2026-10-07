@@ -8,10 +8,11 @@
  * - Workspace: General, (EE: Orchestrator), Flow limits, Optimization tiers (`/settings/optimization-tiers`), Registry.
  *   `/settings?section=` for the sections of the one form.
  * - Security: (EE: Single sign-on), Secrets (`/settings/secrets`).
- * - Account: Appearance (`/settings/appearance`; the lab's, this browser's mode and theme), Password
- *   (`/settings/password`; Change password). Optimization moved to /optimization (plans/feat-optimization-page.md P2).
- * A layer's rows come from the `settingsSections` slot, placed after the row they name. A member sees Secrets and
- * Account: the workspace sections are superuser-gated on the API.
+ * A layer's rows come from the `settingsSections` slot, placed after the row they name. A member sees Secrets only:
+ * the workspace sections are superuser-gated on the API. This is the sidebar's Organization → Settings.
+ * With `account`, the same layout holds the account's own settings (the account menu's Settings): Appearance
+ * (`/account/appearance`; the lab's, this browser's mode and theme) and Password (`/account/password`; Change
+ * password). Optimization moved to /optimization (plans/feat-optimization-page.md P2).
  */
 import { useQuery } from '@tanstack/react-query'
 import { Link, useRouterState } from '@tanstack/react-router'
@@ -42,9 +43,9 @@ interface Row {
   to:
     | '/settings'
     | '/settings/secrets'
-    | '/settings/appearance'
     | '/settings/optimization-tiers'
-    | '/settings/password'
+    | '/account/appearance'
+    | '/account/password'
   section?: string
 }
 
@@ -60,7 +61,13 @@ function withLayer(rows: Row[], layer: readonly SettingsSection[]): Row[] {
   return out
 }
 
-export function SettingsLayout({ children }: { children: ReactNode }) {
+export function SettingsLayout({
+  children,
+  account = false,
+}: {
+  children: ReactNode
+  account?: boolean
+}) {
   const me = useQuery(meQuery)
   // Chat's breakpoint for an inline rail (ChatPage `wide`).
   const wide = useMediaQuery('(min-width: 1024px)')
@@ -69,57 +76,60 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
   const location = useRouterState({ select: (s) => s.location })
   const admin = me.data?.is_superuser === true
   const inGroup = (g: 'workspace' | 'security') => settingsSections.filter((s) => s.group === g)
-  const groups: { key: string; label: string; rows: Row[] }[] = [
-    ...(admin
-      ? [
-          {
-            key: 'workspace',
-            label: copy.nav.workspace,
-            rows: withLayer(
-              CORE_SECTIONS.flatMap((k): Row[] => [
-                {
-                  key: k,
-                  label: copy.sections[k].label,
-                  to: '/settings',
-                  // General is the default: its link carries no section.
-                  section: k === 'general' ? undefined : k,
-                },
-                // A sub-page after Flow limits (plans/feat-context-optimization.md F4): its own route and read.
-                ...(k === 'limits'
-                  ? [
-                      {
-                        key: 'optimization-tiers',
-                        label: copy.optimizationTiers.label,
-                        to: '/settings/optimization-tiers' as const,
-                      },
-                    ]
-                  : []),
-              ]),
-              inGroup('workspace'),
-            ),
-          },
-        ]
-      : []),
-    {
-      key: 'security',
-      label: copy.nav.security,
-      rows: [
-        ...withLayer([], admin ? inGroup('security') : []),
-        { key: 'secrets', label: copy.secrets.title, to: '/settings/secrets' },
-      ],
-    },
-    {
-      key: 'account',
-      label: copy.nav.account,
-      rows: [
-        { key: 'appearance', label: copy.appearance.label, to: '/settings/appearance' },
-        { key: 'password', label: copy.password.label, to: '/settings/password' },
-      ],
-    },
-  ]
+  const groups: { key: string; label: string; rows: Row[] }[] = account
+    ? [
+        {
+          key: 'account',
+          label: copy.nav.account,
+          rows: [
+            { key: 'appearance', label: copy.appearance.label, to: '/account/appearance' },
+            { key: 'password', label: copy.password.label, to: '/account/password' },
+          ],
+        },
+      ]
+    : [
+        ...(admin
+          ? [
+              {
+                key: 'workspace',
+                label: copy.nav.workspace,
+                rows: withLayer(
+                  CORE_SECTIONS.flatMap((k): Row[] => [
+                    {
+                      key: k,
+                      label: copy.sections[k].label,
+                      to: '/settings',
+                      // General is the default: its link carries no section.
+                      section: k === 'general' ? undefined : k,
+                    },
+                    // A sub-page after Flow limits (plans/feat-context-optimization.md F4): its own route and read.
+                    ...(k === 'limits'
+                      ? [
+                          {
+                            key: 'optimization-tiers',
+                            label: copy.optimizationTiers.label,
+                            to: '/settings/optimization-tiers' as const,
+                          },
+                        ]
+                      : []),
+                  ]),
+                  inGroup('workspace'),
+                ),
+              },
+            ]
+          : []),
+        {
+          key: 'security',
+          label: copy.nav.security,
+          rows: [
+            ...withLayer([], admin ? inGroup('security') : []),
+            { key: 'secrets', label: copy.secrets.title, to: '/settings/secrets' },
+          ],
+        },
+      ]
   const known = new Set(groups.flatMap((g) => g.rows.map((r) => r.key)))
   const raw = (location.search as { section?: unknown }).section
-  // A sub-page (Secrets, Appearance, Password) is current by its path; the workspace page by `?section=`.
+  // A sub-page (Secrets, Tiers, Appearance, Password) is current by its path; the workspace page by `?section=`.
   const page = groups
     .flatMap((g) => g.rows)
     .find((r) => r.to === location.pathname && r.to !== '/settings')
@@ -139,6 +149,7 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
       linkProps={linkProps}
       onNavigate={onNavigate}
       framed={framed}
+      title={account ? copy.accountTitle : copy.title}
     />
   )
   return (
@@ -196,6 +207,7 @@ interface NavProps {
   }
   /** Closes the sheet after a pick. */
   onNavigate?: () => void
+  title: string
   /** Beside the rail or in the sheet: the title is a 48 px header row, as Chat's rail has (in the sidebar it sits under Back). */
   framed?: boolean
 }
@@ -204,7 +216,7 @@ interface NavProps {
  * The sections: the app nav's own rows and group headers, the same in the sidebar (the drill-in panel), the column
  * beside the collapsed rail and the phone sheet, as Chat's rail is.
  */
-function SectionsNav({ groups, current, linkProps, onNavigate, framed = false }: NavProps) {
+function SectionsNav({ groups, current, linkProps, onNavigate, framed = false, title }: NavProps) {
   return (
     <nav aria-label={copy.nav.label} className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-2">
       <p
@@ -214,7 +226,7 @@ function SectionsNav({ groups, current, linkProps, onNavigate, framed = false }:
         )}
       >
         <Settings aria-hidden className="size-4 text-muted-foreground" />
-        {copy.title}
+        {title}
       </p>
       {groups.map((g) => (
         <SidebarGroup key={g.key} className="px-3 py-0">

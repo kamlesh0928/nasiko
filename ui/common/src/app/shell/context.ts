@@ -25,8 +25,8 @@
  *
  * Every id that goes into a path or query is `encodeURIComponent`-ed by the router.
  */
-import { z } from 'zod'
-import { flag, isoDate, PRESETS, text } from '@/lib/search'
+import { z } from 'zod/mini'
+import { fallback, flag, isoDate, opt, PRESETS, text } from '@/lib/search'
 
 const SHARED_KEYS = [
   'preset',
@@ -43,16 +43,16 @@ const SHARED_KEYS = [
 
 /** The shared keys' schema, merged into each page's own search schema. */
 export const sharedSearchSchema = z.object({
-  preset: z.enum(PRESETS).default('30d').catch('30d'),
-  from: isoDate.optional().catch(undefined),
-  to: isoDate.optional().catch(undefined),
-  agent: text.optional().catch(undefined),
-  provider: text.optional().catch(undefined),
-  model: text.optional().catch(undefined),
-  compare: flag.optional().catch(undefined),
-  anchor: isoDate.optional().catch(undefined),
-  mock: z
-    .enum([
+  preset: fallback(z.enum(PRESETS), '30d'),
+  from: opt(isoDate),
+  to: opt(isoDate),
+  agent: opt(text),
+  provider: opt(text),
+  model: opt(text),
+  compare: opt(flag),
+  anchor: opt(isoDate),
+  mock: opt(
+    z.enum([
       'tempo-down',
       'empty',
       'trace-503',
@@ -60,10 +60,9 @@ export const sharedSearchSchema = z.object({
       'scan-fail',
       'server-down',
       'logout-unavailable',
-    ])
-    .optional()
-    .catch(undefined),
-  demo: flag.optional().catch(undefined),
+    ]),
+  ),
+  demo: opt(flag),
 })
 
 export type SharedSearch = z.infer<typeof sharedSearchSchema>

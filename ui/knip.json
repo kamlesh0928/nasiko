@@ -4,6 +4,9 @@
     "@fontsource-variable/hanken-grotesk",
     "@fontsource-variable/jetbrains-mono"
   ],
+  "ignore": [
+    "design/**"
+  ],
   "workspaces": {
     ".": {
       "entry": [

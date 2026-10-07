@@ -118,6 +118,7 @@ import {
 import { buildMcpState, mcpHandlers, type McpState } from './mcp'
 import { optimizationHandlers, resetOptimizationMock } from './optimization'
 import { buildWorkflowsState, workflowHandlers, type WorkflowsState } from './workflows'
+import { buildFlowsState, flowHandlers, type FlowsState } from './flows'
 import { checkZip, MAX_ZIP_BYTES } from '@/features/deploy/zipcheck'
 import { nameProblem } from '@/features/deploy/name'
 import { parseVersion } from '@/features/deploy/version'
@@ -247,6 +248,9 @@ export const MOCK_VARIANTS = [
   // or every savings read fails (R2C; the agent lists and your settings still work).
   'optimization-no-reports',
   'optimization-down',
+  // Flows (plans/feat-flows.md §2a): no flows yet (first run), or a server without /api/flows (bare 404).
+  'flows-empty',
+  'flows-absent',
   ...CHAT_PAGE_VARIANTS,
   ...ROUTER_PAGE_VARIANTS,
 ] as const
@@ -414,6 +418,17 @@ function getWorkflows(): WorkflowsState {
 }
 /** The workflows mock's live state, for tests. */
 export const workflowsMockState = (): WorkflowsState => getWorkflows()
+// Flows (plans/feat-flows.md): built from the agents state, rebuilt with it.
+let flowsState: FlowsState | null = null
+function getFlows(): FlowsState {
+  return (flowsState ??= buildFlowsState({
+    agents: getAgents,
+    me: () => ({ id: ADMIN_ID }),
+    now: () => nowFn(),
+  }))
+}
+/** The flows mock's live state, for tests. */
+export const flowsMockState = (): FlowsState => getFlows()
 // Settings (plans/feat-settings.md): the singleton row, and the password the mock last set (null: any is current).
 let settingsRow: Record<string, unknown> | null = null
 // Secret values the mock was sent (the router state keeps names only); a seed secret reads as a fake key.
@@ -486,6 +501,7 @@ export function resetAgentsMock() {
   routerState = null
   mcpState = null
   workflowsState = null
+  flowsState = null
   budgetState = null
   settingsRow = null
   secretValues = new Map()
@@ -562,6 +578,7 @@ export function configureMocks(
     routerState = null
     mcpState = null
     workflowsState = null
+    flowsState = null
     budgetState = null
   }
   if (opts.persona !== undefined) fixedPersona = opts.persona
@@ -632,6 +649,29 @@ function sseStream(lines: string[], closeMessage: string): ReadableStream<Uint8A
 }
 
 export const handlerGroups: Record<Mockable, HttpHandler[]> = {
+  // Flows (plans/feat-flows.md): before observability and chat, which answer the trace and flow ids it doesn't own.
+  flows: flowHandlers({
+    loggedIn: () => loggedIn,
+    me: () => sessionUser(),
+    agents: getAgents,
+    now: () => nowFn(),
+    hasVariant: (v) => hasVariant(v as MockVariant),
+    state: getFlows,
+    seedTrace: (id) => {
+      const found = observabilityData(getSeed()).traceById.get(id)
+      if (!found) return null
+      const { trace: t, session } = found
+      return {
+        traceId: t.trace_id,
+        agentId: t.agent_id,
+        agentName: t.agent_name,
+        startMs: t.ts,
+        // The trace's own extent (its agent calls included): the request's latency ends before they do.
+        latencyMs: traceDetail(getSeed(), id)?.latency_ms ?? t.latency_ms,
+        sessionId: session.session_id,
+      }
+    },
+  }),
   // plans/feat-context-optimization.md: the merged /api/me routes plus the proposed CX-5/CX-T1/CX-6 (optimization.ts).
   optimization: optimizationHandlers({
     loggedIn: () => loggedIn,

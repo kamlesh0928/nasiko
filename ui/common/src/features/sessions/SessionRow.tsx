@@ -12,6 +12,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { AgentLink } from '@/features/agents/components/AgentLink'
 import { OpenChatLink } from '@/features/chat/components/OpenChatLink'
+import { OpenFlowLink } from '@/features/flows/components/OpenFlowLink'
 import { copy, STATUS_LABEL } from '@/features/observability/copy'
 import { sessionCost, type Status } from '@/features/observability/sessions'
 import type { SessionSummary } from '@/features/observability/types'
@@ -160,6 +161,7 @@ export const SessionRow = memo(function SessionRow({
 function RowDetail({ s, agentLabel }: { s: SessionSummary; agentLabel: string }) {
   const d = useSessionDetail(s.session_id)
   const [logs, setLogs] = useState(false)
+  const latest = d.data ? latestTrace(d.data.traces) : null
   return (
     <div className="grid gap-2 bg-muted/40 px-3 py-3 text-sm @[672px]:grid-cols-3">
       <div className="@[672px]:col-span-2">
@@ -201,7 +203,27 @@ function RowDetail({ s, agentLabel }: { s: SessionSummary; agentLabel: string })
         ) : null}
         {/* Only while this detail is open (v1c §5.10). */}
         <OpenChatLink sessionId={s.session_id} className="mt-1 w-fit" />
+        {/* The session's latest request, as a flow (plans/feat-flows.md F19). */}
+        {latest ? (
+          <OpenFlowLink
+            flowId={latest}
+            latest={(d.data?.traces.length ?? 0) > 1}
+            className="w-fit"
+          />
+        ) : null}
       </div>
     </div>
   )
+}
+
+/** The newest trace of a session (by its root span's start), or null. */
+function latestTrace(
+  traces: readonly { trace_id: string; root_span: { start_time?: string | null } }[],
+) {
+  let best: { id: string; at: number } | null = null
+  for (const t of traces) {
+    const at = Date.parse(t.root_span.start_time ?? '') || 0
+    if (!best || at > best.at) best = { id: t.trace_id, at }
+  }
+  return best?.id ?? null
 }

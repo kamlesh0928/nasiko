@@ -42,7 +42,7 @@ Every colour is a CSS variable in `common/src/index.css`, exposed to Tailwind th
   primary, the primary, its pale tint, the ring and the chart order. Dark surfaces are composed, not inverted:
   page < sidebar < card.
 - Both are applied before first paint by the inline script in `index.html` (same keys as `theme.ts`, checked by a test).
-- Settings → Appearance (`/settings/appearance`, also the account menu's Theme submenu) has a Mode radio group and a
+- Account settings → Appearance (`/account/appearance`, also the account menu's Theme submenu) has a Mode radio group and a
   Theme radio group drawn as picture tiles: each mode is a small drawing of the app in that mode (System split on a
   diagonal; fixed `--preview-light-*` / `--preview-dark-*` tokens, the same in every theme and mode), each theme a nav
   tint and button in its light `--primary`. The radio stays in the tile, visually hidden; the chosen tile has a

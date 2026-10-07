@@ -1,4 +1,5 @@
-import { z } from 'zod'
+import { z } from 'zod/mini'
+import { opt } from '@/lib/search'
 import { nameProblem } from './name'
 
 /** URL state for the Builds page (plans/feat-deploy.md §3, §6); junk values fall back instead of throwing. */
@@ -6,11 +7,11 @@ export const BUILDS_FILTERS = ['all', 'active', 'failed', 'success'] as const
 export type BuildsFilter = (typeof BUILDS_FILTERS)[number]
 
 export const buildsSearchSchema = z.object({
-  status: z.enum(BUILDS_FILTERS).optional().catch(undefined),
+  status: opt(z.enum(BUILDS_FILTERS)),
   /** Untrimmed while typing; the request trims. */
-  q: z.string().max(200).optional().catch(undefined),
+  q: opt(z.string().check(z.maxLength(200))),
   /** Zero-based page of the non-pinned list. */
-  page: z.number().int().min(0).max(1000).optional().catch(undefined),
+  page: opt(z.int().check(z.gte(0), z.lte(1000))),
 })
 export type BuildsSearch = z.infer<typeof buildsSearchSchema>
 
@@ -20,19 +21,11 @@ export type DeployMethod = (typeof DEPLOY_METHODS)[number]
 
 export const deploySearchSchema = z.object({
   /** The method tab (design review 6); default upload. */
-  method: z.enum(DEPLOY_METHODS).optional().catch(undefined),
+  method: opt(z.enum(DEPLOY_METHODS)),
   /** GitHub: the picked repository, `owner/name` (kept in the URL, §4.2). */
-  repo: z
-    .string()
-    .regex(/^[\w.-]+\/[\w.-]+$/)
-    .optional()
-    .catch(undefined),
+  repo: opt(z.string().check(z.regex(/^[\w.-]+\/[\w.-]+$/))),
   // Only a name the server would accept: a link can't pre-fill shell characters into the copied CLI command.
-  name: z
-    .string()
-    .refine((n) => nameProblem(n) === null)
-    .optional()
-    .catch(undefined),
-  version: z.string().max(40).optional().catch(undefined),
+  name: opt(z.string().check(z.refine((n) => nameProblem(n) === null))),
+  version: opt(z.string().check(z.maxLength(40))),
 })
 export type DeploySearch = z.infer<typeof deploySearchSchema>

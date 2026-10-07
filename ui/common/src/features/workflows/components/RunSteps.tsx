@@ -4,6 +4,7 @@
  * matches (every save regenerates ids) keeps its agent as the title. A step's requests use chat's `RequestCard`:
  * decided ones render as receipts, the waiting one is answered in place.
  */
+import { OpenFlowLink } from '@/features/flows/components/OpenFlowLink'
 import { Circle, CircleCheck, CircleX, WandSparkles } from 'lucide-react'
 import { useState } from 'react'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -147,6 +148,8 @@ export function RunSteps({
                 <ToneBadge tone={status.tone}>{status.label}</ToneBadge>
                 {s.latency_ms ? <Chip>{fmtDuration(s.latency_ms)}</Chip> : null}
                 {s.tokens_used ? <Chip>{copy.tokens(fmtTokens(s.tokens_used))}</Chip> : null}
+                {/* The step as a flow (plans/feat-flows.md F19, O2): only when the server named its trace. */}
+                {s.trace_id ? <OpenFlowLink flowId={s.trace_id} size="xs" variant="ghost" /> : null}
               </div>
               <Detail step={s} well={well} />
             </div>

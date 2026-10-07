@@ -41,6 +41,7 @@ import { AgentsTile, RunsTile, SpendTile } from './components/Kpis'
 import { Savings } from './components/Savings'
 import { MonthBar } from './components/MonthBar'
 import { NeedsYou } from './components/NeedsYou'
+import { usePausedFlows } from '@/features/flows/paused'
 import { QuickActions } from './components/QuickActions'
 import { RecentChats } from './components/RecentChats'
 import { RecentSessions } from './components/RecentSessions'
@@ -231,6 +232,8 @@ function Overview({
   // const budgets = !budget.absent
   const budgets = false
   const { needs } = needsYou
+  // Read only when there are requests to link (plans/feat-flows.md O2, amended 2026-10-06).
+  const pausedFlows = usePausedFlows(needs.rows.some((r) => r.kind === 'request'))
   const narrative = useMemo(
     () =>
       overviewNarrative({
@@ -315,7 +318,13 @@ function Overview({
         </section>
       </Card>
       <div className="grid grid-cols-1 items-stretch gap-3 @[700px]/overview:grid-cols-2 @[1100px]/overview:grid-cols-4">
-        <NeedsYou data={needsYou} now={now.getTime()} userId={me.sub} className={place.needs} />
+        <NeedsYou
+          data={needsYou}
+          now={now.getTime()}
+          userId={me.sub}
+          pausedFlows={pausedFlows}
+          className={place.needs}
+        />
         <Spend spend={spend} now={now.getTime()} className={place.spend} />
         {/* Budgets hidden: no server support for /api/budgets yet (R-L10). Restore when it lands.
         {budgets ? (

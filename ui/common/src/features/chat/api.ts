@@ -330,9 +330,10 @@ export const resetPendingBackoff = () => pendingFailures.clear()
  * (an opt-in over the app default), after an answer or dismissal, and on a pause frame (the registry wiring).
  * Each result carries the sign-in generation it was fetched under; a stale one is ignored (E2).
  */
-export function usePendingRequests(userId: string) {
+export function usePendingRequests(userId: string, enabled = true) {
   return useQuery({
     queryKey: chatKeys.pending(userId),
+    enabled,
     queryFn: async ({ signal }) => {
       const generation = signInGeneration()
       try {

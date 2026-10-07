@@ -5,6 +5,7 @@
  * name sit only inside an expanded agent row (DP9). Every model- or agent-supplied string here
  * renders as text, never Markdown (NE-11), except the reply itself.
  */
+import { OpenFlowLink } from '@/features/flows/components/OpenFlowLink'
 import { Link } from '@tanstack/react-router'
 import { Check, ChevronDown, ChevronRight, CircleAlert, Loader2, Minus, X } from 'lucide-react'
 import { useId, useRef, useState } from 'react'
@@ -314,6 +315,10 @@ export function Activity({
       </Button>
       {open ? (
         <div id={listId} className="space-y-1">
+          {/* The turn as a flow: every agent call on one time axis (plans/feat-flows.md F19). */}
+          {traceId && !live ? (
+            <OpenFlowLink flowId={traceId} size="xs" variant="ghost" className={TOUCH} />
+          ) : null}
           <ul className="space-y-1" aria-label={copy.agentsUsedLabel}>
             {(rows.length ? rows : nameRows).map((r) => {
               const note = state ? notesFor(state, r.name) : undefined

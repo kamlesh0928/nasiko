@@ -3,6 +3,7 @@
  * the text (design review 9A); five rows show and the rest scroll inside the card (2A); the header always says when
  * it last checked (8A); a failed source adds a line and never turns into "Nothing needs you" (5A).
  */
+import { OpenFlowLink } from '@/features/flows/components/OpenFlowLink'
 import { Link } from '@tanstack/react-router'
 import { CircleAlert, Hand, TriangleAlert } from 'lucide-react'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
@@ -56,11 +57,14 @@ export function NeedsYou({
   data,
   now,
   userId,
+  pausedFlows,
   className,
 }: {
   data: NeedsYouData
   now: number
   userId: string
+  /** Chat session → its paused flow (plans/feat-flows.md O2, amended 2026-10-06): a request row links it. */
+  pausedFlows?: ReadonlyMap<string, string>
   className?: string
 }) {
   const titleRef = useRef<HTMLHeadingElement>(null)
@@ -134,7 +138,12 @@ export function NeedsYou({
               <ul className="divide-y divide-border pr-2.5" aria-label={copy.needs.title}>
                 {needs.rows.map((r) => (
                   <li key={r.key}>
-                    <Row row={r} now={now} userId={userId} />
+                    <Row
+                      row={r}
+                      now={now}
+                      userId={userId}
+                      flowId={r.kind === 'request' ? pausedFlows?.get(r.chat.sessionId) : undefined}
+                    />
                   </li>
                 ))}
               </ul>
@@ -158,7 +167,18 @@ export function NeedsYou({
   )
 }
 
-function Row({ row, now, userId }: { row: NeedRow; now: number; userId: string }) {
+function Row({
+  row,
+  now,
+  userId,
+  flowId,
+}: {
+  row: NeedRow
+  now: number
+  userId: string
+  /** The request's paused flow, when one matches its chat. */
+  flowId?: string
+}) {
   const { Icon, tone, detail: detailTone, label } = ICON[row.severity]
   let title: string
   let detail: string
@@ -257,6 +277,9 @@ function Row({ row, now, userId }: { row: NeedRow; now: number; userId: string }
         <p className="truncate text-sm font-semibold">{title}</p>
         {detail ? <p className={cn('truncate text-xs', detailTone)}>{detail}</p> : null}
       </div>
+      {flowId ? (
+        <OpenFlowLink flowId={flowId} variant="ghost" className="shrink-0 text-xs" />
+      ) : null}
       {action}
     </div>
   )

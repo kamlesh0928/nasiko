@@ -9,6 +9,11 @@
 !*/vite.config.ts
 !*/*/vite.config.ts
 !scripts/**/*.ts
+# The design playground (plans/feat-design-playground.md): its code is TypeScript in this repo, so it is
+# formatted like the rest of it. ESLint skips it (its shell is raw elements by design); Prettier does not.
+!design/**/*.ts
+!design/**/*.tsx
+!design/**/*.css
 node_modules/
 .claude/
 **/dist/
